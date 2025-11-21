@@ -30,6 +30,8 @@ pub enum Error {
     UnsupportedCompressionAlgorithm(String),
     #[error("missing compression metadata for compressed backup {0}")]
     MissingCompressionMetadata(String),
+    #[error("compressed incremental backup unsupported without pagemap (algo={0:?})")]
+    UnsupportedCompressedIncremental(crate::backup::CompressionAlgorithm),
     #[error("serialization error")]
     Serde(#[from] serde_json::Error),
     #[error(transparent)]

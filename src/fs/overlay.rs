@@ -113,12 +113,12 @@ impl Overlay {
             None => return Ok(None),
         };
 
-        if compression.is_some() {
+        if incremental {
             self.ensure_copy_up(rel)?;
             return Ok(Some(fs::read(diff_path)?));
         }
 
-        if incremental {
+        if compression.is_some() {
             self.ensure_copy_up(rel)?;
             return Ok(Some(fs::read(diff_path)?));
         }
@@ -208,12 +208,12 @@ impl Overlay {
             );
         }
 
-        if let Some(algo) = compression {
-            return self.decompress_file(rel, &base_path, &diff_path, algo);
+        if incremental {
+            return self.materialize_incremental(rel, &base_path, &diff_path, compression);
         }
 
-        if incremental {
-            return self.materialize_incremental(rel, &base_path, &diff_path);
+        if let Some(algo) = compression {
+            return self.decompress_file(rel, &base_path, &diff_path, algo);
         }
 
         if let Some(parent) = diff_path.parent() {
@@ -277,7 +277,13 @@ impl Overlay {
         result
     }
 
-    fn materialize_incremental(&self, rel: &Path, inc_path: &Path, diff_path: &Path) -> Result<()> {
+    fn materialize_incremental(
+        &self,
+        rel: &Path,
+        inc_path: &Path,
+        diff_path: &Path,
+        compression: Option<CompressionAlgorithm>,
+    ) -> Result<()> {
         // Find closest ancestor file in older layers.
         let ancestor = self
             .inner
@@ -305,9 +311,13 @@ impl Overlay {
             Err(e) => return Err(e.into()),
         }
 
+        if let Some(algo) = compression {
+            return Err(Error::UnsupportedCompressedIncremental(algo).into());
+        }
+
         // Overlay changed extents from incremental file using sparse extents where possible.
-        let mut inc_file = fs::File::open(inc_path)?;
-        let mut out = fs::OpenOptions::new()
+        let inc_file = fs::File::open(inc_path)?;
+        let out = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(diff_path)?;
