@@ -1,6 +1,6 @@
 //! Implementation of `pbkfs mount` subcommand.
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::mpsc};
 
 use clap::Args;
 use serde_json;
@@ -12,6 +12,7 @@ use crate::{
     fs::{fuse, overlay::Overlay, MountSession, MountSessionState, MountTarget},
     Error, Result,
 };
+use ctrlc;
 
 #[derive(Debug, Clone, Args)]
 pub struct MountArgs {
@@ -48,8 +49,33 @@ pub struct MountContext {
 }
 
 pub fn execute(args: MountArgs) -> Result<()> {
-    // Execute the mount and drop the context; CLI callers only need the side effects.
-    let _ctx = mount(args)?;
+    // Execute the mount and hold it until a termination signal is received.
+    let mut ctx = mount(args)?;
+
+    if let Some(handle) = ctx.fuse_handle.take() {
+        info!("pbkfs mount active; press Ctrl+C to unmount");
+
+        let (tx, rx) = mpsc::channel();
+        ctrlc::set_handler(move || {
+            let _ = tx.send(());
+        })
+        .map_err(|e| Error::Cli(format!("failed to install signal handler: {e}")))?;
+
+        // Block until we receive a signal.
+        let _ = rx.recv();
+
+        info!(
+            "signal received; unmounting {}",
+            ctx.session.pbk_target_path.display()
+        );
+
+        // Attempt graceful unmount; this drops the session and joins the FUSE thread.
+        handle.unmount();
+
+        // Clean lock markers best-effort.
+        let _ = std::fs::remove_file(ctx.diff_dir.path.join(LOCK_FILE));
+    }
+
     Ok(())
 }
 

@@ -90,6 +90,8 @@ description: "Task list template for feature implementation"
 - [X] T033a [US1] Implement FUSE create/mknod/mkdir/unlink/rename/setattr/utimens/fsync/flush to allow PostgreSQL to create and manage files/directories in `pbk_diff` in `src/fs/fuse.rs`
 - [X] T033b [US1] Implement directory operations (rmdir, readdir_plus if available) and ensure copy-on-write semantics for new paths in `src/fs/fuse.rs`
 - [X] T033c [US1] Add writeback/size-truncate handling (truncate, fallocate stub ok) to keep Postgres file sizes consistent in `src/fs/fuse.rs`
+- [X] T033d [US1] Keep mount process alive after successful mount (hold `MountHandle` until signal), graceful shutdown on SIGINT/SIGTERM with proper lock cleanup in `src/cli/mount.rs`
+- [X] T033e [US1] Enhance `pbkfs unmount` to perform actual OS unmount (fusermount/umount fallback) and terminate background mount while cleaning diff/target lock markers in `src/cli/unmount.rs`
 - [X] T034 [US1] Implement mount orchestration that validates `pbk_target`, starts and stops the FUSE session, and transitions `MountSession` state for `pbkfs mount`/`pbkfs unmount` in `src/fs/mod.rs`
 - [X] T035 [US1] Wire CLI `mount` and `unmount` commands through library entrypoint, combining backup store load, chain resolution, diff/binding setup, and FUSE mount/unmount with proper exit codes in `src/lib.rs`
 - [X] T036 [US1] Add structured logging (spans and events) around mount lifecycle (validation, chain resolution, FUSE start/stop) in `src/logging/mod.rs`
