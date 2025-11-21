@@ -9,9 +9,10 @@ fn meta(
     parent: Option<&str>,
     backup_type: BackupType,
     compressed: bool,
+    compression_algo: Option<CompressionAlgorithm>,
 ) -> BackupMetadata {
     let compression = compressed.then(|| Compression {
-        algorithm: CompressionAlgorithm::Zstd,
+        algorithm: compression_algo.unwrap_or(CompressionAlgorithm::Zstd),
         level: Some(3),
     });
     BackupMetadata {
@@ -31,9 +32,21 @@ fn meta(
 #[test]
 fn constructs_chain_from_incremental() -> pbkfs::Result<()> {
     let backups = vec![
-        meta("FULL1", None, BackupType::Full, true),
-        meta("INC1", Some("FULL1"), BackupType::Incremental, true),
-        meta("INC2", Some("INC1"), BackupType::Incremental, false),
+        meta(
+            "FULL1",
+            None,
+            BackupType::Full,
+            true,
+            Some(CompressionAlgorithm::Zstd),
+        ),
+        meta(
+            "INC1",
+            Some("FULL1"),
+            BackupType::Incremental,
+            true,
+            Some(CompressionAlgorithm::Zstd),
+        ),
+        meta("INC2", Some("INC1"), BackupType::Incremental, false, None),
     ];
     let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
 
@@ -54,6 +67,7 @@ fn marks_chain_incomplete_when_parent_missing() -> pbkfs::Result<()> {
         Some("MISSING"),
         BackupType::Incremental,
         false,
+        None,
     )];
     let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
 
@@ -61,5 +75,35 @@ fn marks_chain_incomplete_when_parent_missing() -> pbkfs::Result<()> {
     assert_eq!(ChainIntegrity::Incomplete, chain.integrity_state);
     assert_eq!(1, chain.elements.len());
 
+    Ok(())
+}
+
+#[test]
+fn captures_multiple_compression_algorithms() -> pbkfs::Result<()> {
+    let backups = vec![
+        meta(
+            "FULL1",
+            None,
+            BackupType::Full,
+            true,
+            Some(CompressionAlgorithm::Zlib),
+        ),
+        meta(
+            "INC1",
+            Some("FULL1"),
+            BackupType::Incremental,
+            true,
+            Some(CompressionAlgorithm::Zstd),
+        ),
+    ];
+    let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
+    let chain = BackupChain::from_target_backup(&store, "INC1")?;
+    assert_eq!(2, chain.compression_algorithms.len());
+    assert!(chain
+        .compression_algorithms
+        .contains(&CompressionAlgorithm::Zlib));
+    assert!(chain
+        .compression_algorithms
+        .contains(&CompressionAlgorithm::Zstd));
     Ok(())
 }

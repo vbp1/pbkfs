@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{backup::metadata::BackupStore, Error, Result};
+use crate::{
+    backup::metadata::{BackupStore, CompressionAlgorithm},
+    Error, Result,
+};
 
 use super::metadata::{BackupMetadata, BackupType};
 
@@ -26,6 +29,7 @@ pub struct BackupChain {
     pub elements: Vec<BackupMetadata>,
     pub compressed_mix: CompressionMix,
     pub integrity_state: ChainIntegrity,
+    pub compression_algorithms: Vec<CompressionAlgorithm>,
 }
 
 impl BackupChain {
@@ -71,12 +75,14 @@ impl BackupChain {
         }
 
         let compressed_mix = classify_compression(&chain);
+        let compression_algorithms = compression_algorithms(&chain);
 
         Ok(Self {
             target_backup_id: target_backup_id.to_string(),
             elements: chain,
             compressed_mix,
             integrity_state: integrity,
+            compression_algorithms,
         })
     }
 }
@@ -97,4 +103,20 @@ fn classify_compression(chain: &[BackupMetadata]) -> CompressionMix {
         (_, 0) => CompressionMix::AllCompressed,
         _ => CompressionMix::Mixed,
     }
+}
+
+fn compression_algorithms(chain: &[BackupMetadata]) -> Vec<CompressionAlgorithm> {
+    let mut set = HashSet::new();
+    for bk in chain {
+        if let Some(algo) = bk.compression_algorithm() {
+            set.insert(algo);
+        }
+    }
+    let mut list: Vec<_> = set.into_iter().collect();
+    list.sort_by_key(|a| match a {
+        CompressionAlgorithm::Zlib => 0,
+        CompressionAlgorithm::Lz4 => 1,
+        CompressionAlgorithm::Zstd => 2,
+    });
+    list
 }

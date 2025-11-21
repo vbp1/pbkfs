@@ -26,7 +26,7 @@ pub enum ChecksumState {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum CompressionAlgorithm {
     Zlib,
