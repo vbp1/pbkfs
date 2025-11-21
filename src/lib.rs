@@ -26,6 +26,10 @@ pub enum Error {
     DiffDirNotWritable(String),
     #[error("unsupported pg_probackup version: {0}")]
     UnsupportedPgProbackupVersion(String),
+    #[error("unsupported compression algorithm: {0}")]
+    UnsupportedCompressionAlgorithm(String),
+    #[error("missing compression metadata for compressed backup {0}")]
+    MissingCompressionMetadata(String),
     #[error("serialization error")]
     Serde(#[from] serde_json::Error),
     #[error(transparent)]

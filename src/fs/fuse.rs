@@ -6,7 +6,7 @@ use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io,
-    os::unix::fs::{symlink, MetadataExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Mutex,
     time::Duration,
@@ -137,32 +137,9 @@ impl OverlayFs {
     }
 
     fn ensure_diff_copy(&self, rel: &Path) -> io::Result<()> {
-        let diff_path = self.overlay.diff_root().join(rel);
-        if diff_path.exists() {
-            return Ok(());
-        }
-        let base_path = self.overlay.base_root().join(rel);
-        let meta = fs::symlink_metadata(&base_path)?;
-        if meta.is_dir() {
-            fs::create_dir_all(&diff_path)?;
-        } else if meta.is_file() {
-            if let Some(parent) = diff_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&base_path, &diff_path)?;
-        } else if meta.file_type().is_symlink() {
-            if let Some(parent) = diff_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let target = fs::read_link(&base_path)?;
-            symlink(target, &diff_path)?;
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "unsupported file type for copy-up",
-            ));
-        }
-        Ok(())
+        self.overlay
+            .ensure_copy_up(rel)
+            .map_err(|err| io::Error::from_raw_os_error(Self::err_from_anyhow(err)))
     }
 
     fn visible_dir_entries(&self, rel: &Path) -> io::Result<Vec<String>> {

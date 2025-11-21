@@ -7,4 +7,7 @@ pub mod chain;
 pub mod metadata;
 
 pub use chain::{BackupChain, ChainIntegrity};
-pub use metadata::{BackupMetadata, BackupStatus, BackupStore, BackupType, ChecksumState};
+pub use metadata::{
+    BackupMetadata, BackupStatus, BackupStore, BackupType, ChecksumState, Compression,
+    CompressionAlgorithm,
+};

@@ -85,7 +85,7 @@ fn classify_compression(chain: &[BackupMetadata]) -> CompressionMix {
     let mut compressed = 0usize;
     let mut uncompressed = 0usize;
     for bk in chain {
-        if bk.compressed {
+        if bk.is_compressed() {
             compressed += 1;
         } else {
             uncompressed += 1;

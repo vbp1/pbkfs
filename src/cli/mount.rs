@@ -172,7 +172,13 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
     binding.write_to_diff(&diff_dir)?;
     info!(binding_id=%binding.binding_id, "binding persisted to diff");
 
-    let overlay = Overlay::new(&store.path, &diff_dir.path)?;
+    let compression = chain
+        .elements
+        .iter()
+        .rev()
+        .find(|b| b.is_compressed())
+        .and_then(|b| b.compression_algorithm());
+    let overlay = Overlay::new_with_compression(&store.path, &diff_dir.path, compression)?;
 
     // Persist lock markers before mounting so writes hit the real FS, not the FUSE layer.
     let mut session = MountSession::new(binding.binding_id, &mnt_path);

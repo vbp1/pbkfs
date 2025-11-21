@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -25,6 +26,52 @@ pub enum ChecksumState {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionAlgorithm {
+    Zlib,
+    Lz4,
+    Zstd,
+}
+
+impl CompressionAlgorithm {
+    pub fn from_pg_probackup(value: &str) -> Result<Self> {
+        match value.to_lowercase().as_str() {
+            "zlib" => Ok(Self::Zlib),
+            "lz4" => Ok(Self::Lz4),
+            "zstd" | "zstandard" => Ok(Self::Zstd),
+            other => Err(Error::UnsupportedCompressionAlgorithm(other.to_string()).into()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CompressionAlgorithm {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        CompressionAlgorithm::from_pg_probackup(&raw).map_err(|_| {
+            serde::de::Error::custom(format!("unsupported compression algorithm: {raw}"))
+        })
+    }
+}
+
+impl FromStr for CompressionAlgorithm {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::from_pg_probackup(s)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Compression {
+    pub algorithm: CompressionAlgorithm,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupMetadata {
     pub backup_id: String,
@@ -34,6 +81,8 @@ pub struct BackupMetadata {
     pub start_time: String,
     pub status: BackupStatus,
     pub compressed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Compression>,
     pub size_bytes: u64,
     pub checksum_state: ChecksumState,
 }
@@ -93,6 +142,9 @@ impl BackupStore {
                 Error::UnsupportedPgProbackupVersion(self.version_pg_probackup.clone()).into(),
             );
         }
+        for backup in &self.backups {
+            backup.validate_compression()?;
+        }
         Ok(())
     }
 
@@ -138,6 +190,30 @@ impl BackupStore {
 impl BackupMetadata {
     pub fn is_ok(&self) -> bool {
         matches!(self.status, BackupStatus::Ok)
+    }
+
+    pub fn is_compressed(&self) -> bool {
+        self.compressed || self.compression.is_some()
+    }
+
+    pub fn compression_algorithm(&self) -> Option<CompressionAlgorithm> {
+        self.compression.as_ref().map(|c| c.algorithm)
+    }
+
+    pub fn compression_level(&self) -> Option<u8> {
+        self.compression.as_ref().and_then(|c| c.level)
+    }
+
+    pub fn validate_compression(&self) -> Result<()> {
+        if !self.is_compressed() {
+            return Ok(());
+        }
+
+        if self.compression.is_none() {
+            return Err(Error::MissingCompressionMetadata(self.backup_id.clone()).into());
+        }
+
+        Ok(())
     }
 
     pub fn ensure_instance(&self, instance: &str) -> Result<()> {

@@ -27,6 +27,9 @@ clap = { version = "4.5", features = ["derive"] }
 once_cell = "1.19"
 libc = "0.2"
 ctrlc = "3"
+flate2 = "1.0"
+lz4_flex = { version = "0.10", features = ["std"] }
+zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -46,6 +49,10 @@ path = "tests/unit/chain_resolution_tests.rs"
 [[test]]
 name = "unit_binding_tests"
 path = "tests/unit/binding_tests.rs"
+
+[[test]]
+name = "unit_metadata_tests"
+path = "tests/unit/metadata_tests.rs"
 
 [[test]]
 name = "integration_mount_postgres_tests"

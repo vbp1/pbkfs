@@ -1,6 +1,7 @@
 use pbkfs::backup::chain::{BackupChain, ChainIntegrity, CompressionMix};
 use pbkfs::backup::metadata::{
-    BackupMetadata, BackupStatus, BackupStore, BackupType, ChecksumState,
+    BackupMetadata, BackupStatus, BackupStore, BackupType, ChecksumState, Compression,
+    CompressionAlgorithm,
 };
 
 fn meta(
@@ -9,6 +10,10 @@ fn meta(
     backup_type: BackupType,
     compressed: bool,
 ) -> BackupMetadata {
+    let compression = compressed.then(|| Compression {
+        algorithm: CompressionAlgorithm::Zstd,
+        level: Some(3),
+    });
     BackupMetadata {
         backup_id: id.to_string(),
         instance_name: "main".to_string(),
@@ -17,6 +22,7 @@ fn meta(
         start_time: "2024-01-01T00:00:00Z".to_string(),
         status: BackupStatus::Ok,
         compressed,
+        compression,
         size_bytes: 1024,
         checksum_state: ChecksumState::Verified,
     }
