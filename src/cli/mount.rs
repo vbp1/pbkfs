@@ -101,23 +101,8 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
 
     let mut session = MountSession::new(binding.binding_id, &mnt_path);
 
-    // Spawn FUSE if explicitly enabled; this keeps tests runnable in minimal
-    // environments without /dev/fuse. Opt-in via PBKFS_ENABLE_FUSE=1.
-    let fuse_handle = match std::env::var("PBKFS_ENABLE_FUSE").as_deref() {
-        Ok("1") => match fuse::spawn_overlay(overlay.clone(), &mnt_path) {
-            Ok(h) => Some(h),
-            Err(e) => {
-                let maybe_io = e.downcast_ref::<std::io::Error>().and_then(|ioe| ioe.raw_os_error());
-                if matches!(maybe_io, Some(libc::ENOSYS) | Some(libc::EPERM) | Some(libc::EACCES)) {
-                    info!(error=%e, "FUSE not available; continuing without kernel mount");
-                    None
-                } else {
-                    return Err(e);
-                }
-            }
-        },
-        _ => None,
-    };
+    // Start FUSE session; if it fails, surface the error.
+    let fuse_handle = Some(fuse::spawn_overlay(overlay.clone(), &mnt_path)?);
 
     // Persist a simple lock marker in both the diff and target paths so unmount can locate it.
     let marker = LockMarker {
