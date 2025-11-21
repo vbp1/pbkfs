@@ -1,0 +1,21 @@
+version: '3.9'
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: example
+      POSTGRES_USER: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+  pg_probackup:
+    image: verkhovsky/pg_probackup:2.6
+    depends_on:
+      - postgres
+    environment:
+      POSTGRES_PASSWORD: example
+      POSTGRES_USER: postgres
+    volumes:
+      - ./data/pg_probackup:/var/lib/pg_probackup
+      - ./fixtures:/fixtures:ro

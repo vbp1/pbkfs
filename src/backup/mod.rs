@@ -1,3 +1,10 @@
 //! Backup domain module scaffolding.
+//!
+//! Contains metadata loading from pg_probackup output and backup chain
+//! construction/validation utilities.
 
-// TODO: add metadata loading and chain resolution types.
+pub mod chain;
+pub mod metadata;
+
+pub use chain::{BackupChain, ChainIntegrity};
+pub use metadata::{BackupMetadata, BackupStatus, BackupStore, BackupType, ChecksumState};
