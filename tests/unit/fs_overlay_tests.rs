@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use pbkfs::backup::metadata::CompressionAlgorithm;
-use pbkfs::fs::overlay::Overlay;
+use pbkfs::fs::overlay::{Layer, Overlay};
 use tempfile::tempdir;
 
 #[test]
@@ -89,4 +89,52 @@ fn copy_up_decompresses_compressed_file_on_first_read() -> pbkfs::Result<()> {
 fn unsupported_compression_algorithm_fails_fast() {
     let result = CompressionAlgorithm::from_pg_probackup("pglz");
     assert!(result.is_err());
+}
+
+#[test]
+fn sparse_incremental_materializes_from_base() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let inc = tempdir()?;
+    let diff = tempdir()?;
+
+    // Base full file with content
+    let base_file = base.path().join("FULL1").join("database");
+    let base_data = vec![b'A'; 8192 * 2];
+    fs::create_dir_all(&base_file)?;
+    fs::write(base_file.join("tbl"), &base_data)?;
+
+    // Incremental file writes only second block (simulate sparse change)
+    let inc_db = inc.path().join("INC1").join("database");
+    fs::create_dir_all(&inc_db)?;
+    let inc_path = inc_db.join("tbl");
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&inc_path)?;
+    use std::io::{Seek, SeekFrom, Write};
+    f.seek(SeekFrom::Start(8192))?;
+    f.write_all(&vec![b'B'; 8192])?;
+
+    // Build overlay with layers: inc then base
+    let layers = vec![
+        Layer {
+            root: inc.path().join("INC1").join("database"),
+            compression: None,
+            incremental: true,
+        },
+        Layer {
+            root: base.path().join("FULL1").join("database"),
+            compression: None,
+            incremental: false,
+        },
+    ];
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    let materialized = overlay.read(Path::new("tbl"))?.expect("materialized file");
+    assert_eq!(8192 * 2, materialized.len());
+    assert_eq!(&base_data[..8192], &materialized[..8192]);
+    assert_eq!(&vec![b'B'; 8192][..], &materialized[8192..]);
+
+    Ok(())
 }

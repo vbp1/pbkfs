@@ -1,5 +1,6 @@
 //! Copy-on-write overlay helpers used by tests and FUSE adapter.
 
+use std::os::fd::AsRawFd;
 use std::{
     collections::HashSet,
     fs, io,
@@ -25,6 +26,7 @@ pub struct Overlay {
 pub struct Layer {
     pub root: PathBuf,
     pub compression: Option<CompressionAlgorithm>,
+    pub incremental: bool,
 }
 
 #[derive(Debug)]
@@ -43,6 +45,7 @@ impl Overlay {
             vec![Layer {
                 root: base.as_ref().to_path_buf(),
                 compression: None,
+                incremental: false,
             }],
         )
     }
@@ -58,6 +61,7 @@ impl Overlay {
             vec![Layer {
                 root: base.as_ref().to_path_buf(),
                 compression,
+                incremental: false,
             }],
         )
     }
@@ -70,6 +74,7 @@ impl Overlay {
         let layer = Layer {
             root: base.as_ref().to_path_buf(),
             compression: compression_algorithms.first().copied(),
+            incremental: false,
         };
         Self::new_with_layers(base, diff, vec![layer])
     }
@@ -103,12 +108,17 @@ impl Overlay {
             return Ok(Some(fs::read(diff_path)?));
         }
 
-        let (base_path, compression) = match self.find_layer_path(rel) {
+        let (base_path, compression, incremental) = match self.find_layer_path(rel) {
             Some(v) => v,
             None => return Ok(None),
         };
 
         if compression.is_some() {
+            self.ensure_copy_up(rel)?;
+            return Ok(Some(fs::read(diff_path)?));
+        }
+
+        if incremental {
             self.ensure_copy_up(rel)?;
             return Ok(Some(fs::read(diff_path)?));
         }
@@ -173,7 +183,7 @@ impl Overlay {
             return Ok(());
         }
 
-        let (base_path, compression) = self
+        let (base_path, compression, incremental) = self
             .find_layer_path(rel)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         let meta = fs::symlink_metadata(&base_path)?;
@@ -200,6 +210,10 @@ impl Overlay {
 
         if let Some(algo) = compression {
             return self.decompress_file(rel, &base_path, &diff_path, algo);
+        }
+
+        if incremental {
+            return self.materialize_incremental(rel, &base_path, &diff_path);
         }
 
         if let Some(parent) = diff_path.parent() {
@@ -263,11 +277,87 @@ impl Overlay {
         result
     }
 
-    pub fn find_layer_path(&self, rel: &Path) -> Option<(PathBuf, Option<CompressionAlgorithm>)> {
+    fn materialize_incremental(&self, rel: &Path, inc_path: &Path, diff_path: &Path) -> Result<()> {
+        // Find closest ancestor file in older layers.
+        let ancestor = self
+            .inner
+            .layers
+            .iter()
+            .skip(1) // older layers after the current one
+            .find_map(|layer| {
+                let candidate = layer.root.join(rel);
+                candidate
+                    .exists()
+                    .then_some((candidate, layer.compression, layer.incremental))
+            })
+            .ok_or_else(|| Error::MissingBackup(rel.display().to_string()))?;
+
+        // Start from ancestor content.
+        if let Some(parent) = diff_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match fs::copy(&ancestor.0, diff_path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Create empty if ancestor missing (should not happen)
+                fs::File::create(diff_path)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        // Overlay changed extents from incremental file using sparse extents where possible.
+        let mut inc_file = fs::File::open(inc_path)?;
+        let mut out = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(diff_path)?;
+
+        // Try SEEK_DATA/SEEK_HOLE to preserve holes; fallback to full copy.
+        #[cfg(target_os = "linux")]
+        {
+            use libc::{loff_t, SEEK_DATA, SEEK_HOLE};
+            use std::os::unix::fs::FileExt;
+
+            let mut off: loff_t = 0;
+            let inc_fd = inc_file.as_raw_fd();
+            let mut buf = vec![0u8; 8192 * 4];
+            loop {
+                let data_off = unsafe { libc::lseek(inc_fd, off, SEEK_DATA) };
+                if data_off == -1 {
+                    break;
+                }
+                let hole_off = unsafe { libc::lseek(inc_fd, data_off, SEEK_HOLE) };
+                let end = if hole_off == -1 { data_off } else { hole_off };
+                let mut cursor = data_off as u64;
+                while cursor < end as u64 {
+                    let to_read = std::cmp::min(buf.len() as u64, end as u64 - cursor) as usize;
+                    let n = inc_file.read_at(&mut buf[..to_read], cursor)?;
+                    if n == 0 {
+                        break;
+                    }
+                    out.write_all_at(&buf[..n], cursor)?;
+                    cursor += n as u64;
+                }
+                off = end;
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            io::copy(&mut inc_file, &mut out)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn find_layer_path(
+        &self,
+        rel: &Path,
+    ) -> Option<(PathBuf, Option<CompressionAlgorithm>, bool)> {
         for layer in &self.inner.layers {
             let candidate = layer.root.join(rel);
             if candidate.exists() {
-                return Some((candidate, layer.compression));
+                return Some((candidate, layer.compression, layer.incremental));
             }
         }
         None

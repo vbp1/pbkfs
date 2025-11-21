@@ -192,7 +192,7 @@ impl OverlayFs {
         let (meta, from_diff) = match fs::symlink_metadata(self.overlay.diff_root().join(rel)) {
             Ok(m) => (m, true),
             Err(_) => {
-                let (base_path, _) = self.overlay.find_layer_path(rel)?;
+                let (base_path, _, _) = self.overlay.find_layer_path(rel)?;
                 fs::symlink_metadata(base_path).ok().map(|m| (m, false))?
             }
         };
@@ -902,7 +902,7 @@ impl Filesystem for OverlayFs {
                 diff
             } else {
                 match self.overlay.find_layer_path(&rel) {
-                    Some((p, _)) => p,
+                    Some((p, _, _)) => p,
                     None => {
                         reply.error(ENOENT);
                         return;

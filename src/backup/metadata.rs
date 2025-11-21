@@ -13,6 +13,14 @@ pub enum BackupType {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BackupMode {
+    Full,
+    Delta,
+    Page,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BackupStatus {
     Ok,
     Corrupt,
@@ -77,6 +85,7 @@ pub struct BackupMetadata {
     pub backup_id: String,
     pub instance_name: String,
     pub backup_type: BackupType,
+    pub backup_mode: BackupMode,
     pub parent_id: Option<String>,
     pub start_time: String,
     pub status: BackupStatus,
@@ -272,9 +281,11 @@ fn backup_from_show(instance: &str, b: ShowBackupJson) -> Result<BackupMetadata>
         })
     };
 
-    let backup_type = match b.backup_mode.to_uppercase().as_str() {
-        "FULL" => BackupType::Full,
-        _ => BackupType::Incremental,
+    let (backup_type, backup_mode) = match b.backup_mode.to_uppercase().as_str() {
+        "FULL" => (BackupType::Full, BackupMode::Full),
+        "DELTA" => (BackupType::Incremental, BackupMode::Delta),
+        "PAGE" => (BackupType::Incremental, BackupMode::Page),
+        _ => (BackupType::Incremental, BackupMode::Unknown),
     };
 
     let status = match b.status.to_uppercase().as_str() {
@@ -287,6 +298,7 @@ fn backup_from_show(instance: &str, b: ShowBackupJson) -> Result<BackupMetadata>
         backup_id: b.id,
         instance_name: instance.to_string(),
         backup_type,
+        backup_mode,
         parent_id: b.parent_backup_id,
         start_time: b.start_time,
         status,

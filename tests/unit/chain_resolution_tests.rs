@@ -19,6 +19,11 @@ fn meta(
         backup_id: id.to_string(),
         instance_name: "main".to_string(),
         backup_type,
+        backup_mode: if matches!(backup_type, BackupType::Full) {
+            pbkfs::backup::BackupMode::Full
+        } else {
+            pbkfs::backup::BackupMode::Delta
+        },
         parent_id: parent.map(|p| p.to_string()),
         start_time: "2024-01-01T00:00:00Z".to_string(),
         status: BackupStatus::Ok,
