@@ -14,24 +14,24 @@ fn write_backups_json(dir: &std::path::Path, body: serde_json::Value) {
 #[test]
 fn loads_compression_algorithm_and_level() -> pbkfs::Result<()> {
     let store = tempdir()?;
-    let metadata = serde_json::json!({
-        "instance_name": "main",
-        "version_pg_probackup": "2.6.0",
-        "backups": [
-            {
-                "backup_id": "FULL1",
-                "instance_name": "main",
-                "backup_type": "Full",
-                "parent_id": null,
-                "start_time": "2024-01-01T00:00:00Z",
-                "status": "Ok",
-                "compressed": true,
-                "compression": { "algorithm": "zstd", "level": 6 },
-                "size_bytes": 1024u64,
-                "checksum_state": "Verified"
-            }
-        ]
-    });
+    let metadata = serde_json::json!([
+        {
+            "instance": "main",
+            "backups": [
+                {
+                    "id": "FULL1",
+                    "parent-backup-id": null,
+                    "backup-mode": "FULL",
+                    "status": "OK",
+                    "compress-alg": "zstd",
+                    "compress-level": 6,
+                    "start-time": "2024-01-01T00:00:00Z",
+                    "data-bytes": 1024u64,
+                    "program-version": "2.6.0"
+                }
+            ]
+        }
+    ]);
     write_backups_json(store.path(), metadata);
 
     let loaded = BackupStore::load_from_pg_probackup(store.path(), "main")?;
@@ -49,24 +49,23 @@ fn loads_compression_algorithm_and_level() -> pbkfs::Result<()> {
 #[test]
 fn rejects_unsupported_compression_algorithm() {
     let store = tempdir().unwrap();
-    let metadata = serde_json::json!({
-        "instance_name": "main",
-        "version_pg_probackup": "2.6.0",
-        "backups": [
-            {
-                "backup_id": "FULL1",
-                "instance_name": "main",
-                "backup_type": "Full",
-                "parent_id": null,
-                "start_time": "2024-01-01T00:00:00Z",
-                "status": "Ok",
-                "compressed": true,
-                "compression": { "algorithm": "pglz" },
-                "size_bytes": 1024u64,
-                "checksum_state": "Verified"
-            }
-        ]
-    });
+    let metadata = serde_json::json!([
+        {
+            "instance": "main",
+            "backups": [
+                {
+                    "id": "FULL1",
+                    "parent-backup-id": null,
+                    "backup-mode": "FULL",
+                    "status": "OK",
+                    "compress-alg": "pglz",
+                    "start-time": "2024-01-01T00:00:00Z",
+                    "data-bytes": 1024u64,
+                    "program-version": "2.6.0"
+                }
+            ]
+        }
+    ]);
     write_backups_json(store.path(), metadata);
 
     let err = BackupStore::load_from_pg_probackup(store.path(), "main").unwrap_err();

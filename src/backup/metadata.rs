@@ -96,11 +96,36 @@ pub struct BackupStore {
     pub version_postgres_supported: (u16, u16),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedStore {
-    instance_name: String,
-    version_pg_probackup: String,
-    backups: Vec<BackupMetadata>,
+#[derive(Debug, Clone, Deserialize)]
+struct ShowBackupJson {
+    id: String,
+    #[serde(rename = "parent-backup-id")]
+    parent_backup_id: Option<String>,
+    #[serde(rename = "backup-mode")]
+    backup_mode: String,
+    status: String,
+    #[serde(rename = "compress-alg")]
+    compress_alg: String,
+    #[serde(rename = "compress-level")]
+    compress_level: Option<u8>,
+    #[serde(rename = "start-time")]
+    start_time: String,
+    #[serde(rename = "data-bytes")]
+    data_bytes: Option<u64>,
+    #[serde(rename = "uncompressed-bytes")]
+    uncompressed_bytes: Option<u64>,
+    #[serde(rename = "wal-bytes")]
+    wal_bytes: Option<u64>,
+    #[serde(rename = "program-version")]
+    program_version: Option<String>,
+    #[serde(rename = "server-version")]
+    server_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShowInstanceJson {
+    instance: String,
+    backups: Vec<ShowBackupJson>,
 }
 
 impl BackupStore {
@@ -132,12 +157,9 @@ impl BackupStore {
         if !self.path.is_dir() {
             return Err(Error::InvalidStorePath(self.path.display().to_string()).into());
         }
-        if self.version_pg_probackup.trim().is_empty() {
-            return Err(
-                Error::UnsupportedPgProbackupVersion(self.version_pg_probackup.clone()).into(),
-            );
-        }
-        if !version_supported(&self.version_pg_probackup) {
+        if !self.version_pg_probackup.trim().is_empty()
+            && !version_supported(&self.version_pg_probackup)
+        {
             return Err(
                 Error::UnsupportedPgProbackupVersion(self.version_pg_probackup.clone()).into(),
             );
@@ -156,8 +178,8 @@ impl BackupStore {
 
     /// Load backup store metadata from a JSON payload produced by pg_probackup.
     ///
-    /// For this codebase we expect a fixture file `<pbk_store>/backups.json`
-    /// containing a serialized [`SerializedStore`].
+    /// Expected format mirrors `pg_probackup show --format=json` output:
+    /// [ { "instance": "name", "backups": [ { .. } ] } ]
     pub fn load_from_pg_probackup<P: AsRef<Path>>(path: P, instance: &str) -> Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
@@ -166,22 +188,29 @@ impl BackupStore {
 
         let meta_path = path.join("backups.json");
         let contents = std::fs::read(&meta_path)?;
-        let parsed: SerializedStore = serde_json::from_slice(&contents)?;
+        let mut instances: Vec<ShowInstanceJson> = serde_json::from_slice(&contents)?;
 
-        if parsed.instance_name != instance {
-            return Err(Error::BindingViolation {
+        let inst = instances
+            .drain(..)
+            .find(|i| i.instance == instance)
+            .ok_or_else(|| Error::BindingViolation {
                 expected: instance.to_string(),
-                actual: parsed.instance_name,
-            }
-            .into());
-        }
+                actual: "<missing>".into(),
+            })?;
 
-        let store = BackupStore::new(
-            path,
-            parsed.instance_name,
-            parsed.version_pg_probackup.clone(),
-            parsed.backups,
-        )?;
+        let version_pg_probackup = inst
+            .backups
+            .iter()
+            .find_map(|b| b.program_version.clone())
+            .unwrap_or_else(|| "unknown".into());
+
+        let backups = inst
+            .backups
+            .into_iter()
+            .map(|b| backup_from_show(instance, b))
+            .collect::<Result<Vec<_>>>()?;
+
+        let store = BackupStore::new(path, inst.instance, version_pg_probackup, backups)?;
         store.validate()?;
         Ok(store)
     }
@@ -231,6 +260,41 @@ impl BackupMetadata {
 /// Convenience helper for binding identifiers.
 pub fn new_binding_id() -> Uuid {
     Uuid::new_v4()
+}
+
+fn backup_from_show(instance: &str, b: ShowBackupJson) -> Result<BackupMetadata> {
+    let compression = if b.compress_alg.to_lowercase() == "none" {
+        None
+    } else {
+        Some(Compression {
+            algorithm: CompressionAlgorithm::from_pg_probackup(&b.compress_alg)?,
+            level: b.compress_level,
+        })
+    };
+
+    let backup_type = match b.backup_mode.to_uppercase().as_str() {
+        "FULL" => BackupType::Full,
+        _ => BackupType::Incremental,
+    };
+
+    let status = match b.status.to_uppercase().as_str() {
+        "OK" => BackupStatus::Ok,
+        "ERROR" | "CORRUPT" => BackupStatus::Corrupt,
+        _ => BackupStatus::Unknown,
+    };
+
+    Ok(BackupMetadata {
+        backup_id: b.id,
+        instance_name: instance.to_string(),
+        backup_type,
+        parent_id: b.parent_backup_id,
+        start_time: b.start_time,
+        status,
+        compressed: compression.is_some(),
+        compression,
+        size_bytes: b.data_bytes.unwrap_or(0),
+        checksum_state: ChecksumState::NotVerified,
+    })
 }
 
 fn version_supported(version: &str) -> bool {

@@ -11,27 +11,24 @@ use pbkfs::{cli::mount::MountArgs, cli::unmount};
 use tempfile::tempdir;
 
 fn write_metadata(store: &Path, compressed: bool, compression: Option<(&str, Option<u8>)>) {
-    let metadata = serde_json::json!({
-        "instance_name": "main",
-        "version_pg_probackup": "2.6.0",
-        "backups": [
-            {
-                "backup_id": "FULL1",
-                "instance_name": "main",
-                "backup_type": "Full",
-                "parent_id": null,
-                "start_time": "2024-01-01T00:00:00Z",
-                "status": "Ok",
-                "compressed": compressed,
-                "compression": compression.map(|(alg, level)| serde_json::json!({
-                    "algorithm": alg,
-                    "level": level
-                })),
-                "size_bytes": 1024u64,
-                "checksum_state": "Verified"
-            }
-        ]
-    });
+    let metadata = serde_json::json!([
+        {
+            "instance": "main",
+            "backups": [
+                {
+                    "id": "FULL1",
+                    "parent-backup-id": null,
+                    "backup-mode": "FULL",
+                    "status": "OK",
+                    "compress-alg": compression.map(|(alg, _)| alg).unwrap_or("none"),
+                    "compress-level": compression.and_then(|(_, lvl)| lvl),
+                    "start-time": "2024-01-01T00:00:00Z",
+                    "data-bytes": 1024u64,
+                    "program-version": "2.6.0"
+                }
+            ]
+        }
+    ]);
     fs::write(
         store.join("backups.json"),
         serde_json::to_vec_pretty(&metadata).unwrap(),
