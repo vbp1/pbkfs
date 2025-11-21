@@ -29,7 +29,11 @@ fn overlay_read_write_is_fast_enough() -> pbkfs::Result<()> {
     assert_eq!(payload.len(), read.len());
     // The exact budget is generous; we're only guarding against accidental
     // regressions from obvious pathologies (e.g., repeated fs::metadata calls).
-    assert!(elapsed.as_millis() < 50, "overlay operations too slow: {:?}", elapsed);
+    assert!(
+        elapsed.as_millis() < 50,
+        "overlay operations too slow: {:?}",
+        elapsed
+    );
 
     Ok(())
 }

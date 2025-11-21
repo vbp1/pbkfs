@@ -28,8 +28,11 @@ fn write_metadata(store: &Path) {
             }
         ]
     });
-    fs::write(store.join("backups.json"), serde_json::to_vec_pretty(&metadata).unwrap())
-        .unwrap();
+    fs::write(
+        store.join("backups.json"),
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -55,7 +58,9 @@ fn mounts_backup_and_preserves_store_immutability() -> pbkfs::Result<()> {
     let ctx = pbkfs::cli::mount::mount(args)?;
 
     // Reads come from base
-    let contents = ctx.overlay.read(Path::new("data/base.txt"))?
+    let contents = ctx
+        .overlay
+        .read(Path::new("data/base.txt"))?
         .expect("base file should be visible");
     assert_eq!(b"from-store", contents.as_slice());
 
@@ -63,7 +68,9 @@ fn mounts_backup_and_preserves_store_immutability() -> pbkfs::Result<()> {
     ctx.overlay
         .write(Path::new("data/base.txt"), b"from-diff")?;
 
-    let reread = ctx.overlay.read(Path::new("data/base.txt"))?
+    let reread = ctx
+        .overlay
+        .read(Path::new("data/base.txt"))?
         .expect("diff value should be returned");
     assert_eq!(b"from-diff", reread.as_slice());
 

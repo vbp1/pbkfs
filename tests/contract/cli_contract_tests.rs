@@ -24,7 +24,10 @@ fn expect_error(args: &[&str], expected: Error) {
 #[test]
 fn mount_requires_target_and_store_paths() {
     // Missing all required paths
-    expect_error(&["pbkfs", "mount"], Error::Cli("pbk_store is required".into()));
+    expect_error(
+        &["pbkfs", "mount"],
+        Error::Cli("pbk_store is required".into()),
+    );
 
     // Non-empty target directory should fail fast
     let store = tempdir().unwrap();
@@ -56,7 +59,10 @@ fn mount_requires_target_and_store_paths() {
 
 #[test]
 fn unmount_requires_mnt_path() {
-    expect_error(&["pbkfs", "unmount"], Error::Cli("mnt_path is required".into()));
+    expect_error(
+        &["pbkfs", "unmount"],
+        Error::Cli("mnt_path is required".into()),
+    );
 
     // Non-existent mount path should also error
     let err = pbkfs::run(["pbkfs", "unmount", "--mnt-path", "/no/such/path"])

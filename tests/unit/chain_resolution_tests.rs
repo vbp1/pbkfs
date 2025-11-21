@@ -1,7 +1,14 @@
 use pbkfs::backup::chain::{BackupChain, ChainIntegrity, CompressionMix};
-use pbkfs::backup::metadata::{BackupMetadata, BackupStatus, BackupStore, BackupType, ChecksumState};
+use pbkfs::backup::metadata::{
+    BackupMetadata, BackupStatus, BackupStore, BackupType, ChecksumState,
+};
 
-fn meta(id: &str, parent: Option<&str>, backup_type: BackupType, compressed: bool) -> BackupMetadata {
+fn meta(
+    id: &str,
+    parent: Option<&str>,
+    backup_type: BackupType,
+    compressed: bool,
+) -> BackupMetadata {
     BackupMetadata {
         backup_id: id.to_string(),
         instance_name: "main".to_string(),
@@ -36,7 +43,12 @@ fn constructs_chain_from_incremental() -> pbkfs::Result<()> {
 
 #[test]
 fn marks_chain_incomplete_when_parent_missing() -> pbkfs::Result<()> {
-    let backups = vec![meta("INC1", Some("MISSING"), BackupType::Incremental, false)];
+    let backups = vec![meta(
+        "INC1",
+        Some("MISSING"),
+        BackupType::Incremental,
+        false,
+    )];
     let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
 
     let chain = BackupChain::from_target_backup(&store, "INC1")?;

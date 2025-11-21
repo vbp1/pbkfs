@@ -10,7 +10,15 @@ fn writes_and_reads_binding_record() -> pbkfs::Result<()> {
     diff.ensure_writable()?;
 
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
-    let mut record = BindingRecord::new("main", "FULL1", "/pbk_store", "/pbk_target", std::process::id() as i32, host, "0.1.0");
+    let mut record = BindingRecord::new(
+        "main",
+        "FULL1",
+        "/pbk_store",
+        "/pbk_target",
+        std::process::id() as i32,
+        host,
+        "0.1.0",
+    );
     record.mark_stale();
     record.touch();
     record.write_to_diff(&diff)?;
