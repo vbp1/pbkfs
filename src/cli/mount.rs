@@ -1,6 +1,11 @@
 //! Implementation of `pbkfs mount` subcommand.
 
-use std::{fs, path::PathBuf, sync::mpsc};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    time::Duration,
+};
 
 use clap::Args;
 use serde_json;
@@ -55,28 +60,72 @@ pub fn execute(args: MountArgs) -> Result<()> {
     if let Some(handle) = ctx.fuse_handle.take() {
         info!("pbkfs mount active; press Ctrl+C to unmount");
 
+        #[derive(Debug)]
+        enum Event {
+            Signal,
+            Unmounted,
+        }
+
         let (tx, rx) = mpsc::channel();
-        ctrlc::set_handler(move || {
-            let _ = tx.send(());
+
+        // Handle SIGINT/SIGTERM.
+        ctrlc::set_handler({
+            let tx = tx.clone();
+            move || {
+                let _ = tx.send(Event::Signal);
+            }
         })
         .map_err(|e| Error::Cli(format!("failed to install signal handler: {e}")))?;
 
-        // Block until we receive a signal.
-        let _ = rx.recv();
+        // Watch for external unmounts.
+        let mount_path = ctx.session.pbk_target_path.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if !is_mounted(&mount_path) {
+                let _ = tx.send(Event::Unmounted);
+                break;
+            }
+        });
 
-        info!(
-            "signal received; unmounting {}",
-            ctx.session.pbk_target_path.display()
-        );
-
-        // Attempt graceful unmount; this drops the session and joins the FUSE thread.
-        handle.unmount();
+        // Wait for either event.
+        match rx.recv() {
+            Ok(Event::Signal) => {
+                info!(
+                    "signal received; unmounting {}",
+                    ctx.session.pbk_target_path.display()
+                );
+                handle.unmount();
+            }
+            Ok(Event::Unmounted) => {
+                info!(
+                    "detected external unmount; exiting for {}",
+                    ctx.session.pbk_target_path.display()
+                );
+                // Join the session to ensure the background thread is cleaned up.
+                handle.unmount();
+            }
+            Err(_) => {
+                handle.unmount();
+            }
+        }
 
         // Clean lock markers best-effort.
         let _ = std::fs::remove_file(ctx.diff_dir.path.join(LOCK_FILE));
     }
 
     Ok(())
+}
+
+/// Check if a path is currently mounted (Linux-only, /proc/mounts).
+fn is_mounted(path: &Path) -> bool {
+    if let Ok(contents) = fs::read_to_string("/proc/mounts") {
+        let target = path.to_string_lossy();
+        return contents
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .any(|p| p == target);
+    }
+    false
 }
 
 /// Perform mount orchestration used by both the CLI and tests.
