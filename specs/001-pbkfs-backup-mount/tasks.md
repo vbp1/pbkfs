@@ -92,6 +92,9 @@ description: "Task list template for feature implementation"
 - [X] T033c [US1] Add writeback/size-truncate handling (truncate, fallocate stub ok) to keep Postgres file sizes consistent in `src/fs/fuse.rs`
 - [X] T033d [US1] Keep mount process alive after successful mount (hold `MountHandle` until signal), graceful shutdown on SIGINT/SIGTERM with proper lock cleanup in `src/cli/mount.rs`
 - [X] T033e [US1] Enhance `pbkfs unmount` to perform actual OS unmount (fusermount/umount fallback) and terminate background mount while cleaning diff/target lock markers in `src/cli/unmount.rs`
+- [ ] T033f [US1] Extend backup metadata to capture compression algorithm/level from pg_probackup JSON and surface in domain types in `src/backup/metadata.rs`
+- [ ] T033g [US1] Implement decompress-on-first-read copy-up for compressed backup files (zlib/lz4/zstd) with per-file lock to prevent duplicate work in `src/fs/overlay.rs`
+- [ ] T033h [US1] Add unit/integration tests for compressed file handling (copy-up + immutability) and fail-fast on unsupported algorithms in `tests/unit/fs_overlay_tests.rs` and fixtures
 - [X] T034 [US1] Implement mount orchestration that validates `pbk_target`, starts and stops the FUSE session, and transitions `MountSession` state for `pbkfs mount`/`pbkfs unmount` in `src/fs/mod.rs`
 - [X] T035 [US1] Wire CLI `mount` and `unmount` commands through library entrypoint, combining backup store load, chain resolution, diff/binding setup, and FUSE mount/unmount with proper exit codes in `src/lib.rs`
 - [X] T036 [US1] Add structured logging (spans and events) around mount lifecycle (validation, chain resolution, FUSE start/stop) in `src/logging/mod.rs`
