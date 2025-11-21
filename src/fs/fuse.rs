@@ -295,6 +295,15 @@ pub fn spawn_overlay<P: AsRef<Path>>(overlay: Overlay, mountpoint: P) -> Result<
     let mountpoint = mountpoint.as_ref().to_string_lossy().to_string();
     let fs = OverlayFs::new(overlay.clone());
     let options = vec![MountOption::FSName("pbkfs".into())];
-    let session = fuser::spawn_mount2(fs, &mountpoint, &options)?;
-    Ok(MountHandle { mountpoint, session })
+    match fuser::spawn_mount2(fs, &mountpoint, &options) {
+        Ok(session) => Ok(MountHandle { mountpoint, session }),
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+            // Some older kernels don't support the newer mount path; try the legacy helper.
+            let fs_fallback = OverlayFs::new(overlay);
+            #[allow(deprecated)]
+            let session = fuser::spawn_mount(fs_fallback, &mountpoint, &[])?;
+            Ok(MountHandle { mountpoint, session })
+        }
+        Err(e) => Err(e.into()),
+    }
 }
