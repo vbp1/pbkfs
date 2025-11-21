@@ -293,11 +293,25 @@ impl MountHandle {
 /// as non-fatal for now.
 pub fn spawn_overlay<P: AsRef<Path>>(overlay: Overlay, mountpoint: P) -> Result<MountHandle> {
     let mountpoint = mountpoint.as_ref().to_string_lossy().to_string();
-    let fs = OverlayFs::new(overlay);
-    let options = vec![MountOption::FSName("pbkfs".into()), MountOption::AutoUnmount];
-    let session = fuser::spawn_mount2(fs, &mountpoint, &options)?;
-    Ok(MountHandle {
-        mountpoint,
-        session,
-    })
+    let fs = OverlayFs::new(overlay.clone());
+    let options = vec![MountOption::FSName("pbkfs".into())];
+    match fuser::spawn_mount2(fs, &mountpoint, &options) {
+        Ok(session) => Ok(MountHandle { mountpoint, session }),
+        Err(e) => {
+            // Fallback to legacy spawn_mount for environments where spawn_mount2 isn't supported
+            // (older fusermount/fuse). Keep the error if fallback also fails.
+            if let Some(code) = e.raw_os_error() {
+                if code != libc::ENOSYS && code != libc::EPERM && code != libc::EACCES {
+                    return Err(e.into());
+                }
+            }
+
+            let fs_fallback = OverlayFs::new(overlay);
+            let opt = std::ffi::OsString::from("fsname=pbkfs");
+            let args: [&std::ffi::OsStr; 2] = [std::ffi::OsStr::new("-o"), opt.as_os_str()];
+            #[allow(deprecated)]
+            let session = fuser::spawn_mount(fs_fallback, &mountpoint, &args)?;
+            Ok(MountHandle { mountpoint, session })
+        }
+    }
 }
