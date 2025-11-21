@@ -4,16 +4,11 @@ use tracing_subscriber::{fmt, util::SubscriberInitExt, EnvFilter};
 
 use crate::Result;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogFormat {
+    #[default]
     Human,
     Json,
-}
-
-impl Default for LogFormat {
-    fn default() -> Self {
-        LogFormat::Human
-    }
 }
 
 /// Initialize global tracing subscriber. Safe to call multiple times; subsequent
