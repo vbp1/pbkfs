@@ -32,6 +32,17 @@ pub enum Error {
     MissingCompressionMetadata(String),
     #[error("compressed incremental backup unsupported without pagemap (algo={0:?})")]
     UnsupportedCompressedIncremental(crate::backup::CompressionAlgorithm),
+    #[error("pagemap file missing for incremental: {0}")]
+    MissingPagemap(String),
+    #[error("incremental page size mismatch for {path} block {block}: expected {expected} got {actual}")]
+    InvalidIncrementalPageSize {
+        path: String,
+        block: u32,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("incremental data incomplete for {path}; missing pages {missing:?}")]
+    IncompleteIncremental { path: String, missing: Vec<u32> },
     #[error("serialization error")]
     Serde(#[from] serde_json::Error),
     #[error(transparent)]

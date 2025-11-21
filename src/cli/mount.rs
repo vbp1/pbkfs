@@ -12,7 +12,7 @@ use serde_json;
 use tracing::{info, instrument};
 
 use crate::{
-    backup::{chain::BackupChain, metadata::BackupStore, BackupType},
+    backup::{chain::BackupChain, metadata::BackupStore, BackupMode, BackupType},
     binding::{BindingRecord, DiffDir, LockMarker, LOCK_FILE},
     fs::{
         fuse,
@@ -183,6 +183,7 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
             root,
             compression: backup.compression_algorithm(),
             incremental: backup.backup_type == BackupType::Incremental,
+            backup_mode: backup.backup_mode,
         });
     }
     // Fallback for legacy layouts where files sit directly under pbk_store
@@ -191,6 +192,7 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
         root: store.path.join("database"),
         compression: fallback_compression,
         incremental: false,
+        backup_mode: BackupMode::Full,
     });
 
     let overlay = Overlay::new_with_layers(&store.path, &diff_dir.path, layers)?;

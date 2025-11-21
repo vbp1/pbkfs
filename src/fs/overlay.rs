@@ -1,21 +1,32 @@
 //! Copy-on-write overlay helpers used by tests and FUSE adapter.
 
-use std::os::fd::AsRawFd;
 use std::{
     collections::HashSet,
     fs, io,
-    os::unix::fs::symlink,
+    io::{BufReader, Read},
+    os::unix::fs::{symlink, FileExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
 
-use crate::{backup::metadata::CompressionAlgorithm, Error, Result};
+use crate::{
+    backup::metadata::{BackupMode, CompressionAlgorithm},
+    Error, Result,
+};
 use walkdir::WalkDir;
 
 const COPYUP_WAIT_RETRIES: usize = 50;
 const COPYUP_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+const BLCKSZ: usize = 8192;
+const PAGE_TRUNCATED: i32 = -2;
+
+#[repr(C)]
+struct BackupPageHeader {
+    block: u32,
+    compressed_size: i32,
+}
 
 #[derive(Debug, Clone)]
 pub struct Overlay {
@@ -27,6 +38,7 @@ pub struct Layer {
     pub root: PathBuf,
     pub compression: Option<CompressionAlgorithm>,
     pub incremental: bool,
+    pub backup_mode: BackupMode,
 }
 
 #[derive(Debug)]
@@ -46,6 +58,7 @@ impl Overlay {
                 root: base.as_ref().to_path_buf(),
                 compression: None,
                 incremental: false,
+                backup_mode: BackupMode::Full,
             }],
         )
     }
@@ -62,6 +75,7 @@ impl Overlay {
                 root: base.as_ref().to_path_buf(),
                 compression,
                 incremental: false,
+                backup_mode: BackupMode::Full,
             }],
         )
     }
@@ -75,6 +89,7 @@ impl Overlay {
             root: base.as_ref().to_path_buf(),
             compression: compression_algorithms.first().copied(),
             incremental: false,
+            backup_mode: BackupMode::Full,
         };
         Self::new_with_layers(base, diff, vec![layer])
     }
@@ -183,10 +198,14 @@ impl Overlay {
             return Ok(());
         }
 
-        let (base_path, compression, incremental) = self
-            .find_layer_path(rel)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        let meta = fs::symlink_metadata(&base_path)?;
+        let matches = self.matching_layers(rel);
+        if matches.is_empty() {
+            return Err(io::Error::from(io::ErrorKind::NotFound).into());
+        }
+
+        let (top_idx, top_path) = &matches[0];
+        let top_layer = &self.inner.layers[*top_idx];
+        let meta = fs::symlink_metadata(top_path)?;
 
         if meta.is_dir() {
             fs::create_dir_all(&diff_path)?;
@@ -197,7 +216,7 @@ impl Overlay {
             if let Some(parent) = diff_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let target = fs::read_link(&base_path)?;
+            let target = fs::read_link(top_path)?;
             symlink(target, &diff_path)?;
             return Ok(());
         }
@@ -208,18 +227,18 @@ impl Overlay {
             );
         }
 
-        if incremental {
-            return self.materialize_incremental(rel, &base_path, &diff_path, compression);
+        if top_layer.incremental {
+            return self.materialize_incremental_chain(rel, &diff_path, matches);
         }
 
-        if let Some(algo) = compression {
-            return self.decompress_file(rel, &base_path, &diff_path, algo);
+        if let Some(algo) = top_layer.compression {
+            return self.decompress_file(rel, top_path, &diff_path, algo);
         }
 
         if let Some(parent) = diff_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(&base_path, &diff_path)?;
+        fs::copy(top_path, &diff_path)?;
         Ok(())
     }
 
@@ -239,7 +258,20 @@ impl Overlay {
             inflight.insert(rel.to_path_buf());
         }
 
-        let result = match algo {
+        let result = self.decompress_file_inner(base_path, diff_path, algo);
+
+        let mut inflight = self.inner.inflight.lock().unwrap();
+        inflight.remove(rel);
+        result
+    }
+
+    fn decompress_file_inner(
+        &self,
+        base_path: &Path,
+        diff_path: &Path,
+        algo: CompressionAlgorithm,
+    ) -> Result<()> {
+        match algo {
             CompressionAlgorithm::Zlib => {
                 let reader = fs::File::open(base_path)?;
                 let mut decoder = flate2::read::ZlibDecoder::new(reader);
@@ -270,107 +302,233 @@ impl Overlay {
                 io::copy(&mut decoder, &mut out)?;
                 Ok(())
             }
-        };
+        }
+    }
+
+    fn materialize_incremental_chain(
+        &self,
+        rel: &Path,
+        diff_path: &Path,
+        matches: Vec<(usize, PathBuf)>,
+    ) -> Result<()> {
+        {
+            let mut inflight = self.inner.inflight.lock().unwrap();
+            if inflight.contains(rel) {
+                drop(inflight);
+                return self.wait_for_existing(diff_path);
+            }
+            inflight.insert(rel.to_path_buf());
+        }
+
+        let result = self.do_materialize_incremental_chain(rel, diff_path, matches);
 
         let mut inflight = self.inner.inflight.lock().unwrap();
         inflight.remove(rel);
         result
     }
 
-    fn materialize_incremental(
+    fn do_materialize_incremental_chain(
         &self,
         rel: &Path,
-        inc_path: &Path,
+        diff_path: &Path,
+        mut matches: Vec<(usize, PathBuf)>,
+    ) -> Result<()> {
+        // Process oldest -> newest to build the final file.
+        matches.reverse();
+
+        let base_pos = matches
+            .iter()
+            .position(|(idx, _)| !self.inner.layers[*idx].incremental);
+        let base_pos = base_pos.ok_or_else(|| Error::MissingBackup(rel.display().to_string()))?;
+        let (base_idx, base_path) = matches.remove(base_pos);
+
+        self.copy_base(&base_path, diff_path, self.inner.layers[base_idx].compression)?;
+
+        // Apply incremental layers in chronological order after the base.
+        for (idx, path) in matches.into_iter() {
+            let layer = &self.inner.layers[idx];
+            if !layer.incremental {
+                continue;
+            }
+            self.apply_incremental_layer(rel, diff_path, &path, layer)?;
+        }
+
+        Ok(())
+    }
+
+    fn copy_base(
+        &self,
+        base_path: &Path,
         diff_path: &Path,
         compression: Option<CompressionAlgorithm>,
     ) -> Result<()> {
-        // Find closest ancestor file in older layers.
-        let ancestor = self
-            .inner
-            .layers
-            .iter()
-            .skip(1) // older layers after the current one
-            .find_map(|layer| {
-                let candidate = layer.root.join(rel);
-                candidate
-                    .exists()
-                    .then_some((candidate, layer.compression, layer.incremental))
-            })
-            .ok_or_else(|| Error::MissingBackup(rel.display().to_string()))?;
+        let meta = fs::symlink_metadata(base_path)?;
+        if !meta.is_file() {
+            return Err(
+                io::Error::new(io::ErrorKind::Other, "unsupported base type for incremental").into(),
+            );
+        }
 
-        // Start from ancestor content.
         if let Some(parent) = diff_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        match fs::copy(&ancestor.0, diff_path) {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // Create empty if ancestor missing (should not happen)
-                fs::File::create(diff_path)?;
+
+        match compression {
+            Some(algo) => self.decompress_file_inner(base_path, diff_path, algo),
+            None => {
+                fs::copy(base_path, diff_path)?;
+                Ok(())
             }
-            Err(e) => return Err(e.into()),
+        }
+    }
+
+    fn apply_incremental_layer(
+        &self,
+        rel: &Path,
+        diff_path: &Path,
+        inc_path: &Path,
+        layer: &Layer,
+    ) -> Result<()> {
+        if !inc_path.exists() {
+            return Ok(()); // nothing to apply
         }
 
-        if let Some(algo) = compression {
-            return Err(Error::UnsupportedCompressedIncremental(algo).into());
-        }
+        let expected = match layer.backup_mode {
+            BackupMode::Delta | BackupMode::Page => self.load_pagemap(inc_path)?,
+            _ => None,
+        };
 
-        // Overlay changed extents from incremental file using sparse extents where possible.
-        let inc_file = fs::File::open(inc_path)?;
+        let mut reader = self.open_incremental_reader(inc_path, layer.compression)?;
         let out = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(diff_path)?;
 
-        // Try SEEK_DATA/SEEK_HOLE to preserve holes; fallback to full copy.
-        #[cfg(target_os = "linux")]
-        {
-            use libc::{loff_t, SEEK_DATA, SEEK_HOLE};
-            use std::os::unix::fs::FileExt;
+        let mut seen = HashSet::new();
+        loop {
+            let mut hdr = [0u8; std::mem::size_of::<BackupPageHeader>()];
+            match reader.read_exact(&mut hdr) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
 
-            let mut off: loff_t = 0;
-            let inc_fd = inc_file.as_raw_fd();
-            let mut buf = vec![0u8; 8192 * 4];
-            loop {
-                let data_off = unsafe { libc::lseek(inc_fd, off, SEEK_DATA) };
-                if data_off == -1 {
-                    break;
+            let block = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            let compressed_size = i32::from_le_bytes(hdr[4..8].try_into().unwrap());
+
+            if compressed_size == PAGE_TRUNCATED {
+                out.set_len(block as u64 * BLCKSZ as u64)?;
+                break;
+            }
+
+            if compressed_size <= 0 {
+                return Err(Error::InvalidIncrementalPageSize {
+                    path: rel.display().to_string(),
+                    block,
+                    expected: BLCKSZ,
+                    actual: compressed_size.max(0) as usize,
                 }
-                let hole_off = unsafe { libc::lseek(inc_fd, data_off, SEEK_HOLE) };
-                let end = if hole_off == -1 { data_off } else { hole_off };
-                let mut cursor = data_off as u64;
-                while cursor < end as u64 {
-                    let to_read = std::cmp::min(buf.len() as u64, end as u64 - cursor) as usize;
-                    let n = inc_file.read_at(&mut buf[..to_read], cursor)?;
-                    if n == 0 {
-                        break;
-                    }
-                    out.write_all_at(&buf[..n], cursor)?;
-                    cursor += n as u64;
+                .into());
+            }
+
+            let mut buf = vec![0u8; compressed_size as usize];
+            reader.read_exact(&mut buf)?;
+
+            let page = if let Some(algo) = layer.compression {
+                self.decompress_page(algo, &buf)?
+            } else {
+                buf
+            };
+
+            if page.len() != BLCKSZ {
+                return Err(Error::InvalidIncrementalPageSize {
+                    path: rel.display().to_string(),
+                    block,
+                    expected: BLCKSZ,
+                    actual: page.len(),
                 }
-                off = end;
+                .into());
+            }
+
+            out.write_all_at(&page, block as u64 * BLCKSZ as u64)?;
+            seen.insert(block);
+        }
+
+        if let Some(expected_blocks) = expected {
+            let missing: Vec<u32> = expected_blocks
+                .difference(&seen)
+                .copied()
+                .collect();
+            if !missing.is_empty() {
+                return Err(Error::IncompleteIncremental {
+                    path: rel.display().to_string(),
+                    missing,
+                }
+                .into());
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            io::copy(&mut inc_file, &mut out)?;
+        Ok(())
+    }
+
+    fn open_incremental_reader(
+        &self,
+        path: &Path,
+        _compression: Option<CompressionAlgorithm>,
+    ) -> Result<Box<dyn Read>> {
+        let file = fs::File::open(path)?;
+        Ok(Box::new(BufReader::new(file)))
+    }
+
+    fn decompress_page(
+        &self,
+        algo: CompressionAlgorithm,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        match algo {
+            CompressionAlgorithm::Zlib => {
+                let mut decoder = flate2::read::ZlibDecoder::new(data);
+                let mut out = Vec::new();
+                decoder.read_to_end(&mut out)?;
+                Ok(out)
+            }
+            CompressionAlgorithm::Lz4 => lz4_flex::block::decompress_size_prepended(data)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e).into()),
+            CompressionAlgorithm::Zstd => zstd::stream::decode_all(data)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e).into()),
+        }
+    }
+
+    fn load_pagemap(&self, inc_path: &Path) -> Result<Option<HashSet<u32>>> {
+        let candidate = inc_path.with_extension("pagemap");
+        if !candidate.exists() {
+            return Ok(None);
         }
 
-        Ok(())
+        let bytes = fs::read(&candidate)?;
+        let mut blocks = HashSet::new();
+        for (byte_idx, byte) in bytes.iter().enumerate() {
+            for bit in 0..8 {
+                if byte & (1 << bit) != 0 {
+                    blocks.insert((byte_idx * 8 + bit) as u32);
+                }
+            }
+        }
+
+        Ok(Some(blocks))
     }
 
     pub fn find_layer_path(
         &self,
         rel: &Path,
     ) -> Option<(PathBuf, Option<CompressionAlgorithm>, bool)> {
-        for layer in &self.inner.layers {
-            let candidate = layer.root.join(rel);
-            if candidate.exists() {
-                return Some((candidate, layer.compression, layer.incremental));
-            }
-        }
-        None
+        self.matching_layers(rel)
+            .into_iter()
+            .next()
+            .map(|(idx, candidate)| {
+                let layer = &self.inner.layers[idx];
+                (candidate, layer.compression, layer.incremental)
+            })
     }
 
     fn wait_for_existing(&self, diff_path: &Path) -> Result<()> {
@@ -385,5 +543,16 @@ impl Overlay {
             "waiting for copy-up to finish",
         ))
         .into())
+    }
+
+    fn matching_layers(&self, rel: &Path) -> Vec<(usize, PathBuf)> {
+        let mut matches = Vec::new();
+        for (idx, layer) in self.inner.layers.iter().enumerate() {
+            let candidate = layer.root.join(rel);
+            if candidate.exists() {
+                matches.push((idx, candidate));
+            }
+        }
+        matches
     }
 }
