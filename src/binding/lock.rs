@@ -137,6 +137,12 @@ impl LockMarker {
         let marker: LockMarker = serde_json::from_slice(&data)?;
         Ok(marker)
     }
+
+    pub fn from_diff_dir(path: &Path) -> Result<Self> {
+        let data = std::fs::read(path.join(LOCK_FILE))?;
+        let marker: LockMarker = serde_json::from_slice(&data)?;
+        Ok(marker)
+    }
 }
 
 fn now_secs() -> u64 {

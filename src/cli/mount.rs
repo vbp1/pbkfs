@@ -99,19 +99,18 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
 
     let overlay = Overlay::new(&store.path, &diff_dir.path)?;
 
+    // Persist lock markers before mounting so writes hit the real FS, not the FUSE layer.
     let mut session = MountSession::new(binding.binding_id, &mnt_path);
-
-    // Start FUSE session; if it fails, surface the error.
-    let fuse_handle = Some(fuse::spawn_overlay(overlay.clone(), &mnt_path)?);
-
-    // Persist a simple lock marker in both the diff and target paths so unmount can locate it.
     let marker = LockMarker {
         mount_id: session.mount_id,
         diff_dir: diff_dir.path.clone(),
     };
     let marker_bytes = serde_json::to_vec_pretty(&marker)?;
     fs::write(diff_dir.path.join(LOCK_FILE), &marker_bytes)?;
-    fs::write(PathBuf::from(&mnt_path).join(LOCK_FILE), &marker_bytes)?;
+    // Do not write into the mount target; it will be shadowed by the FUSE mount.
+
+    // Start FUSE session; if it fails, surface the error.
+    let fuse_handle = Some(fuse::spawn_overlay(overlay.clone(), &mnt_path)?);
 
     session.state = MountSessionState::Ready;
     info!(mount_id=%session.mount_id, "mount ready");

@@ -77,6 +77,7 @@ fn mounts_backup_and_preserves_store_immutability() -> pbkfs::Result<()> {
     // Unmount removes the lock marker
     unmount::execute(unmount::UnmountArgs {
         mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
     })?;
 
     assert!(!diff.path().join(pbkfs::binding::LOCK_FILE).exists());
