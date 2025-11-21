@@ -30,8 +30,6 @@ pub enum Error {
     UnsupportedCompressionAlgorithm(String),
     #[error("missing compression metadata for compressed backup {0}")]
     MissingCompressionMetadata(String),
-    #[error("mixed compression algorithms in backup chain: {0}")]
-    MixedCompressionAlgorithms(String),
     #[error("serialization error")]
     Serde(#[from] serde_json::Error),
     #[error(transparent)]
