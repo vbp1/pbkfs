@@ -1,0 +1,15 @@
+[package]
+name = "pbkfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[lib]
+name = "pbkfs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pbkfs"
+path = "src/main.rs"
+
+[dependencies]
