@@ -178,7 +178,7 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
 
     let mut layers = Vec::new();
     for backup in chain.elements.iter().rev() {
-        let root = store.path.join(&backup.backup_id);
+        let root = store.path.join(&backup.backup_id).join("database");
         layers.push(OverlayLayer {
             root,
             compression: backup.compression_algorithm(),
@@ -187,7 +187,7 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
     // Fallback for legacy layouts where files sit directly under pbk_store
     let fallback_compression = chain.compression_algorithms.first().copied();
     layers.push(OverlayLayer {
-        root: store.path.clone(),
+        root: store.path.join("database"),
         compression: fallback_compression,
     });
 
