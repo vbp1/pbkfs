@@ -46,7 +46,7 @@ fn mounts_backup_and_preserves_store_immutability() -> pbkfs::Result<()> {
     let diff = tempdir()?;
 
     // Base backup content lives under the store path
-    let base_file = store.path().join("data/base.txt");
+    let base_file = store.path().join("FULL1").join("data/base.txt");
     fs::create_dir_all(base_file.parent().unwrap())?;
     fs::write(&base_file, b"from-store")?;
     write_metadata(store.path(), false, None);
@@ -103,7 +103,7 @@ fn mount_decompresses_compressed_backup_files() -> pbkfs::Result<()> {
     let diff = tempdir()?;
 
     // Create compressed base content in the backup store
-    let base_file = store.path().join("data/compressed.dat");
+    let base_file = store.path().join("FULL1").join("data/compressed.dat");
     fs::create_dir_all(base_file.parent().unwrap())?;
     let payload = b"postgres-compressed-data";
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));

@@ -14,7 +14,11 @@ use tracing::{info, instrument};
 use crate::{
     backup::{chain::BackupChain, metadata::BackupStore},
     binding::{BindingRecord, DiffDir, LockMarker, LOCK_FILE},
-    fs::{fuse, overlay::Overlay, MountSession, MountSessionState, MountTarget},
+    fs::{
+        fuse,
+        overlay::{Layer as OverlayLayer, Overlay},
+        MountSession, MountSessionState, MountTarget,
+    },
     Error, Result,
 };
 use ctrlc;
@@ -172,11 +176,22 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
     binding.write_to_diff(&diff_dir)?;
     info!(binding_id=%binding.binding_id, "binding persisted to diff");
 
-    let overlay = Overlay::new_with_algorithms(
-        &store.path,
-        &diff_dir.path,
-        chain.compression_algorithms.clone(),
-    )?;
+    let mut layers = Vec::new();
+    for backup in chain.elements.iter().rev() {
+        let root = store.path.join(&backup.backup_id);
+        layers.push(OverlayLayer {
+            root,
+            compression: backup.compression_algorithm(),
+        });
+    }
+    // Fallback for legacy layouts where files sit directly under pbk_store
+    let fallback_compression = chain.compression_algorithms.first().copied();
+    layers.push(OverlayLayer {
+        root: store.path.clone(),
+        compression: fallback_compression,
+    });
+
+    let overlay = Overlay::new_with_layers(&store.path, &diff_dir.path, layers)?;
 
     // Persist lock markers before mounting so writes hit the real FS, not the FUSE layer.
     let mut session = MountSession::new(binding.binding_id, &mnt_path);

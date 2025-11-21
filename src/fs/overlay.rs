@@ -21,17 +21,30 @@ pub struct Overlay {
     inner: Arc<OverlayInner>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Layer {
+    pub root: PathBuf,
+    pub compression: Option<CompressionAlgorithm>,
+}
+
 #[derive(Debug)]
 struct OverlayInner {
     base: PathBuf,
     diff: PathBuf,
-    compression: Vec<CompressionAlgorithm>,
+    layers: Vec<Layer>,                // newest -> oldest
     inflight: Mutex<HashSet<PathBuf>>, // tracks in-progress copy-ups per path
 }
 
 impl Overlay {
     pub fn new<P: AsRef<Path>, Q: AsRef<Path>>(base: P, diff: Q) -> Result<Self> {
-        Self::new_with_compression(base, diff, None)
+        Self::new_with_layers(
+            base.as_ref().to_path_buf(),
+            diff,
+            vec![Layer {
+                root: base.as_ref().to_path_buf(),
+                compression: None,
+            }],
+        )
     }
 
     pub fn new_with_compression<P: AsRef<Path>, Q: AsRef<Path>>(
@@ -39,8 +52,14 @@ impl Overlay {
         diff: Q,
         compression: Option<CompressionAlgorithm>,
     ) -> Result<Self> {
-        let list = compression.map(|c| vec![c]).unwrap_or_default();
-        Self::new_with_algorithms(base, diff, list)
+        Self::new_with_layers(
+            base.as_ref().to_path_buf(),
+            diff,
+            vec![Layer {
+                root: base.as_ref().to_path_buf(),
+                compression,
+            }],
+        )
     }
 
     pub fn new_with_algorithms<P: AsRef<Path>, Q: AsRef<Path>>(
@@ -48,17 +67,30 @@ impl Overlay {
         diff: Q,
         compression_algorithms: Vec<CompressionAlgorithm>,
     ) -> Result<Self> {
+        let layer = Layer {
+            root: base.as_ref().to_path_buf(),
+            compression: compression_algorithms.first().copied(),
+        };
+        Self::new_with_layers(base, diff, vec![layer])
+    }
+
+    pub fn new_with_layers<P: AsRef<Path>, Q: AsRef<Path>>(
+        base: P,
+        diff: Q,
+        layers: Vec<Layer>,
+    ) -> Result<Self> {
         let base_path = base.as_ref().to_path_buf();
         let diff_root = diff.as_ref().to_path_buf();
         let data_path = diff_root.join("data");
         if !data_path.exists() {
             fs::create_dir_all(&data_path)?;
         }
+
         Ok(Self {
             inner: Arc::new(OverlayInner {
                 base: base_path,
                 diff: data_path,
-                compression: compression_algorithms,
+                layers,
                 inflight: Mutex::new(HashSet::new()),
             }),
         })
@@ -71,12 +103,12 @@ impl Overlay {
             return Ok(Some(fs::read(diff_path)?));
         }
 
-        let base_path = self.inner.base.join(rel);
-        if !base_path.exists() {
-            return Ok(None);
-        }
+        let (base_path, compression) = match self.find_layer_path(rel) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
 
-        if !self.inner.compression.is_empty() {
+        if compression.is_some() {
             self.ensure_copy_up(rel)?;
             return Ok(Some(fs::read(diff_path)?));
         }
@@ -122,18 +154,28 @@ impl Overlay {
     }
 
     pub fn compression_algorithm(&self) -> Option<CompressionAlgorithm> {
-        self.inner.compression.first().copied()
+        self.inner.layers.iter().find_map(|l| l.compression)
+    }
+
+    pub fn layer_roots(&self) -> Vec<(PathBuf, Option<CompressionAlgorithm>)> {
+        self.inner
+            .layers
+            .iter()
+            .map(|l| (l.root.clone(), l.compression))
+            .collect()
     }
 
     /// Ensure a diff-side copy exists for the provided relative path, performing
-    /// a decompress-on-first-read copy-up when a compression algorithm is set.
+    /// a decompress-on-first-read copy-up using the layer's compression algorithm.
     pub fn ensure_copy_up(&self, rel: &Path) -> Result<()> {
         let diff_path = self.inner.diff.join(rel);
         if diff_path.exists() {
             return Ok(());
         }
 
-        let base_path = self.inner.base.join(rel);
+        let (base_path, compression) = self
+            .find_layer_path(rel)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         let meta = fs::symlink_metadata(&base_path)?;
 
         if meta.is_dir() {
@@ -156,8 +198,8 @@ impl Overlay {
             );
         }
 
-        if !self.inner.compression.is_empty() {
-            return self.decompress_file(rel, &base_path, &diff_path);
+        if let Some(algo) = compression {
+            return self.decompress_file(rel, &base_path, &diff_path, algo);
         }
 
         if let Some(parent) = diff_path.parent() {
@@ -167,7 +209,13 @@ impl Overlay {
         Ok(())
     }
 
-    fn decompress_file(&self, rel: &Path, base_path: &Path, diff_path: &Path) -> Result<()> {
+    fn decompress_file(
+        &self,
+        rel: &Path,
+        base_path: &Path,
+        diff_path: &Path,
+        algo: CompressionAlgorithm,
+    ) -> Result<()> {
         {
             let mut inflight = self.inner.inflight.lock().unwrap();
             if inflight.contains(rel) {
@@ -177,54 +225,13 @@ impl Overlay {
             inflight.insert(rel.to_path_buf());
         }
 
-        let result = self.try_decompress_any(base_path, diff_path);
-
-        let mut inflight = self.inner.inflight.lock().unwrap();
-        inflight.remove(rel);
-        result
-    }
-
-    fn try_decompress_any(&self, base_path: &Path, diff_path: &Path) -> Result<()> {
-        let mut errors = Vec::new();
-        let algs: Vec<CompressionAlgorithm> = if self.inner.compression.is_empty() {
-            vec![
-                CompressionAlgorithm::Zstd,
-                CompressionAlgorithm::Zlib,
-                CompressionAlgorithm::Lz4,
-            ]
-        } else {
-            self.inner.compression.clone()
-        };
-
-        for algo in algs {
-            match self.decompress_with_algorithm(base_path, diff_path, algo) {
-                Ok(()) => return Ok(()),
-                Err(e) => errors.push((algo, e)),
-            }
-        }
-
-        let joined = errors
-            .into_iter()
-            .map(|(a, e)| format!("{a:?}: {e}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        Err(Error::UnsupportedCompressionAlgorithm(joined).into())
-    }
-
-    fn decompress_with_algorithm(
-        &self,
-        base_path: &Path,
-        diff_path: &Path,
-        algo: CompressionAlgorithm,
-    ) -> Result<()> {
-        if let Some(parent) = diff_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        match algo {
+        let result = match algo {
             CompressionAlgorithm::Zlib => {
                 let reader = fs::File::open(base_path)?;
                 let mut decoder = flate2::read::ZlibDecoder::new(reader);
+                if let Some(parent) = diff_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
                 let mut out = fs::File::create(diff_path)?;
                 io::copy(&mut decoder, &mut out)?;
                 Ok(())
@@ -233,17 +240,37 @@ impl Overlay {
                 let bytes = fs::read(base_path)?;
                 let decompressed = lz4_flex::block::decompress_size_prepended(&bytes)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                if let Some(parent) = diff_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
                 fs::write(diff_path, decompressed)?;
                 Ok(())
             }
             CompressionAlgorithm::Zstd => {
                 let reader = fs::File::open(base_path)?;
                 let mut decoder = zstd::stream::Decoder::new(reader)?;
+                if let Some(parent) = diff_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
                 let mut out = fs::File::create(diff_path)?;
                 io::copy(&mut decoder, &mut out)?;
                 Ok(())
             }
+        };
+
+        let mut inflight = self.inner.inflight.lock().unwrap();
+        inflight.remove(rel);
+        result
+    }
+
+    pub fn find_layer_path(&self, rel: &Path) -> Option<(PathBuf, Option<CompressionAlgorithm>)> {
+        for layer in &self.inner.layers {
+            let candidate = layer.root.join(rel);
+            if candidate.exists() {
+                return Some((candidate, layer.compression));
+            }
         }
+        None
     }
 
     fn wait_for_existing(&self, diff_path: &Path) -> Result<()> {

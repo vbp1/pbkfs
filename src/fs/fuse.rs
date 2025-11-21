@@ -156,19 +156,21 @@ impl OverlayFs {
             }
         }
 
-        let base_dir = self.overlay.base_root().join(rel);
-        if let Ok(read_dir) = fs::read_dir(&base_dir) {
-            for entry in read_dir.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let child_rel = if rel.as_os_str().is_empty() {
-                    PathBuf::from(&name)
-                } else {
-                    rel.join(&name)
-                };
-                if self.is_whiteouted(&child_rel) {
-                    continue;
+        for (root, _) in self.overlay.layer_roots() {
+            let base_dir = root.join(rel);
+            if let Ok(read_dir) = fs::read_dir(&base_dir) {
+                for entry in read_dir.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let child_rel = if rel.as_os_str().is_empty() {
+                        PathBuf::from(&name)
+                    } else {
+                        rel.join(&name)
+                    };
+                    if self.is_whiteouted(&child_rel) {
+                        continue;
+                    }
+                    names.insert(name);
                 }
-                names.insert(name);
             }
         }
 
@@ -178,7 +180,7 @@ impl OverlayFs {
     }
 
     fn path_exists_in_base(&self, rel: &Path) -> bool {
-        self.overlay.base_root().join(rel).exists()
+        self.overlay.find_layer_path(rel).is_some()
     }
 
     fn stat_path(&self, rel: &Path) -> Option<(FileAttr, bool)> {
@@ -189,9 +191,10 @@ impl OverlayFs {
         // Prefer diff over base
         let (meta, from_diff) = match fs::symlink_metadata(self.overlay.diff_root().join(rel)) {
             Ok(m) => (m, true),
-            Err(_) => fs::symlink_metadata(self.overlay.base_root().join(rel))
-                .ok()
-                .map(|m| (m, false))?,
+            Err(_) => {
+                let (base_path, _) = self.overlay.find_layer_path(rel)?;
+                fs::symlink_metadata(base_path).ok().map(|m| (m, false))?
+            }
         };
 
         let file_type = meta.file_type();
@@ -898,7 +901,13 @@ impl Filesystem for OverlayFs {
             if diff.exists() {
                 diff
             } else {
-                self.overlay.base_root().join(&rel)
+                match self.overlay.find_layer_path(&rel) {
+                    Some((p, _)) => p,
+                    None => {
+                        reply.error(ENOENT);
+                        return;
+                    }
+                }
             }
         };
 
