@@ -115,7 +115,7 @@ fn sparse_incremental_materializes_from_base() -> pbkfs::Result<()> {
         .append(true)
         .open(&inc_path)?;
     write_incremental_entry(&mut inc_file, 1, &vec![b'B'; BLCKSZ])?;
-    fs::write(inc_path.with_extension("pagemap"), &[0b00000010])?;
+    fs::write(inc_path.with_extension("pagemap"), [0b00000010])?;
 
     // Build overlay with layers: inc then base
     let layers = vec![
@@ -151,11 +151,7 @@ fn incremental_page_backup_reconstructs_full_file() -> pbkfs::Result<()> {
     let rel = Path::new("base/1/rel");
 
     // Base FULL content: three pages.
-    let base_path = base
-        .path()
-        .join("FULL")
-        .join("database")
-        .join(rel);
+    let base_path = base.path().join("FULL").join("database").join(rel);
     fs::create_dir_all(base_path.parent().unwrap())?;
     let mut base_bytes = Vec::new();
     base_bytes.extend(vec![b'A'; BLCKSZ]);
@@ -164,11 +160,7 @@ fn incremental_page_backup_reconstructs_full_file() -> pbkfs::Result<()> {
     fs::write(&base_path, &base_bytes)?;
 
     // Incremental PAGE backup with changes to blocks 0 and 2.
-    let inc_path = inc
-        .path()
-        .join("INC")
-        .join("database")
-        .join(rel);
+    let inc_path = inc.path().join("INC").join("database").join(rel);
     fs::create_dir_all(inc_path.parent().unwrap())?;
     let mut inc_file = fs::OpenOptions::new()
         .create(true)
@@ -180,7 +172,7 @@ fn incremental_page_backup_reconstructs_full_file() -> pbkfs::Result<()> {
     write_incremental_entry(&mut inc_file, 2, &block2)?;
 
     // Sidecar pagemap indicating blocks 0 and 2 changed.
-    fs::write(inc_path.with_extension("pagemap"), &[0b00000101])?;
+    fs::write(inc_path.with_extension("pagemap"), [0b00000101])?;
 
     let layers = vec![
         Layer {
@@ -221,11 +213,7 @@ fn compressed_incremental_pages_are_applied() -> pbkfs::Result<()> {
     let rel = Path::new("base/2/rel");
 
     // Base FULL content: two pages.
-    let base_path = base
-        .path()
-        .join("FULL")
-        .join("database")
-        .join(rel);
+    let base_path = base.path().join("FULL").join("database").join(rel);
     fs::create_dir_all(base_path.parent().unwrap())?;
     let mut base_bytes = Vec::new();
     base_bytes.extend(vec![b'A'; BLCKSZ]);
@@ -233,11 +221,7 @@ fn compressed_incremental_pages_are_applied() -> pbkfs::Result<()> {
     fs::write(&base_path, &base_bytes)?;
 
     // Incremental PAGE backup with block 1 compressed.
-    let inc_path = inc
-        .path()
-        .join("INC")
-        .join("database")
-        .join(rel);
+    let inc_path = inc.path().join("INC").join("database").join(rel);
     fs::create_dir_all(inc_path.parent().unwrap())?;
     let mut inc_file = fs::OpenOptions::new()
         .create(true)
@@ -247,7 +231,7 @@ fn compressed_incremental_pages_are_applied() -> pbkfs::Result<()> {
     let compressed = compress_zlib_block(&block1)?;
     write_incremental_entry(&mut inc_file, 1, &compressed)?;
 
-    fs::write(inc_path.with_extension("pagemap"), &[0b00000010])?;
+    fs::write(inc_path.with_extension("pagemap"), [0b00000010])?;
 
     let layers = vec![
         Layer {
@@ -282,22 +266,14 @@ fn pagemap_mismatch_surfaces_error() {
     let rel = Path::new("base/3/rel");
 
     // Base with two pages.
-    let base_path = base
-        .path()
-        .join("FULL")
-        .join("database")
-        .join(rel);
+    let base_path = base.path().join("FULL").join("database").join(rel);
     fs::create_dir_all(base_path.parent().unwrap()).unwrap();
     let mut base_bytes = Vec::new();
     base_bytes.extend(vec![b'A'; BLCKSZ * 2]);
     fs::write(&base_path, &base_bytes).unwrap();
 
     // Incremental only contains block 1, but pagemap expects blocks 0 and 1.
-    let inc_path = inc
-        .path()
-        .join("INC")
-        .join("database")
-        .join(rel);
+    let inc_path = inc.path().join("INC").join("database").join(rel);
     fs::create_dir_all(inc_path.parent().unwrap()).unwrap();
     let mut inc_file = fs::OpenOptions::new()
         .create(true)
@@ -305,7 +281,7 @@ fn pagemap_mismatch_surfaces_error() {
         .open(&inc_path)
         .unwrap();
     write_incremental_entry(&mut inc_file, 1, &vec![b'Z'; BLCKSZ]).unwrap();
-    fs::write(inc_path.with_extension("pagemap"), &[0b00000011]).unwrap();
+    fs::write(inc_path.with_extension("pagemap"), [0b00000011]).unwrap();
 
     let layers = vec![
         Layer {
@@ -332,11 +308,7 @@ fn pagemap_mismatch_surfaces_error() {
     assert!(has_incomplete, "expected IncompleteIncremental error");
 }
 
-fn write_incremental_entry(
-    file: &mut fs::File,
-    block: u32,
-    payload: &[u8],
-) -> pbkfs::Result<()> {
+fn write_incremental_entry(file: &mut fs::File, block: u32, payload: &[u8]) -> pbkfs::Result<()> {
     file.write_all(&block.to_le_bytes())?;
     let size = payload.len() as i32;
     file.write_all(&size.to_le_bytes())?;

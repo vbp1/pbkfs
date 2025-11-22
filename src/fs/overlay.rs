@@ -52,7 +52,7 @@ struct OverlayInner {
 impl Overlay {
     pub fn new<P: AsRef<Path>, Q: AsRef<Path>>(base: P, diff: Q) -> Result<Self> {
         Self::new_with_layers(
-            base.as_ref().to_path_buf(),
+            base.as_ref(),
             diff,
             vec![Layer {
                 root: base.as_ref().to_path_buf(),
@@ -69,7 +69,7 @@ impl Overlay {
         compression: Option<CompressionAlgorithm>,
     ) -> Result<Self> {
         Self::new_with_layers(
-            base.as_ref().to_path_buf(),
+            base.as_ref(),
             diff,
             vec![Layer {
                 root: base.as_ref().to_path_buf(),
@@ -342,7 +342,11 @@ impl Overlay {
         let base_pos = base_pos.ok_or_else(|| Error::MissingBackup(rel.display().to_string()))?;
         let (base_idx, base_path) = matches.remove(base_pos);
 
-        self.copy_base(&base_path, diff_path, self.inner.layers[base_idx].compression)?;
+        self.copy_base(
+            &base_path,
+            diff_path,
+            self.inner.layers[base_idx].compression,
+        )?;
 
         // Apply incremental layers in chronological order after the base.
         for (idx, path) in matches.into_iter() {
@@ -364,9 +368,11 @@ impl Overlay {
     ) -> Result<()> {
         let meta = fs::symlink_metadata(base_path)?;
         if !meta.is_file() {
-            return Err(
-                io::Error::new(io::ErrorKind::Other, "unsupported base type for incremental").into(),
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unsupported base type for incremental",
+            )
+            .into());
         }
 
         if let Some(parent) = diff_path.parent() {
@@ -455,10 +461,7 @@ impl Overlay {
         }
 
         if let Some(expected_blocks) = expected {
-            let missing: Vec<u32> = expected_blocks
-                .difference(&seen)
-                .copied()
-                .collect();
+            let missing: Vec<u32> = expected_blocks.difference(&seen).copied().collect();
             if !missing.is_empty() {
                 return Err(Error::IncompleteIncremental {
                     path: rel.display().to_string(),
@@ -480,11 +483,7 @@ impl Overlay {
         Ok(Box::new(BufReader::new(file)))
     }
 
-    fn decompress_page(
-        &self,
-        algo: CompressionAlgorithm,
-        data: &[u8],
-    ) -> Result<Vec<u8>> {
+    fn decompress_page(&self, algo: CompressionAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
         match algo {
             CompressionAlgorithm::Zlib => {
                 let mut decoder = flate2::read::ZlibDecoder::new(data);

@@ -7,7 +7,10 @@
 
 use std::{fs, path::Path, thread, time::Duration};
 
-use pbkfs::{binding::BindingRecord, binding::BindingState, binding::LockMarker, cli::mount::MountArgs, cli::unmount};
+use pbkfs::{
+    binding::BindingRecord, binding::BindingState, binding::LockMarker, cli::mount::MountArgs,
+    cli::unmount,
+};
 use tempfile::tempdir;
 
 fn write_metadata(store: &Path, _compressed: bool, compression: Option<(&str, Option<u8>)>) {
@@ -74,6 +77,7 @@ fn mounts_backup_and_preserves_store_immutability() -> pbkfs::Result<()> {
         diff_dir: Some(diff.path().to_path_buf()),
         instance: Some("main".into()),
         backup_id: Some("FULL1".into()),
+        force: false,
     };
 
     let ctx = pbkfs::cli::mount::mount(args)?;
@@ -141,6 +145,7 @@ fn mount_decompresses_compressed_backup_files() -> pbkfs::Result<()> {
         diff_dir: Some(diff.path().to_path_buf()),
         instance: Some("main".into()),
         backup_id: Some("FULL1".into()),
+        force: false,
     };
 
     let ctx = pbkfs::cli::mount::mount(args)?;
@@ -188,6 +193,7 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
         diff_dir: Some(diff.path().to_path_buf()),
         instance: Some("main".into()),
         backup_id: Some("FULL1".into()),
+        force: false,
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -225,6 +231,7 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
         diff_dir: Some(diff.path().to_path_buf()),
         instance: None,
         backup_id: None,
+        force: false,
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -235,12 +242,10 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
                     return Ok(());
                 }
             }
-            if let Some(pbk_err) = err.downcast_ref::<pbkfs::Error>() {
-                if let pbkfs::Error::Io(io_err) = pbk_err {
-                    if io_err.kind() == std::io::ErrorKind::PermissionDenied {
-                        eprintln!("skipping stale-lock recovery test: {io_err}");
-                        return Ok(());
-                    }
+            if let Some(pbkfs::Error::Io(io_err)) = err.downcast_ref::<pbkfs::Error>() {
+                if io_err.kind() == std::io::ErrorKind::PermissionDenied {
+                    eprintln!("skipping stale-lock recovery test: {io_err}");
+                    return Ok(());
                 }
             }
             if err.to_string().contains("Permission denied") {
@@ -257,16 +262,17 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
         .expect("diff data should persist across remounts");
     assert_eq!(b"first-write", reread.as_slice());
 
-    let binding_after = match BindingRecord::load_from_diff(&pbkfs::binding::DiffDir::new(diff.path())?) {
-        Ok(b) => b,
-        Err(err) => {
-            if err.to_string().contains("Permission denied") {
-                eprintln!("skipping stale-lock recovery test: {err}");
-                return Ok(());
+    let binding_after =
+        match BindingRecord::load_from_diff(&pbkfs::binding::DiffDir::new(diff.path())?) {
+            Ok(b) => b,
+            Err(err) => {
+                if err.to_string().contains("Permission denied") {
+                    eprintln!("skipping stale-lock recovery test: {err}");
+                    return Ok(());
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
-    };
+        };
     assert_eq!(initial_binding.binding_id, binding_after.binding_id);
     assert_eq!(BindingState::Active, binding_after.state);
     assert!(binding_after.last_used_at >= initial_binding.last_used_at);
@@ -309,6 +315,7 @@ fn remount_rejects_binding_mismatch() {
         diff_dir: Some(diff.path().to_path_buf()),
         instance: Some("main".into()),
         backup_id: Some("FULL1".into()),
+        force: false,
     })
     .unwrap();
 
@@ -329,6 +336,7 @@ fn remount_rejects_binding_mismatch() {
         diff_dir: Some(diff.path().to_path_buf()),
         instance: Some("other".into()),
         backup_id: Some("FULL1".into()),
+        force: false,
     })
     .expect_err("binding mismatch should fail");
 
@@ -359,6 +367,7 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
         diff_dir: Some(diff.path().to_path_buf()),
         instance: Some("main".into()),
         backup_id: Some("FULL1".into()),
+        force: false,
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -402,6 +411,7 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
         diff_dir: Some(diff.path().to_path_buf()),
         instance: None,
         backup_id: None,
+        force: false,
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -413,16 +423,17 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
         }
     };
 
-    let binding_after = match BindingRecord::load_from_diff(&pbkfs::binding::DiffDir::new(diff.path())?) {
-        Ok(b) => b,
-        Err(err) => {
-            if err.to_string().contains("Permission denied") {
-                eprintln!("skipping stale-lock recovery test: {err}");
-                return Ok(());
+    let binding_after =
+        match BindingRecord::load_from_diff(&pbkfs::binding::DiffDir::new(diff.path())?) {
+            Ok(b) => b,
+            Err(err) => {
+                if err.to_string().contains("Permission denied") {
+                    eprintln!("skipping stale-lock recovery test: {err}");
+                    return Ok(());
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
-    };
+        };
     assert_eq!(BindingState::Active, binding_after.state);
     assert_eq!(binding.binding_id, binding_after.binding_id);
 

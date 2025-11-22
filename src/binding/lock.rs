@@ -119,9 +119,13 @@ pub fn cleanup_diff_dir(diff_dir: &DiffDir, force: bool) -> Result<()> {
     let lock_exists = diff_dir.lock_path().exists();
     let binding = diff_dir.load_binding()?;
 
-    let active_pid = binding
-        .as_ref()
-        .and_then(|b| if b.is_owner_alive() { Some(b.owner_pid) } else { None });
+    let active_pid = binding.as_ref().and_then(|b| {
+        if b.is_owner_alive() {
+            Some(b.owner_pid)
+        } else {
+            None
+        }
+    });
 
     if let Some(pid) = active_pid {
         if !force {
@@ -137,7 +141,10 @@ pub fn cleanup_diff_dir(diff_dir: &DiffDir, force: bool) -> Result<()> {
 
     if lock_exists && binding.is_none() && !force {
         warn!(diff_dir = %diff_dir.path.display(), "cleanup blocked: lock present without binding");
-        return Err(Error::Cli("lock present without binding metadata; unmount first or use --force".into()).into());
+        return Err(Error::Cli(
+            "lock present without binding metadata; unmount first or use --force".into(),
+        )
+        .into());
     }
 
     if lock_exists {
