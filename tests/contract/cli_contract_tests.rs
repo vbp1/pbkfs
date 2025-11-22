@@ -1,6 +1,6 @@
 //! CLI contract tests for pbkfs argument validation.
 
-use pbkfs::Error;
+use pbkfs::{binding::DiffDir, cli::mount::MountArgs, binding::BindingRecord, Error};
 use tempfile::tempdir;
 
 fn expect_error(args: &[&str], expected: Error) {
@@ -71,4 +71,196 @@ fn unmount_requires_mnt_path() {
         .downcast_ref::<Error>()
         .expect("should downcast to pbkfs::Error");
     assert!(matches!(actual, Error::InvalidTargetDir(_)));
+}
+
+fn write_metadata(store: &std::path::Path) {
+    let metadata = serde_json::json!([
+        {
+            "instance": "main",
+            "backups": [
+                {
+                    "id": "FULL1",
+                    "parent-backup-id": null,
+                    "backup-mode": "FULL",
+                    "status": "OK",
+                    "compress-alg": "none",
+                    "compress-level": null,
+                    "start-time": "2024-01-01T00:00:00Z",
+                    "data-bytes": 512u64,
+                    "program-version": "2.6.0"
+                }
+            ]
+        }
+    ]);
+
+    std::fs::write(
+        store.join("backups.json"),
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn mount_reuses_binding_with_diff_only_arguments() -> pbkfs::Result<()> {
+    let store = tempdir()?;
+    let target = tempdir()?;
+    let diff = tempdir()?;
+
+    // Base backup content and metadata
+    let base_file = store
+        .path()
+        .join("FULL1")
+        .join("database")
+        .join("data/base.txt");
+    std::fs::create_dir_all(base_file.parent().unwrap())?;
+    std::fs::write(&base_file, b"from-store")?;
+    write_metadata(store.path());
+
+    // Existing binding record ties diff to instance/backup.
+    let diff_dir = DiffDir::new(diff.path())?;
+    let binding = BindingRecord::new(
+        "main",
+        "FULL1",
+        store.path(),
+        target.path(),
+        42,
+        "host",
+        "0.1.0",
+    );
+    binding.write_to_diff(&diff_dir)?;
+
+    // Prior diff content should be visible after remount.
+    let diff_data = diff.path().join("data").join("data/base.txt");
+    std::fs::create_dir_all(diff_data.parent().unwrap())?;
+    std::fs::write(&diff_data, b"from-diff")?;
+
+    let ctx = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: None,
+        backup_id: None,
+    })?;
+
+    assert_eq!(binding.binding_id, ctx.binding.binding_id);
+    assert_eq!("main", ctx.binding.instance_name);
+    assert_eq!("FULL1", ctx.chain.target_backup_id);
+
+    let contents = ctx
+        .overlay
+        .read(std::path::Path::new("data/base.txt"))?
+        .expect("diff content should be visible");
+    assert_eq!(b"from-diff", contents.as_slice());
+
+    if let Some(handle) = ctx.fuse_handle {
+        handle.unmount();
+    }
+    let _ = std::fs::remove_file(diff.path().join(pbkfs::binding::LOCK_FILE));
+
+    Ok(())
+}
+
+#[test]
+fn mount_rejects_binding_mismatch_when_instance_differs() {
+    let store = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+
+    write_metadata(store.path());
+    let diff_dir = DiffDir::new(diff.path()).unwrap();
+    let binding = BindingRecord::new(
+        "main",
+        "FULL1",
+        store.path(),
+        target.path(),
+        7,
+        "host",
+        "0.1.0",
+    );
+    binding.write_to_diff(&diff_dir).unwrap();
+
+    let err = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("other".into()),
+        backup_id: Some("FULL1".into()),
+    })
+    .expect_err("mismatched instance should fail");
+
+    let actual = err
+        .downcast_ref::<Error>()
+        .expect("should downcast to pbkfs::Error");
+    assert!(matches!(actual, Error::BindingViolation { .. }));
+}
+
+#[test]
+fn mount_rejects_binding_mismatch_when_backup_differs() {
+    let store = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+
+    write_metadata(store.path());
+    let diff_dir = DiffDir::new(diff.path()).unwrap();
+    let binding = BindingRecord::new(
+        "main",
+        "FULL1",
+        store.path(),
+        target.path(),
+        7,
+        "host",
+        "0.1.0",
+    );
+    binding.write_to_diff(&diff_dir).unwrap();
+
+    let err = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("INC1".into()),
+    })
+    .expect_err("mismatched backup should fail");
+
+    let actual = err
+        .downcast_ref::<Error>()
+        .expect("should downcast to pbkfs::Error");
+    assert!(matches!(actual, Error::BindingViolation { .. }));
+}
+
+#[test]
+fn mount_rejects_binding_mismatch_when_store_differs() {
+    let store_expected = tempdir().unwrap();
+    let store_actual = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+
+    write_metadata(store_expected.path());
+    write_metadata(store_actual.path());
+
+    let diff_dir = DiffDir::new(diff.path()).unwrap();
+    let binding = BindingRecord::new(
+        "main",
+        "FULL1",
+        store_expected.path(),
+        target.path(),
+        9,
+        "host",
+        "0.1.0",
+    );
+    binding.write_to_diff(&diff_dir).unwrap();
+
+    let err = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store_actual.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: None,
+        backup_id: None,
+    })
+    .expect_err("store path mismatch should fail");
+
+    let actual = err
+        .downcast_ref::<Error>()
+        .expect("should downcast to pbkfs::Error");
+    assert!(matches!(actual, Error::BindingViolation { .. }));
 }

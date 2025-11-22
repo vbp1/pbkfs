@@ -26,12 +26,13 @@ release/
 *.log
 .env*
 
-# Specify && Codex
+# Specify && Codex && CC
 .codex/
 specs/
 .specify/
 AGENTS.md
 INIT.md
+CLAUDE.md
 
 # Other
 pg_probackup
