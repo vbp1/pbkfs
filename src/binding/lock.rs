@@ -147,7 +147,7 @@ pub fn cleanup_diff_dir(diff_dir: &DiffDir, force: bool) -> Result<()> {
     overlay::wipe_diff_dir(&diff_dir.path)?;
 
     if diff_dir.binding_path().exists() {
-        let _ = fs::remove_file(diff_dir.binding_path());
+        fs::remove_file(diff_dir.binding_path())?;
     }
 
     if binding.is_some() {
