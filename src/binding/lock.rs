@@ -5,9 +5,10 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::{backup::metadata::new_binding_id, Error, Result};
+use crate::{backup::metadata::new_binding_id, fs::overlay, Error, Result};
 
 pub const BINDING_FILE: &str = ".pbkfs-binding.json";
 pub const LOCK_FILE: &str = ".pbkfs-lock";
@@ -66,6 +67,13 @@ impl DiffDir {
         Ok(())
     }
 
+    pub fn ensure_directory(&self) -> Result<()> {
+        if !self.path.is_dir() {
+            return Err(Error::Cli("diff_dir must be a directory".into()).into());
+        }
+        Ok(())
+    }
+
     pub fn write_lock(&self, mount_id: Uuid) -> Result<()> {
         let marker = LockMarker {
             mount_id,
@@ -93,6 +101,60 @@ impl DiffDir {
         let record: BindingRecord = serde_json::from_slice(&contents)?;
         Ok(Some(record))
     }
+}
+
+/// Cleanup a diff directory, respecting active mount detection unless forced.
+///
+/// * Validates writability and presence of lock/binding metadata.
+/// * Rejects cleanup when an active owner is detected unless `force` is set.
+/// * Removes lock/binding files and wipes diff data while keeping root dir.
+pub fn cleanup_diff_dir(diff_dir: &DiffDir, force: bool) -> Result<()> {
+    if diff_dir.path.parent().is_none() {
+        return Err(Error::Cli("refusing to cleanup root path".into()).into());
+    }
+
+    diff_dir.ensure_directory()?;
+    diff_dir.ensure_writable()?;
+
+    let lock_exists = diff_dir.lock_path().exists();
+    let binding = diff_dir.load_binding()?;
+
+    let active_pid = binding
+        .as_ref()
+        .and_then(|b| if b.is_owner_alive() { Some(b.owner_pid) } else { None });
+
+    if let Some(pid) = active_pid {
+        if !force {
+            warn!(
+                pid,
+                diff_dir = %diff_dir.path.display(),
+                "cleanup blocked: active mount detected"
+            );
+            return Err(Error::BindingInUse(pid).into());
+        }
+        warn!(pid, diff_dir = %diff_dir.path.display(), "forcing cleanup despite active mount");
+    }
+
+    if lock_exists && binding.is_none() && !force {
+        warn!(diff_dir = %diff_dir.path.display(), "cleanup blocked: lock present without binding");
+        return Err(Error::Cli("lock present without binding metadata; unmount first or use --force".into()).into());
+    }
+
+    if lock_exists {
+        fs::remove_file(diff_dir.lock_path())?;
+    }
+
+    overlay::wipe_diff_dir(&diff_dir.path)?;
+
+    if diff_dir.binding_path().exists() {
+        let _ = fs::remove_file(diff_dir.binding_path());
+    }
+
+    if binding.is_some() {
+        info!(diff_dir = %diff_dir.path.display(), force, "binding cleared during cleanup");
+    }
+    info!(diff_dir = %diff_dir.path.display(), force, "cleanup completed");
+    Ok(())
 }
 
 impl BindingRecord {
