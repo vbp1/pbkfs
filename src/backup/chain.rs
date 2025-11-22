@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     backup::metadata::{BackupStore, CompressionAlgorithm},
+    binding::BindingRecord,
     Error, Result,
 };
 
@@ -84,6 +85,14 @@ impl BackupChain {
             integrity_state: integrity,
             compression_algorithms,
         })
+    }
+
+    pub fn from_binding(store: &BackupStore, binding: &BindingRecord) -> Result<Self> {
+        binding.validate_store_path(&store.path)?;
+        store
+            .find_backup(&binding.backup_id)
+            .ok_or_else(|| Error::MissingBackup(binding.backup_id.clone()))?;
+        Self::from_target_backup(store, &binding.backup_id)
     }
 }
 

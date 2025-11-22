@@ -9,7 +9,7 @@ use std::{
 
 use clap::Args;
 use serde_json;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::{
     backup::{chain::BackupChain, metadata::BackupStore, BackupMode, BackupType},
@@ -137,19 +137,18 @@ fn is_mounted(path: &Path) -> bool {
 pub fn mount(args: MountArgs) -> Result<MountContext> {
     let pbk_store = args
         .pbk_store
-        .ok_or_else(|| Error::Cli("pbk_store is required".into()))?;
+        .ok_or_else(|| Error::Cli("pbk_store is required".into()))
+        .map(canonicalize_path)?;
+
     let mnt_path = args
         .mnt_path
-        .ok_or_else(|| Error::Cli("mnt_path is required".into()))?;
+        .ok_or_else(|| Error::Cli("mnt_path is required".into()))
+        .map(canonicalize_path)?;
+
     let diff_dir_path = args
         .diff_dir
-        .ok_or_else(|| Error::Cli("diff_dir is required".into()))?;
-    let instance = args
-        .instance
-        .ok_or_else(|| Error::Cli("instance is required".into()))?;
-    let backup_id = args
-        .backup_id
-        .ok_or_else(|| Error::Cli("backup_id is required".into()))?;
+        .ok_or_else(|| Error::Cli("diff_dir is required".into()))
+        .map(canonicalize_path)?;
 
     let target = MountTarget::new(&mnt_path);
     target.validate_empty()?;
@@ -160,20 +159,68 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
     diff_dir.ensure_writable()?;
     info!(diff = %diff_dir.path.display(), "diff directory prepared");
 
+    let existing_binding = diff_dir.load_binding()?;
+    let mut recovered_stale = false;
+    let binding = if let Some(mut binding) = existing_binding {
+        info!(binding_id=%binding.binding_id, "reusing existing binding from diff");
+        binding.validate_store_path(&pbk_store)?;
+        binding.validate_binding_args(args.instance.as_deref(), args.backup_id.as_deref())?;
+
+        if !paths_match(&binding.pbk_target_path, &mnt_path) {
+            warn!(
+                expected=%binding.pbk_target_path.display(),
+                actual=%mnt_path.display(),
+                "mount path differs from binding; proceeding with reuse"
+            );
+        }
+
+        let lock_path = diff_dir.lock_path();
+        if lock_path.exists() {
+            if binding.is_owner_alive() {
+                return Err(Error::BindingInUse(binding.owner_pid).into());
+            }
+            warn!(owner_pid=binding.owner_pid, "stale lock detected; recovering");
+            let _ = fs::remove_file(&lock_path);
+            binding.mark_stale();
+            recovered_stale = true;
+        }
+
+        binding.refresh_for_reuse(
+            &mnt_path,
+            std::process::id() as i32,
+            std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
+        );
+        binding
+    } else {
+        let instance = args
+            .instance
+            .ok_or_else(|| Error::Cli("instance is required".into()))?;
+        let backup_id = args
+            .backup_id
+            .ok_or_else(|| Error::Cli("backup_id is required".into()))?;
+
+        BindingRecord::new(
+            instance,
+            backup_id,
+            &pbk_store,
+            &mnt_path,
+            std::process::id() as i32,
+            std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
+            env!("CARGO_PKG_VERSION"),
+        )
+    };
+
+    let instance = binding.instance_name.clone();
+    let backup_id = binding.backup_id.clone();
+
     let store = BackupStore::load_from_pg_probackup(&pbk_store, &instance)?;
-    let chain = BackupChain::from_target_backup(&store, &backup_id)?;
+    let chain = BackupChain::from_binding(&store, &binding)?;
     info!(backup=?backup_id, instance=?instance, "backup chain resolved");
 
-    let binding = BindingRecord::new(
-        instance,
-        backup_id,
-        pbk_store,
-        &mnt_path,
-        std::process::id() as i32,
-        std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
-        env!("CARGO_PKG_VERSION"),
-    );
     binding.write_to_diff(&diff_dir)?;
+    if recovered_stale {
+        warn!(binding_id=%binding.binding_id, "binding recovered from stale state");
+    }
     info!(binding_id=%binding.binding_id, "binding persisted to diff");
 
     let mut layers = Vec::new();
@@ -207,7 +254,7 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
     fs::write(diff_dir.path.join(LOCK_FILE), &marker_bytes)?;
     // Do not write into the mount target; it will be shadowed by the FUSE mount.
 
-    // Start FUSE session; if it fails, surface the error.
+    // Start FUSE session; surface errors to caller so tests reveal mount issues.
     let fuse_handle = Some(fuse::spawn_overlay(overlay.clone(), &mnt_path)?);
 
     session.state = MountSessionState::Ready;
@@ -222,4 +269,12 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
         session,
         fuse_handle,
     })
+}
+
+fn canonicalize_path(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
+}
+
+fn paths_match(a: &Path, b: &Path) -> bool {
+    canonicalize_path(a.to_path_buf()) == canonicalize_path(b.to_path_buf())
 }

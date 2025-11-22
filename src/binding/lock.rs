@@ -75,6 +75,24 @@ impl DiffDir {
         std::fs::write(self.path.join(LOCK_FILE), data)?;
         Ok(())
     }
+
+    pub fn lock_path(&self) -> PathBuf {
+        self.path.join(LOCK_FILE)
+    }
+
+    pub fn binding_path(&self) -> PathBuf {
+        self.path.join(BINDING_FILE)
+    }
+
+    pub fn load_binding(&self) -> Result<Option<BindingRecord>> {
+        let path = self.binding_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read(path)?;
+        let record: BindingRecord = serde_json::from_slice(&contents)?;
+        Ok(Some(record))
+    }
 }
 
 impl BindingRecord {
@@ -129,6 +147,63 @@ impl BindingRecord {
         let record: BindingRecord = serde_json::from_slice(&contents)?;
         Ok(record)
     }
+
+    pub fn validate_store_path(&self, pbk_store: &Path) -> Result<()> {
+        if !paths_match(&self.pbk_store_path, pbk_store) {
+            return Err(Error::BindingViolation {
+                expected: self.pbk_store_path.display().to_string(),
+                actual: pbk_store.display().to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    pub fn validate_binding_args(
+        &self,
+        instance: Option<&str>,
+        backup: Option<&str>,
+    ) -> Result<()> {
+        if let Some(inst) = instance {
+            if !self.instance_name.eq(inst) {
+                return Err(Error::BindingViolation {
+                    expected: self.instance_name.clone(),
+                    actual: inst.to_string(),
+                }
+                .into());
+            }
+        }
+
+        if let Some(backup_id) = backup {
+            // pg_probackup backup IDs are case-insensitive (commonly uppercased)
+            if !self.backup_id.eq_ignore_ascii_case(backup_id) {
+                return Err(Error::BindingViolation {
+                    expected: self.backup_id.clone(),
+                    actual: backup_id.to_string(),
+                }
+                .into());
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn refresh_for_reuse(
+        &mut self,
+        pbk_target_path: impl Into<PathBuf>,
+        owner_pid: i32,
+        owner_host: impl Into<String>,
+    ) {
+        self.pbk_target_path = pbk_target_path.into();
+        self.owner_pid = owner_pid;
+        self.owner_host = owner_host.into();
+        self.state = BindingState::Active;
+        self.touch();
+    }
+
+    pub fn is_owner_alive(&self) -> bool {
+        pid_alive(self.owner_pid)
+    }
 }
 
 impl LockMarker {
@@ -158,4 +233,21 @@ fn is_writable(path: &Path) -> bool {
         Ok(_) => fs::remove_file(test_file).is_ok(),
         Err(_) => false,
     }
+}
+
+fn pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // Linux-only: rely on /proc/<pid> presence to detect liveness
+    let path = PathBuf::from("/proc").join(pid.to_string());
+    path.exists()
+}
+
+fn canonicalize_or(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn paths_match(a: &Path, b: &Path) -> bool {
+    canonicalize_or(a) == canonicalize_or(b)
 }

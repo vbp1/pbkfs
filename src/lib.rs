@@ -51,6 +51,8 @@ pub enum Error {
     Cli(String),
     #[error("target is not mounted: {0}")]
     NotMounted(String),
+    #[error("diff directory already in use by pid {0}")]
+    BindingInUse(i32),
 }
 
 /// Entry point for the library, called by the CLI thin wrapper.
