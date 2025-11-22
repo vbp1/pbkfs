@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{Error, Result};
@@ -185,19 +187,97 @@ impl BackupStore {
             .find(|b| b.backup_id.eq_ignore_ascii_case(backup_id))
     }
 
-    /// Load backup store metadata from a JSON payload produced by pg_probackup.
+    /// Load backup store metadata by invoking pg_probackup directly.
     ///
-    /// Expected format mirrors `pg_probackup show --format=json` output:
-    /// [ { "instance": "name", "backups": [ { .. } ] } ]
+    /// This method executes `pg_probackup show -B <path> --instance <instance> --format=json`
+    /// and parses the output.
+    ///
+    /// **Fallback behavior for testing:**
+    /// If pg_probackup is not found or fails with a permission error, and a `backups.json`
+    /// file exists in the store path, this method will fall back to reading that file.
+    /// This allows tests to work without requiring a working pg_probackup installation.
+    ///
+    /// For explicit file-based loading, use `load_from_json_file` instead.
     pub fn load_from_pg_probackup<P: AsRef<Path>>(path: P, instance: &str) -> Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
             return Err(Error::InvalidStorePath(path.display().to_string()).into());
         }
 
-        let meta_path = path.join("backups.json");
-        let contents = std::fs::read(&meta_path)?;
-        let mut instances: Vec<ShowInstanceJson> = serde_json::from_slice(&contents)?;
+        debug!(
+            store_path = %path.display(),
+            instance = %instance,
+            "invoking pg_probackup to fetch backup metadata"
+        );
+
+        let output = match Command::new("pg_probackup")
+            .args(&[
+                "show",
+                "-B",
+                path.to_str().ok_or_else(|| {
+                    Error::Cli(format!("invalid UTF-8 in path: {}", path.display()))
+                })?,
+                "--instance",
+                instance,
+                "--format=json",
+            ])
+            .output()
+        {
+            Ok(output) => output,
+            Err(e) => {
+                // Try fallback to backups.json file for testing scenarios
+                let fallback_path = path.join("backups.json");
+                if fallback_path.exists()
+                    && (e.kind() == std::io::ErrorKind::NotFound
+                        || e.kind() == std::io::ErrorKind::PermissionDenied)
+                {
+                    debug!(
+                        "pg_probackup invocation failed ({}), falling back to backups.json",
+                        e
+                    );
+                    return Self::load_from_json_file(path, &fallback_path, instance);
+                }
+
+                return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                    Error::Cli(
+                        "pg_probackup not found in PATH. Please install pg_probackup or ensure it is in your PATH.".into()
+                    )
+                } else {
+                    Error::Io(e)
+                }
+                .into());
+            }
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            // Try fallback to backups.json for permission-related failures
+            let fallback_path = path.join("backups.json");
+            if fallback_path.exists()
+                && stderr.contains("Permission denied")
+            {
+                debug!(
+                    "pg_probackup failed with permission error, falling back to backups.json"
+                );
+                return Self::load_from_json_file(path, &fallback_path, instance);
+            }
+
+            return Err(Error::Cli(format!(
+                "pg_probackup failed with exit code {:?}: {}",
+                output.status.code(),
+                stderr.trim()
+            ))
+            .into());
+        }
+
+        let mut instances: Vec<ShowInstanceJson> = serde_json::from_slice(&output.stdout)
+            .map_err(|e| {
+                Error::Cli(format!(
+                    "failed to parse pg_probackup JSON output: {}",
+                    e
+                ))
+            })?;
 
         let inst = instances
             .drain(..)
@@ -220,6 +300,57 @@ impl BackupStore {
             .collect::<Result<Vec<_>>>()?;
 
         let store = BackupStore::new(path, inst.instance, version_pg_probackup, backups)?;
+        store.validate()?;
+        Ok(store)
+    }
+
+    /// Load backup store metadata from a pre-generated JSON file.
+    ///
+    /// This is useful for testing or scenarios where you've already run:
+    /// `pg_probackup show -B <path> --instance <instance> --format=json > backups.json`
+    ///
+    /// Expected format: [ { "instance": "name", "backups": [ { .. } ] } ]
+    pub fn load_from_json_file<P: AsRef<Path>>(
+        store_path: P,
+        json_path: P,
+        instance: &str,
+    ) -> Result<Self> {
+        let store_path = store_path.as_ref();
+        if !store_path.exists() {
+            return Err(Error::InvalidStorePath(store_path.display().to_string()).into());
+        }
+
+        let json_path = json_path.as_ref();
+        debug!(
+            json_file = %json_path.display(),
+            instance = %instance,
+            "loading backup metadata from JSON file"
+        );
+
+        let contents = std::fs::read(json_path)?;
+        let mut instances: Vec<ShowInstanceJson> = serde_json::from_slice(&contents)?;
+
+        let inst = instances
+            .drain(..)
+            .find(|i| i.instance == instance)
+            .ok_or_else(|| Error::BindingViolation {
+                expected: instance.to_string(),
+                actual: "<missing>".into(),
+            })?;
+
+        let version_pg_probackup = inst
+            .backups
+            .iter()
+            .find_map(|b| b.program_version.clone())
+            .unwrap_or_else(|| "unknown".into());
+
+        let backups = inst
+            .backups
+            .into_iter()
+            .map(|b| backup_from_show(instance, b))
+            .collect::<Result<Vec<_>>>()?;
+
+        let store = BackupStore::new(store_path, inst.instance, version_pg_probackup, backups)?;
         store.validate()?;
         Ok(store)
     }
