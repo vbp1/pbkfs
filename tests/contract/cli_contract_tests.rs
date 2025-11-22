@@ -2,6 +2,7 @@
 
 use pbkfs::{binding::DiffDir, cli::mount::MountArgs, binding::BindingRecord, Error};
 use tempfile::tempdir;
+use uuid::Uuid;
 
 fn expect_error(args: &[&str], expected: Error) {
     let err = pbkfs::run(args.iter().copied()).expect_err("command should fail");
@@ -263,4 +264,122 @@ fn mount_rejects_binding_mismatch_when_store_differs() {
         .downcast_ref::<Error>()
         .expect("should downcast to pbkfs::Error");
     assert!(matches!(actual, Error::BindingViolation { .. }));
+}
+
+#[test]
+fn cleanup_requires_diff_dir() {
+    expect_error(
+        &["pbkfs", "cleanup"],
+        Error::Cli("diff_dir is required".into()),
+    );
+}
+
+#[test]
+fn cleanup_removes_binding_and_diff_data_when_idle() -> pbkfs::Result<()> {
+    let diff = tempdir()?;
+    let store = tempdir()?;
+    let target = tempdir()?;
+
+    let diff_dir = DiffDir::new(diff.path())?;
+    let mut binding = BindingRecord::new(
+        "main",
+        "FULL1",
+        store.path(),
+        target.path(),
+        0,
+        "host",
+        "0.1.0",
+    );
+    binding.mark_released();
+    binding.write_to_diff(&diff_dir)?;
+
+    let diff_file = diff.path().join("data/db/heap");
+    std::fs::create_dir_all(diff_file.parent().unwrap())?;
+    std::fs::write(&diff_file, b"dirty-bytes")?;
+
+    pbkfs::run([
+        "pbkfs",
+        "cleanup",
+        "--diff-dir",
+        diff.path().to_str().unwrap(),
+    ])?;
+
+    assert!(!diff_dir.binding_path().exists());
+    assert!(!diff_dir.lock_path().exists());
+    assert!(!diff_file.exists());
+
+    Ok(())
+}
+
+#[test]
+fn cleanup_rejects_active_mount_without_force() {
+    let diff = tempdir().unwrap();
+    let store = tempdir().unwrap();
+    let target = tempdir().unwrap();
+
+    let diff_dir = DiffDir::new(diff.path()).unwrap();
+    let pid = std::process::id() as i32;
+    let binding = BindingRecord::new(
+        "main",
+        "FULL1",
+        store.path(),
+        target.path(),
+        pid,
+        "host",
+        "0.1.0",
+    );
+    binding.write_to_diff(&diff_dir).unwrap();
+    diff_dir.write_lock(Uuid::new_v4()).unwrap();
+
+    let err = pbkfs::run([
+        "pbkfs",
+        "cleanup",
+        "--diff-dir",
+        diff.path().to_str().unwrap(),
+    ])
+    .expect_err("active mount should be rejected");
+
+    let actual = err
+        .downcast_ref::<Error>()
+        .expect("should downcast to pbkfs::Error");
+    assert!(matches!(actual, Error::BindingInUse(p) if *p == pid));
+}
+
+#[test]
+fn cleanup_force_overrides_active_lock_and_cleans() -> pbkfs::Result<()> {
+    let diff = tempdir()?;
+    let store = tempdir()?;
+    let target = tempdir()?;
+
+    let diff_dir = DiffDir::new(diff.path())?;
+    let pid = std::process::id() as i32;
+    let binding = BindingRecord::new(
+        "main",
+        "FULL1",
+        store.path(),
+        target.path(),
+        pid,
+        "host",
+        "0.1.0",
+    );
+    binding.write_to_diff(&diff_dir)?;
+    diff_dir.write_lock(Uuid::new_v4())?;
+
+    let diff_file = diff.path().join("data/db/heap");
+    std::fs::create_dir_all(diff_file.parent().unwrap())?;
+    std::fs::write(&diff_file, b"dirty")?;
+
+    pbkfs::run([
+        "pbkfs",
+        "cleanup",
+        "--diff-dir",
+        diff.path().to_str().unwrap(),
+        "--force",
+    ])?;
+
+    assert!(!diff_dir.binding_path().exists());
+    assert!(!diff_dir.lock_path().exists());
+    assert!(!diff_file.exists());
+
+    Ok(())
 }

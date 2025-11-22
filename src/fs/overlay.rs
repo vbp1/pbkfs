@@ -556,3 +556,32 @@ impl Overlay {
         matches
     }
 }
+
+/// Remove all contents of a diff directory while leaving the root intact.
+///
+/// Symlinks are removed as links (no traversal). Directories are removed
+/// recursively. The `diff_root` itself must already exist.
+pub fn wipe_diff_dir(diff_root: &Path) -> Result<()> {
+    if !diff_root.exists() {
+        return Ok(());
+    }
+
+    if diff_root.parent().is_none() {
+        return Err(Error::Cli("refusing to wipe root path".into()).into());
+    }
+
+    for entry in fs::read_dir(diff_root)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            fs::remove_file(&path)?;
+        } else if ft.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
