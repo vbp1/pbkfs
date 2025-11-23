@@ -11,6 +11,24 @@ fn meta(
     compressed: bool,
     compression_algo: Option<CompressionAlgorithm>,
 ) -> BackupMetadata {
+    meta_with_status(
+        id,
+        parent,
+        backup_type,
+        compressed,
+        compression_algo,
+        BackupStatus::Ok,
+    )
+}
+
+fn meta_with_status(
+    id: &str,
+    parent: Option<&str>,
+    backup_type: BackupType,
+    compressed: bool,
+    compression_algo: Option<CompressionAlgorithm>,
+    status: BackupStatus,
+) -> BackupMetadata {
     let compression = compressed.then(|| Compression {
         algorithm: compression_algo.unwrap_or(CompressionAlgorithm::Zstd),
         level: Some(3),
@@ -26,7 +44,7 @@ fn meta(
         },
         parent_id: parent.map(|p| p.to_string()),
         start_time: "2024-01-01T00:00:00Z".to_string(),
-        status: BackupStatus::Ok,
+        status,
         compressed,
         compression,
         size_bytes: 1024,
@@ -110,5 +128,106 @@ fn captures_multiple_compression_algorithms() -> pbkfs::Result<()> {
     assert!(chain
         .compression_algorithms
         .contains(&CompressionAlgorithm::Zstd));
+    Ok(())
+}
+
+#[test]
+fn accepts_done_status_as_valid() -> pbkfs::Result<()> {
+    let backups = vec![
+        meta_with_status(
+            "FULL1",
+            None,
+            BackupType::Full,
+            false,
+            None,
+            BackupStatus::Done,
+        ),
+        meta_with_status(
+            "INC1",
+            Some("FULL1"),
+            BackupType::Incremental,
+            false,
+            None,
+            BackupStatus::Done,
+        ),
+    ];
+    let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
+    let chain = BackupChain::from_target_backup(&store, "INC1")?;
+
+    // Both DONE and OK should result in Valid chain
+    assert_eq!(ChainIntegrity::Valid, chain.integrity_state);
+    assert_eq!(2, chain.elements.len());
+
+    // Verify is_ok() returns true for Done status
+    assert!(chain.elements[0].is_ok());
+    assert!(chain.elements[1].is_ok());
+
+    Ok(())
+}
+
+#[test]
+fn marks_chain_corrupt_when_backup_has_error_status() -> pbkfs::Result<()> {
+    let backups = vec![
+        meta_with_status(
+            "FULL1",
+            None,
+            BackupType::Full,
+            false,
+            None,
+            BackupStatus::Ok,
+        ),
+        meta_with_status(
+            "INC1",
+            Some("FULL1"),
+            BackupType::Incremental,
+            false,
+            None,
+            BackupStatus::Corrupt,
+        ),
+    ];
+    let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
+    let chain = BackupChain::from_target_backup(&store, "INC1")?;
+
+    // Chain with corrupt backup should be marked as Corrupt
+    assert_eq!(ChainIntegrity::Corrupt, chain.integrity_state);
+
+    Ok(())
+}
+
+#[test]
+fn mixed_ok_and_done_statuses_are_valid() -> pbkfs::Result<()> {
+    let backups = vec![
+        meta_with_status(
+            "FULL1",
+            None,
+            BackupType::Full,
+            false,
+            None,
+            BackupStatus::Ok,
+        ),
+        meta_with_status(
+            "INC1",
+            Some("FULL1"),
+            BackupType::Incremental,
+            false,
+            None,
+            BackupStatus::Done,
+        ),
+        meta_with_status(
+            "INC2",
+            Some("INC1"),
+            BackupType::Incremental,
+            false,
+            None,
+            BackupStatus::Ok,
+        ),
+    ];
+    let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
+    let chain = BackupChain::from_target_backup(&store, "INC2")?;
+
+    // Mix of OK and DONE should still be Valid
+    assert_eq!(ChainIntegrity::Valid, chain.integrity_state);
+    assert!(chain.elements.iter().all(|b| b.is_ok()));
+
     Ok(())
 }

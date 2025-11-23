@@ -23,6 +23,7 @@ pub enum BackupMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BackupStatus {
     Ok,
+    Done,
     Corrupt,
     Unknown,
 }
@@ -227,7 +228,7 @@ impl BackupStore {
 
 impl BackupMetadata {
     pub fn is_ok(&self) -> bool {
-        matches!(self.status, BackupStatus::Ok)
+        matches!(self.status, BackupStatus::Ok | BackupStatus::Done)
     }
 
     pub fn is_compressed(&self) -> bool {
@@ -290,6 +291,7 @@ fn backup_from_show(instance: &str, b: ShowBackupJson) -> Result<BackupMetadata>
 
     let status = match b.status.to_uppercase().as_str() {
         "OK" => BackupStatus::Ok,
+        "DONE" => BackupStatus::Done,
         "ERROR" | "CORRUPT" => BackupStatus::Corrupt,
         _ => BackupStatus::Unknown,
     };
