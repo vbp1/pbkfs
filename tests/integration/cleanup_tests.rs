@@ -26,7 +26,9 @@ fn cleanup_clears_diff_dir_when_idle() -> pbkfs::Result<()> {
     binding.mark_released();
     binding.write_to_diff(&diff_dir)?;
 
-    let diff_file = diff.path().join("data/base/pg_wal/000000010000000000000001");
+    let diff_file = diff
+        .path()
+        .join("data/base/pg_wal/000000010000000000000001");
     std::fs::create_dir_all(diff_file.parent().unwrap())?;
     std::fs::write(&diff_file, b"wal-bytes")?;
 
@@ -143,7 +145,10 @@ fn cleanup_fails_when_diff_not_writable_and_preserves_binding() {
     perms.set_mode(0o700);
     let _ = std::fs::set_permissions(diff.path(), perms);
 
-    assert!(matches!(err.downcast_ref::<pbkfs::Error>(), Some(pbkfs::Error::DiffDirNotWritable(_))));
+    assert!(matches!(
+        err.downcast_ref::<pbkfs::Error>(),
+        Some(pbkfs::Error::DiffDirNotWritable(_))
+    ));
     // Binding file should remain because cleanup aborted
     assert!(diff.path().join(BINDING_FILE).exists());
 }

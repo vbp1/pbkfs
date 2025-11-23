@@ -12,7 +12,11 @@ use serde_json;
 use tracing::{info, instrument, warn};
 
 use crate::{
-    backup::{chain::BackupChain, metadata::BackupStore, BackupMode, BackupType},
+    backup::{
+        chain::{BackupChain, ChainIntegrity},
+        metadata::BackupStore,
+        BackupMode, BackupType,
+    },
     binding::{BindingRecord, DiffDir, LockMarker, LOCK_FILE},
     fs::{
         fuse,
@@ -44,6 +48,10 @@ pub struct MountArgs {
     /// Target backup id
     #[arg(short = 'i', long = "backup-id")]
     pub backup_id: Option<String>,
+
+    /// Allow mounting corrupt backup chains (dangerous)
+    #[arg(long, default_value = "false")]
+    pub force: bool,
 }
 
 #[derive(Debug)]
@@ -179,7 +187,10 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
             if binding.is_owner_alive() {
                 return Err(Error::BindingInUse(binding.owner_pid).into());
             }
-            warn!(owner_pid=binding.owner_pid, "stale lock detected; recovering");
+            warn!(
+                owner_pid = binding.owner_pid,
+                "stale lock detected; recovering"
+            );
             let _ = fs::remove_file(&lock_path);
             binding.mark_stale();
             recovered_stale = true;
@@ -216,6 +227,27 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
     let store = BackupStore::load_from_pg_probackup(&pbk_store, &instance)?;
     let chain = BackupChain::from_binding(&store, &binding)?;
     info!(backup=?backup_id, instance=?instance, "backup chain resolved");
+
+    // Validate chain integrity
+    match chain.integrity_state {
+        ChainIntegrity::Incomplete => {
+            return Err(Error::Cli(
+                "Backup chain is incomplete (missing FULL backup). Cannot mount.".into(),
+            )
+            .into());
+        }
+        ChainIntegrity::Corrupt if !args.force => {
+            return Err(Error::Cli(
+                "Backup chain contains corrupted backups. Use --force to override (dangerous)."
+                    .into(),
+            )
+            .into());
+        }
+        ChainIntegrity::Corrupt => {
+            warn!("Mounting CORRUPT backup chain (--force enabled). Data may be invalid!");
+        }
+        ChainIntegrity::Valid => {}
+    }
 
     binding.write_to_diff(&diff_dir)?;
     if recovered_stale {

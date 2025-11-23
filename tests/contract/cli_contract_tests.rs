@@ -1,6 +1,6 @@
 //! CLI contract tests for pbkfs argument validation.
 
-use pbkfs::{binding::DiffDir, cli::mount::MountArgs, binding::BindingRecord, Error};
+use pbkfs::{binding::BindingRecord, binding::DiffDir, cli::mount::MountArgs, Error};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -101,6 +101,33 @@ fn write_metadata(store: &std::path::Path) {
     .unwrap();
 }
 
+fn write_corrupt_metadata(store: &std::path::Path) {
+    let metadata = serde_json::json!([
+        {
+            "instance": "main",
+            "backups": [
+                {
+                    "id": "FULL1",
+                    "parent-backup-id": null,
+                    "backup-mode": "FULL",
+                    "status": "CORRUPT",
+                    "compress-alg": "none",
+                    "compress-level": null,
+                    "start-time": "2024-01-01T00:00:00Z",
+                    "data-bytes": 512u64,
+                    "program-version": "2.6.0"
+                }
+            ]
+        }
+    ]);
+
+    std::fs::write(
+        store.join("backups.json"),
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn mount_reuses_binding_with_diff_only_arguments() -> pbkfs::Result<()> {
     let store = tempdir()?;
@@ -141,6 +168,7 @@ fn mount_reuses_binding_with_diff_only_arguments() -> pbkfs::Result<()> {
         diff_dir: Some(diff.path().to_path_buf()),
         instance: None,
         backup_id: None,
+        force: false,
     })?;
 
     assert_eq!(binding.binding_id, ctx.binding.binding_id);
@@ -186,6 +214,7 @@ fn mount_rejects_binding_mismatch_when_instance_differs() {
         diff_dir: Some(diff.path().to_path_buf()),
         instance: Some("other".into()),
         backup_id: Some("FULL1".into()),
+        force: false,
     })
     .expect_err("mismatched instance should fail");
 
@@ -220,6 +249,7 @@ fn mount_rejects_binding_mismatch_when_backup_differs() {
         diff_dir: Some(diff.path().to_path_buf()),
         instance: Some("main".into()),
         backup_id: Some("INC1".into()),
+        force: false,
     })
     .expect_err("mismatched backup should fail");
 
@@ -257,6 +287,7 @@ fn mount_rejects_binding_mismatch_when_store_differs() {
         diff_dir: Some(diff.path().to_path_buf()),
         instance: None,
         backup_id: None,
+        force: false,
     })
     .expect_err("store path mismatch should fail");
 
@@ -380,6 +411,71 @@ fn cleanup_force_overrides_active_lock_and_cleans() -> pbkfs::Result<()> {
     assert!(!diff_dir.binding_path().exists());
     assert!(!diff_dir.lock_path().exists());
     assert!(!diff_file.exists());
+
+    Ok(())
+}
+
+#[test]
+fn mount_rejects_corrupt_chain_without_force() {
+    let store = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+
+    let base_file = store
+        .path()
+        .join("FULL1")
+        .join("database")
+        .join("data/base.txt");
+    std::fs::create_dir_all(base_file.parent().unwrap()).unwrap();
+    std::fs::write(&base_file, b"data").unwrap();
+    write_corrupt_metadata(store.path());
+
+    let err = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+    })
+    .expect_err("corrupt chain should fail without --force");
+
+    let actual = err
+        .downcast_ref::<Error>()
+        .expect("should downcast to pbkfs::Error");
+    assert!(matches!(actual, Error::Cli(msg) if msg.contains("corrupted")));
+}
+
+#[test]
+fn mount_allows_corrupt_chain_with_force() -> pbkfs::Result<()> {
+    let store = tempdir()?;
+    let target = tempdir()?;
+    let diff = tempdir()?;
+
+    let base_file = store
+        .path()
+        .join("FULL1")
+        .join("database")
+        .join("data/base.txt");
+    std::fs::create_dir_all(base_file.parent().unwrap())?;
+    std::fs::write(&base_file, b"data")?;
+    write_corrupt_metadata(store.path());
+
+    let ctx = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: true,
+    })?;
+
+    assert_eq!("FULL1", ctx.chain.target_backup_id);
+
+    if let Some(handle) = ctx.fuse_handle {
+        handle.unmount();
+    }
+    let _ = std::fs::remove_file(diff.path().join(pbkfs::binding::LOCK_FILE));
 
     Ok(())
 }

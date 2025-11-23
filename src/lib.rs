@@ -34,7 +34,9 @@ pub enum Error {
     UnsupportedCompressedIncremental(crate::backup::CompressionAlgorithm),
     #[error("pagemap file missing for incremental: {0}")]
     MissingPagemap(String),
-    #[error("incremental page size mismatch for {path} block {block}: expected {expected} got {actual}")]
+    #[error(
+        "incremental page size mismatch for {path} block {block}: expected {expected} got {actual}"
+    )]
     InvalidIncrementalPageSize {
         path: String,
         block: u32,

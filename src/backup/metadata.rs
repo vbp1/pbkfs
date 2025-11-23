@@ -125,12 +125,15 @@ struct ShowBackupJson {
     #[serde(rename = "data-bytes")]
     data_bytes: Option<u64>,
     #[serde(rename = "uncompressed-bytes")]
+    #[allow(dead_code)]
     uncompressed_bytes: Option<u64>,
     #[serde(rename = "wal-bytes")]
+    #[allow(dead_code)]
     wal_bytes: Option<u64>,
     #[serde(rename = "program-version")]
     program_version: Option<String>,
     #[serde(rename = "server-version")]
+    #[allow(dead_code)]
     server_version: Option<String>,
 }
 
