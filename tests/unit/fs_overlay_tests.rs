@@ -1,6 +1,6 @@
-use std::{fs, io::Write, path::Path};
 #[cfg(target_family = "unix")]
 use std::os::unix::fs::PermissionsExt;
+use std::{fs, io::Write, path::Path};
 
 use flate2::{write::ZlibEncoder, Compression};
 use pbkfs::backup::metadata::{BackupMode, CompressionAlgorithm};
@@ -323,7 +323,9 @@ fn write_surfaces_enospc_from_diff_device() {
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink("/dev/full", &target).unwrap();
 
-    let err = overlay.write(rel, b"payload").expect_err("should propagate ENOSPC");
+    let err = overlay
+        .write(rel, b"payload")
+        .expect_err("should propagate ENOSPC");
     let io_err = err
         .downcast_ref::<std::io::Error>()
         .expect("must be io error");
