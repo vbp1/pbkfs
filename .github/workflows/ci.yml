@@ -12,10 +12,8 @@ jobs:
       - name: Set up Rust 1.80
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.80.0
-
-      - name: Install rustfmt and clippy components
-        run: rustup component add --toolchain 1.80.0 rustfmt clippy
+          toolchain: 1.80.1
+          components: rustfmt, clippy
 
       - name: Cache cargo build
         uses: actions/cache@v4
