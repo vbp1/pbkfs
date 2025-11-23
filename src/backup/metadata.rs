@@ -215,7 +215,7 @@ impl BackupStore {
         );
 
         let output = match Command::new("pg_probackup")
-            .args(&[
+            .args([
                 "show",
                 "-B",
                 path.to_str().ok_or_else(|| {
@@ -258,12 +258,8 @@ impl BackupStore {
 
             // Try fallback to backups.json for permission-related failures
             let fallback_path = path.join("backups.json");
-            if fallback_path.exists()
-                && stderr.contains("Permission denied")
-            {
-                debug!(
-                    "pg_probackup failed with permission error, falling back to backups.json"
-                );
+            if fallback_path.exists() && stderr.contains("Permission denied") {
+                debug!("pg_probackup failed with permission error, falling back to backups.json");
                 return Self::load_from_json_file(path, &fallback_path, instance);
             }
 
@@ -276,12 +272,7 @@ impl BackupStore {
         }
 
         let mut instances: Vec<ShowInstanceJson> = serde_json::from_slice(&output.stdout)
-            .map_err(|e| {
-                Error::Cli(format!(
-                    "failed to parse pg_probackup JSON output: {}",
-                    e
-                ))
-            })?;
+            .map_err(|e| Error::Cli(format!("failed to parse pg_probackup JSON output: {}", e)))?;
 
         let inst = instances
             .drain(..)

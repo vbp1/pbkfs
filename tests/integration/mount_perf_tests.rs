@@ -26,6 +26,8 @@ fn overlay_read_write_is_fast_enough() -> pbkfs::Result<()> {
     overlay.write(std::path::Path::new("data/chunk.bin"), b"diff")?;
     let elapsed = start.elapsed();
 
+    println!("overlay_read_write elapsed_ms={} payload_bytes={}", elapsed.as_millis(), payload.len());
+
     assert_eq!(payload.len(), read.len());
     // The exact budget is generous; we're only guarding against accidental
     // regressions from obvious pathologies (e.g., repeated fs::metadata calls).

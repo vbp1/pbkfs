@@ -1,4 +1,6 @@
 use std::{fs, io::Write, path::Path};
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::PermissionsExt;
 
 use flate2::{write::ZlibEncoder, Compression};
 use pbkfs::backup::metadata::{BackupMode, CompressionAlgorithm};
@@ -306,6 +308,95 @@ fn pagemap_mismatch_surfaces_error() {
         .map(|e| matches!(e, pbkfs::Error::IncompleteIncremental { .. }))
         .unwrap_or(false);
     assert!(has_incomplete, "expected IncompleteIncremental error");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn write_surfaces_enospc_from_diff_device() {
+    let base = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+    let overlay = Overlay::new(base.path(), diff.path()).unwrap();
+
+    // Route the target to /dev/full so writes yield ENOSPC.
+    let rel = Path::new("dev_full.bin");
+    let target = diff.path().join("data").join(rel);
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/dev/full", &target).unwrap();
+
+    let err = overlay.write(rel, b"payload").expect_err("should propagate ENOSPC");
+    let io_err = err
+        .downcast_ref::<std::io::Error>()
+        .expect("must be io error");
+    assert_eq!(io_err.raw_os_error(), Some(28)); // ENOSPC
+}
+
+#[cfg(target_family = "unix")]
+#[test]
+fn write_surfaces_eacces_when_diff_not_writable() {
+    let base = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+    let overlay = Overlay::new(base.path(), diff.path()).unwrap();
+
+    // Make diff/data read-only to force EACCES on write.
+    let diff_data = diff.path().join("data");
+    fs::set_permissions(&diff_data, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let rel = Path::new("blocked/file.txt");
+    let err = overlay
+        .write(rel, b"cannot-write")
+        .expect_err("should propagate EACCES");
+    let io_err = err
+        .downcast_ref::<std::io::Error>()
+        .expect("must be io error");
+    assert_eq!(io_err.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
+#[test]
+fn mixed_compression_chain_prefers_newest_layer() -> pbkfs::Result<()> {
+    let compressed = tempdir()?;
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    // Newest layer: compressed zstd file
+    let top_root = compressed.path().join("INC1").join("database");
+    fs::create_dir_all(&top_root)?;
+    let original = b"mixed-compression";
+    let compressed_bytes = zstd::stream::encode_all(&original[..], 3)?;
+    fs::write(top_root.join("tbl"), compressed_bytes)?;
+
+    // Older layer: uncompressed base file with different contents
+    let base_root = base.path().join("FULL1").join("database");
+    fs::create_dir_all(&base_root)?;
+    fs::write(base_root.join("tbl"), b"older-version")?;
+
+    let layers = vec![
+        Layer {
+            root: top_root,
+            compression: Some(CompressionAlgorithm::Zstd),
+            incremental: false,
+            backup_mode: BackupMode::Full,
+        },
+        Layer {
+            root: base_root,
+            compression: None,
+            incremental: false,
+            backup_mode: BackupMode::Full,
+        },
+    ];
+
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+    let data = overlay
+        .read(Path::new("tbl"))?
+        .expect("should materialize from compressed top layer");
+
+    assert_eq!(data.as_slice(), original);
+
+    // Diff should now have decompressed bytes.
+    let diff_path = overlay.diff_root().join("tbl");
+    assert!(diff_path.exists());
+    assert_eq!(fs::read(diff_path)?, original);
+
+    Ok(())
 }
 
 fn write_incremental_entry(file: &mut fs::File, block: u32, payload: &[u8]) -> pbkfs::Result<()> {
