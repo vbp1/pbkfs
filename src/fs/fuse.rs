@@ -245,7 +245,7 @@ impl Filesystem for OverlayFs {
         };
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.rel_for(ino).and_then(|p| self.stat_path(&p)) {
             Some((attr, _)) => reply.attr(&TTL, &attr),
             None => reply.error(ENOENT),
