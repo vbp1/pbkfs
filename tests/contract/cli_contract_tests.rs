@@ -7,7 +7,10 @@ use uuid::Uuid;
 static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 fn mount_guarded(args: MountArgs) -> pbkfs::Result<pbkfs::cli::mount::MountContext> {
-    let _guard = ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+    let _guard = ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
     pbkfs::cli::mount::mount(args)
 }
 
@@ -150,7 +153,10 @@ JSON
     }
     let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
     {
-        let _guard = ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        let _guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
         std::env::set_var("PG_PROBACKUP_BIN", &script_path);
 
         let ctx = pbkfs::cli::mount::mount(MountArgs {

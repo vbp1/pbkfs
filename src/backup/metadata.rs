@@ -174,9 +174,33 @@ impl BackupStore {
             return Err(Error::InvalidStorePath(path.display().to_string()).into());
         }
 
+        let instance_name = instance_name.into();
+        match layout {
+            StoreLayout::Native => {
+                let backups_dir = path.join("backups").join(&instance_name);
+                if !backups_dir.is_dir() {
+                    return Err(Error::InvalidStoreLayout(format!(
+                        "layout=native but {} is missing or not a directory",
+                        backups_dir.display()
+                    ))
+                    .into());
+                }
+            }
+            StoreLayout::JsonFallback => {
+                let json_file = path.join("backups.json");
+                if !json_file.exists() {
+                    return Err(Error::InvalidStoreLayout(format!(
+                        "layout=json-fallback but {} is missing",
+                        json_file.display()
+                    ))
+                    .into());
+                }
+            }
+        }
+
         Ok(Self {
             path: path.to_path_buf(),
-            instance_name: instance_name.into(),
+            instance_name,
             backups,
             version_pg_probackup: version_pg_probackup.into(),
             version_postgres_supported: (14, 17),
@@ -230,9 +254,10 @@ impl BackupStore {
         }
 
         Err(Error::InvalidStoreLayout(format!(
-            "backup {} missing expected data directory under {}",
+            "backup {} data directory not found (tried native: {}, legacy: {})",
             backup.backup_id,
-            native.display()
+            native.display(),
+            legacy.display()
         ))
         .into())
     }
@@ -306,16 +331,14 @@ impl BackupStore {
                     );
                 }
 
-                return Err(
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        Error::PgProbackupMissingBinary(pg_probackup_bin.clone())
-                    } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        Error::PgProbackupNotExecutable(pg_probackup_bin.clone())
-                    } else {
-                        Error::Io(e)
-                    }
-                    .into(),
-                );
+                return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                    Error::PgProbackupMissingBinary(pg_probackup_bin.clone())
+                } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    Error::PgProbackupNotExecutable(pg_probackup_bin.clone())
+                } else {
+                    Error::Io(e)
+                }
+                .into());
             }
         };
 

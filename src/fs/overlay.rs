@@ -15,12 +15,17 @@ use crate::{
     backup::metadata::{BackupMode, CompressionAlgorithm},
     Error, Result,
 };
+use tracing::warn;
 use walkdir::WalkDir;
 
 const COPYUP_WAIT_RETRIES: usize = 50;
 const COPYUP_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 const BLCKSZ: usize = 8192;
 const PAGE_TRUNCATED: i32 = -2;
+// PostgreSQL OID is u32: up to 10 decimal digits (4_294_967_295).
+const MAX_OID_DIGITS: usize = 10;
+// pg_probackup segment numbers are bounded (pgFileSize): up to 5 digits.
+const MAX_SEGMENT_DIGITS: usize = 5;
 
 #[repr(C)]
 struct BackupPageHeader {
@@ -249,7 +254,12 @@ impl Overlay {
         // materialize a plain heap file by decoding per-page headers into BLCKSZ
         // pages in the diff directory.
         if self.is_pg_datafile(rel) {
-            return self.materialize_full_datafile(rel, top_path, &diff_path, top_layer.compression);
+            return self.materialize_full_datafile(
+                rel,
+                top_path,
+                &diff_path,
+                top_layer.compression,
+            );
         }
 
         if let Some(algo) = top_layer.compression {
@@ -472,15 +482,7 @@ impl Overlay {
             let mut buf = vec![0u8; compressed_size as usize];
             reader.read_exact(&mut buf)?;
 
-            let page = match layer.compression {
-                // For pg_probackup-style pages, compression is per-page. A page
-                // with size BLCKSZ is stored uncompressed even if an algorithm
-                // is configured.
-                Some(algo) if compressed_size as usize != BLCKSZ => {
-                    self.decompress_page(algo, &buf)?
-                }
-                _ => buf,
-            };
+            let page = self.decompress_page_if_needed(layer.compression, compressed_size, buf)?;
 
             if page.len() != BLCKSZ {
                 return Err(Error::InvalidIncrementalPageSize {
@@ -517,6 +519,20 @@ impl Overlay {
     ) -> Result<Box<dyn Read>> {
         let file = fs::File::open(path)?;
         Ok(Box::new(BufReader::new(file)))
+    }
+
+    fn decompress_page_if_needed(
+        &self,
+        compression: Option<CompressionAlgorithm>,
+        compressed_size: i32,
+        buf: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        if compressed_size as usize != BLCKSZ {
+            if let Some(algo) = compression {
+                return self.decompress_page(algo, &buf);
+            }
+        }
+        Ok(buf)
     }
 
     fn decompress_page(&self, algo: CompressionAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
@@ -581,7 +597,7 @@ impl Overlay {
         while let Some(&c) = chars.peek() {
             if c.is_ascii_digit() {
                 oid_digits += 1;
-                if oid_digits > 10 {
+                if oid_digits > MAX_OID_DIGITS {
                     return false;
                 }
                 chars.next();
@@ -607,7 +623,7 @@ impl Overlay {
                         }
                     }
                     seg_digits += 1;
-                    if seg_digits > 5 {
+                    if seg_digits > MAX_SEGMENT_DIGITS {
                         return false;
                     }
                 }
@@ -679,6 +695,26 @@ impl Overlay {
 
             if compressed_size == PAGE_TRUNCATED {
                 out.set_len(block as u64 * BLCKSZ as u64)?;
+                warn!(
+                    "PAGE_TRUNCATED at block {} in {}; remaining data ignored",
+                    block,
+                    rel.display()
+                );
+                // Ensure no trailing data after truncation marker; treat any
+                // extra bytes as format corruption.
+                let mut trailer = [0u8; 1];
+                match reader.read(&mut trailer) {
+                    Ok(0) => {}
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("data found after PAGE_TRUNCATED in {}", rel.display()),
+                        )
+                        .into());
+                    }
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => {}
+                    Err(e) => return Err(e.into()),
+                }
                 break;
             }
 
@@ -695,12 +731,7 @@ impl Overlay {
             let mut buf = vec![0u8; compressed_size as usize];
             reader.read_exact(&mut buf)?;
 
-            let page = match compression {
-                Some(algo) if compressed_size as usize != BLCKSZ => {
-                    self.decompress_page(algo, &buf)?
-                }
-                _ => buf,
-            };
+            let page = self.decompress_page_if_needed(compression, compressed_size, buf)?;
 
             if page.len() != BLCKSZ {
                 return Err(Error::InvalidIncrementalPageSize {
