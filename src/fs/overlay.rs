@@ -612,7 +612,7 @@ impl Overlay {
                 // Optional ".<segno>" with 1..5 digits, no leading zero.
                 let mut seg_digits = 0usize;
                 let mut first_seg: Option<char> = None;
-                while let Some(c) = chars.next() {
+                for c in chars {
                     if !c.is_ascii_digit() {
                         return false;
                     }
