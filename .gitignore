@@ -37,6 +37,7 @@ CLAUDE.md
 # Other
 pg_probackup
 postgres.repo
+postgres/data/
 
 # OS / editor cruft
 .DS_Store
@@ -46,5 +47,4 @@ Thumbs.db
 
 
 # Added by cargo
-
 /target
