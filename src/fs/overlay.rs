@@ -671,7 +671,6 @@ impl Overlay {
                 }
                 return Ok(Some(page));
             }
-
         }
     }
 
