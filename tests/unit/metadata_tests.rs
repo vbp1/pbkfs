@@ -1,6 +1,6 @@
 use std::fs;
 
-use pbkfs::backup::metadata::{BackupStore, CompressionAlgorithm};
+use pbkfs::backup::metadata::{BackupStore, CompressionAlgorithm, StoreLayout};
 use tempfile::tempdir;
 
 fn write_backups_json(dir: &std::path::Path, body: serde_json::Value) {
@@ -9,6 +9,13 @@ fn write_backups_json(dir: &std::path::Path, body: serde_json::Value) {
         serde_json::to_vec_pretty(&body).unwrap(),
     )
     .unwrap();
+}
+
+fn native_root(dir: &std::path::Path, instance: &str, backup_id: &str) -> std::path::PathBuf {
+    dir.join("backups")
+        .join(instance)
+        .join(backup_id)
+        .join("database")
 }
 
 #[test]
@@ -45,6 +52,59 @@ fn loads_compression_algorithm_and_level() -> pbkfs::Result<()> {
     assert_eq!(Some(6), backup.compression_level());
 
     Ok(())
+}
+
+#[test]
+fn resolves_native_backup_roots_without_shim() -> pbkfs::Result<()> {
+    let store = tempdir()?;
+    let data_root = native_root(store.path(), "main", "FULL1");
+    fs::create_dir_all(&data_root)?;
+    fs::write(data_root.join("datafile"), b"ok")?;
+
+    let metadata = serde_json::json!([
+        {
+            "instance": "main",
+            "backups": [
+                {
+                    "id": "FULL1",
+                    "parent-backup-id": null,
+                    "backup-mode": "FULL",
+                    "status": "OK",
+                    "compress-alg": "none",
+                    "compress-level": null,
+                    "start-time": "2024-01-01T00:00:00Z",
+                    "data-bytes": 1024u64,
+                    "program-version": "2.6.0"
+                }
+            ]
+        }
+    ]);
+    let json_path = store.path().join("backups.json");
+    write_backups_json(store.path(), metadata);
+
+    let loaded = BackupStore::load_from_json_file(store.path(), &json_path, "main")?;
+    assert_eq!(StoreLayout::JsonFallback, loaded.layout);
+
+    let backup = loaded.find_backup("FULL1").expect("backup present");
+    let root = loaded.backup_data_root(backup)?;
+    assert_eq!(native_root(store.path(), "main", "FULL1"), root);
+    Ok(())
+}
+
+#[test]
+fn rejects_non_array_json_layout() {
+    let store = tempdir().unwrap();
+    fs::write(store.path().join("backups.json"), br#"{"instance":"main"}"#).unwrap();
+
+    let err =
+        BackupStore::load_from_json_file(store.path(), &store.path().join("backups.json"), "main")
+            .unwrap_err();
+    let msg = format!("{err:#}");
+    let msg_lc = msg.to_lowercase();
+    assert!(
+        msg_lc.contains("sequence") || msg_lc.contains("array"),
+        "unexpected error message: {msg}"
+    );
 }
 
 #[test]

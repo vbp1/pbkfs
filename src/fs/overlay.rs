@@ -15,12 +15,17 @@ use crate::{
     backup::metadata::{BackupMode, CompressionAlgorithm},
     Error, Result,
 };
+use tracing::warn;
 use walkdir::WalkDir;
 
 const COPYUP_WAIT_RETRIES: usize = 50;
 const COPYUP_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 const BLCKSZ: usize = 8192;
 const PAGE_TRUNCATED: i32 = -2;
+// PostgreSQL OID is u32: up to 10 decimal digits (4_294_967_295).
+const MAX_OID_DIGITS: usize = 10;
+// pg_probackup segment numbers are bounded (pgFileSize): up to 5 digits.
+const MAX_SEGMENT_DIGITS: usize = 5;
 
 #[repr(C)]
 struct BackupPageHeader {
@@ -128,12 +133,9 @@ impl Overlay {
             None => return Ok(None),
         };
 
-        if incremental {
-            self.ensure_copy_up(rel)?;
-            return Ok(Some(fs::read(diff_path)?));
-        }
-
-        if compression.is_some() {
+        // pg_probackup data files (FULL+incremental) and compressed layers
+        // must always be materialized into the diff directory before reads.
+        if incremental || compression.is_some() || self.is_pg_datafile(rel) {
             self.ensure_copy_up(rel)?;
             return Ok(Some(fs::read(diff_path)?));
         }
@@ -200,6 +202,23 @@ impl Overlay {
 
         let matches = self.matching_layers(rel);
         if matches.is_empty() {
+            // If this looks like a main-fork relation file (datafile) but is
+            // absent from all layers, it most likely represents a relation
+            // that existed but had no pages at backup time. PostgreSQL and
+            // pg_probackup restore such relations as zero-length files, so
+            // materialize an empty file in the diff to match that behavior.
+            if self.is_pg_datafile(rel) {
+                if let Some(parent) = diff_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&diff_path)?;
+                return Ok(());
+            }
+
             return Err(io::Error::from(io::ErrorKind::NotFound).into());
         }
 
@@ -229,6 +248,18 @@ impl Overlay {
 
         if top_layer.incremental {
             return self.materialize_incremental_chain(rel, &diff_path, matches);
+        }
+
+        // For non-incremental main-fork relation files produced by pg_probackup,
+        // materialize a plain heap file by decoding per-page headers into BLCKSZ
+        // pages in the diff directory.
+        if self.is_pg_datafile(rel) {
+            return self.materialize_full_datafile(
+                rel,
+                top_path,
+                &diff_path,
+                top_layer.compression,
+            );
         }
 
         if let Some(algo) = top_layer.compression {
@@ -379,6 +410,17 @@ impl Overlay {
             fs::create_dir_all(parent)?;
         }
 
+        // Determine the logical relation path relative to diff root so we can
+        // decide whether this is a main-fork data file that uses pg_probackup's
+        // per-page BackupPageHeader format.
+        let rel = diff_path
+            .strip_prefix(&self.inner.diff)
+            .unwrap_or(diff_path);
+
+        if self.is_pg_datafile(rel) {
+            return self.materialize_full_datafile(rel, base_path, diff_path, compression);
+        }
+
         match compression {
             Some(algo) => self.decompress_file_inner(base_path, diff_path, algo),
             None => {
@@ -440,11 +482,7 @@ impl Overlay {
             let mut buf = vec![0u8; compressed_size as usize];
             reader.read_exact(&mut buf)?;
 
-            let page = if let Some(algo) = layer.compression {
-                self.decompress_page(algo, &buf)?
-            } else {
-                buf
-            };
+            let page = self.decompress_page_if_needed(layer.compression, compressed_size, buf)?;
 
             if page.len() != BLCKSZ {
                 return Err(Error::InvalidIncrementalPageSize {
@@ -483,6 +521,20 @@ impl Overlay {
         Ok(Box::new(BufReader::new(file)))
     }
 
+    fn decompress_page_if_needed(
+        &self,
+        compression: Option<CompressionAlgorithm>,
+        compressed_size: i32,
+        buf: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        if compressed_size as usize != BLCKSZ {
+            if let Some(algo) = compression {
+                return self.decompress_page(algo, &buf);
+            }
+        }
+        Ok(buf)
+    }
+
     fn decompress_page(&self, algo: CompressionAlgorithm, data: &[u8]) -> Result<Vec<u8>> {
         match algo {
             CompressionAlgorithm::Zlib => {
@@ -515,6 +567,195 @@ impl Overlay {
         }
 
         Ok(Some(blocks))
+    }
+
+    /// Heuristic to detect PostgreSQL main-fork relation files that pg_probackup
+    /// stores using per-page BackupPageHeader records.
+    ///
+    /// Mirrors pg_probackup's `set_forkname` logic for `is_datafile`, but only
+    /// for the filename component:
+    ///   - `<oid>` or `<oid>.<segno>` where oid/segno are decimal, no leading 0.
+    ///   - No fork suffixes like `_vm`, `_fsm`, `_init`, `_ptrack`, or CFS
+    ///     variants; any non-digit/`.` suffix causes this to return false.
+    fn is_pg_datafile(&self, rel: &Path) -> bool {
+        let name = match rel.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => return false,
+        };
+
+        let mut chars = name.chars().peekable();
+        let first = match chars.next() {
+            Some(c) if c.is_ascii_digit() => c,
+            _ => return false,
+        };
+        if first == '0' {
+            return false;
+        }
+
+        // Parse OID digits, enforcing an upper bound similar to pg_probackup.
+        let mut oid_digits = 1usize;
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() {
+                oid_digits += 1;
+                if oid_digits > MAX_OID_DIGITS {
+                    return false;
+                }
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        match chars.next() {
+            None => true, // pure "<oid>"
+            Some('.') => {
+                // Optional ".<segno>" with 1..5 digits, no leading zero.
+                let mut seg_digits = 0usize;
+                let mut first_seg: Option<char> = None;
+                for c in chars {
+                    if !c.is_ascii_digit() {
+                        return false;
+                    }
+                    if seg_digits == 0 {
+                        first_seg = Some(c);
+                        if c == '0' {
+                            return false;
+                        }
+                    }
+                    seg_digits += 1;
+                    if seg_digits > MAX_SEGMENT_DIGITS {
+                        return false;
+                    }
+                }
+                seg_digits > 0 && first_seg.is_some()
+            }
+            // Any other suffix (e.g. "_vm", "_fsm", ".cfm") marks it as non-datafile.
+            Some(_) => false,
+        }
+    }
+
+    /// Materialize a pg_probackup-style FULL data file into a plain PostgreSQL
+    /// heap file under the diff directory by decoding BackupPageHeader records.
+    ///
+    /// The source file layout is:
+    ///   [BackupPageHeader {block, compressed_size}] [page_bytes] ...
+    /// Pages may be per-page compressed; for `compression = None` they are
+    /// stored uncompressed with `compressed_size == BLCKSZ`.
+    fn materialize_full_datafile(
+        &self,
+        rel: &Path,
+        src: &Path,
+        dst: &Path,
+        compression: Option<CompressionAlgorithm>,
+    ) -> Result<()> {
+        use std::io::{ErrorKind, Seek, SeekFrom};
+
+        let mut reader = fs::File::open(src)?;
+        let meta = reader.metadata()?;
+        let total_len = meta.len();
+
+        if total_len == 0 {
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let _ = fs::File::create(dst)?;
+            return Ok(());
+        }
+
+        if total_len < std::mem::size_of::<BackupPageHeader>() as u64 {
+            // Not a pg_probackup data file; fall back to a plain copy.
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(src, dst)?;
+            return Ok(());
+        }
+
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut out = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(dst)?;
+
+        let mut max_block: Option<u32> = None;
+        let mut header_buf = [0u8; std::mem::size_of::<BackupPageHeader>()];
+
+        loop {
+            match reader.read_exact(&mut header_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+
+            let block = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+            let compressed_size = i32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+
+            if compressed_size == PAGE_TRUNCATED {
+                out.set_len(block as u64 * BLCKSZ as u64)?;
+                warn!(
+                    "PAGE_TRUNCATED at block {} in {}; remaining data ignored",
+                    block,
+                    rel.display()
+                );
+                // Ensure no trailing data after truncation marker; treat any
+                // extra bytes as format corruption.
+                let mut trailer = [0u8; 1];
+                match reader.read(&mut trailer) {
+                    Ok(0) => {}
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("data found after PAGE_TRUNCATED in {}", rel.display()),
+                        )
+                        .into());
+                    }
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => {}
+                    Err(e) => return Err(e.into()),
+                }
+                break;
+            }
+
+            if compressed_size <= 0 || compressed_size as usize > BLCKSZ {
+                return Err(Error::InvalidIncrementalPageSize {
+                    path: rel.display().to_string(),
+                    block,
+                    expected: BLCKSZ,
+                    actual: compressed_size.max(0) as usize,
+                }
+                .into());
+            }
+
+            let mut buf = vec![0u8; compressed_size as usize];
+            reader.read_exact(&mut buf)?;
+
+            let page = self.decompress_page_if_needed(compression, compressed_size, buf)?;
+
+            if page.len() != BLCKSZ {
+                return Err(Error::InvalidIncrementalPageSize {
+                    path: rel.display().to_string(),
+                    block,
+                    expected: BLCKSZ,
+                    actual: page.len(),
+                }
+                .into());
+            }
+
+            out.write_all_at(&page, block as u64 * BLCKSZ as u64)?;
+            max_block = Some(max_block.map_or(block, |b| b.max(block)));
+        }
+
+        if let Some(max_block) = max_block {
+            let expected_len = (max_block as u64 + 1) * BLCKSZ as u64;
+            let current_len = out.seek(SeekFrom::End(0))?;
+            if current_len < expected_len {
+                out.set_len(expected_len)?;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn find_layer_path(

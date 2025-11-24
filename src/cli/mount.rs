@@ -15,7 +15,7 @@ use crate::{
     backup::{
         chain::{BackupChain, ChainIntegrity},
         metadata::BackupStore,
-        BackupMode, BackupType,
+        BackupType,
     },
     binding::{BindingRecord, DiffDir, LockMarker, LOCK_FILE},
     fs::{
@@ -226,7 +226,12 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
 
     let store = BackupStore::load_from_pg_probackup(&pbk_store, &instance)?;
     let chain = BackupChain::from_binding(&store, &binding)?;
-    info!(backup=?backup_id, instance=?instance, "backup chain resolved");
+    info!(
+        backup = ?backup_id,
+        instance = ?instance,
+        store_layout = %store.layout,
+        "backup chain resolved"
+    );
 
     // Validate chain integrity
     match chain.integrity_state {
@@ -257,7 +262,7 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
 
     let mut layers = Vec::new();
     for backup in chain.elements.iter().rev() {
-        let root = store.path.join(&backup.backup_id).join("database");
+        let root = store.backup_data_root(backup)?;
         layers.push(OverlayLayer {
             root,
             compression: backup.compression_algorithm(),
@@ -265,14 +270,6 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
             backup_mode: backup.backup_mode,
         });
     }
-    // Fallback for legacy layouts where files sit directly under pbk_store
-    let fallback_compression = chain.compression_algorithms.first().copied();
-    layers.push(OverlayLayer {
-        root: store.path.join("database"),
-        compression: fallback_compression,
-        incremental: false,
-        backup_mode: BackupMode::Full,
-    });
 
     let overlay = Overlay::new_with_layers(&store.path, &diff_dir.path, layers)?;
 

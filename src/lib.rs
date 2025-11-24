@@ -26,6 +26,20 @@ pub enum Error {
     DiffDirNotWritable(String),
     #[error("unsupported pg_probackup version: {0}")]
     UnsupportedPgProbackupVersion(String),
+    #[error("invalid backup store layout: {0}")]
+    InvalidStoreLayout(String),
+    #[error("pg_probackup binary not found: {0}")]
+    PgProbackupMissingBinary(String),
+    #[error("pg_probackup not executable or permission denied: {0}")]
+    PgProbackupNotExecutable(String),
+    #[error("pg_probackup failed to load shared libraries: {0}")]
+    PgProbackupMissingSharedLibs(String),
+    #[error("pg_probackup instance not found: {0}")]
+    PgProbackupInstanceMissing(String),
+    #[error("pg_probackup returned invalid JSON: {0}")]
+    PgProbackupInvalidJson(String),
+    #[error("pg_probackup exited with code {code:?}: {message}")]
+    PgProbackupFailed { code: Option<i32>, message: String },
     #[error("unsupported compression algorithm: {0}")]
     UnsupportedCompressionAlgorithm(String),
     #[error("missing compression metadata for compressed backup {0}")]

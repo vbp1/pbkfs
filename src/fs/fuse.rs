@@ -188,12 +188,26 @@ impl OverlayFs {
             return None;
         }
 
-        // Prefer diff over base
-        let (meta, from_diff) = match fs::symlink_metadata(self.overlay.diff_root().join(rel)) {
+        // Prefer diff over base; if neither has the path but this looks like a
+        // PostgreSQL datafile, let the overlay materialize an appropriate
+        // backing file (including zero-length relations that existed without
+        // any pages at backup time).
+        let diff_candidate = self.overlay.diff_root().join(rel);
+        let (meta, from_diff) = match fs::symlink_metadata(&diff_candidate) {
             Ok(m) => (m, true),
             Err(_) => {
-                let (base_path, _, _) = self.overlay.find_layer_path(rel)?;
-                fs::symlink_metadata(base_path).ok().map(|m| (m, false))?
+                if let Some((base_path, _, _)) = self.overlay.find_layer_path(rel) {
+                    let meta = fs::symlink_metadata(base_path).ok()?;
+                    (meta, false)
+                } else {
+                    // Let overlay try to materialize a backing file (e.g., empty
+                    // main-fork relation file); if that fails, treat as missing.
+                    if self.overlay.ensure_copy_up(rel).is_err() {
+                        return None;
+                    }
+                    let meta = fs::symlink_metadata(&diff_candidate).ok()?;
+                    (meta, true)
+                }
             }
         };
 

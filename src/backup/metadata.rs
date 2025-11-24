@@ -9,6 +9,23 @@ use uuid::Uuid;
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StoreLayout {
+    /// Native pg_probackup catalog layout: backups/<instance>/<id>/database
+    Native,
+    /// JSON-only fallback used for tests or environments without pg_probackup
+    JsonFallback,
+}
+
+impl std::fmt::Display for StoreLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreLayout::Native => write!(f, "native"),
+            StoreLayout::JsonFallback => write!(f, "json-fallback"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BackupType {
     Full,
     Incremental,
@@ -106,6 +123,7 @@ pub struct BackupStore {
     pub backups: Vec<BackupMetadata>,
     pub version_pg_probackup: String,
     pub version_postgres_supported: (u16, u16),
+    pub layout: StoreLayout,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,18 +167,44 @@ impl BackupStore {
         instance_name: impl Into<String>,
         version_pg_probackup: impl Into<String>,
         backups: Vec<BackupMetadata>,
+        layout: StoreLayout,
     ) -> Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
             return Err(Error::InvalidStorePath(path.display().to_string()).into());
         }
 
+        let instance_name = instance_name.into();
+        match layout {
+            StoreLayout::Native => {
+                let backups_dir = path.join("backups").join(&instance_name);
+                if !backups_dir.is_dir() {
+                    return Err(Error::InvalidStoreLayout(format!(
+                        "layout=native but {} is missing or not a directory",
+                        backups_dir.display()
+                    ))
+                    .into());
+                }
+            }
+            StoreLayout::JsonFallback => {
+                let json_file = path.join("backups.json");
+                if !json_file.exists() {
+                    return Err(Error::InvalidStoreLayout(format!(
+                        "layout=json-fallback but {} is missing",
+                        json_file.display()
+                    ))
+                    .into());
+                }
+            }
+        }
+
         Ok(Self {
             path: path.to_path_buf(),
-            instance_name: instance_name.into(),
+            instance_name,
             backups,
             version_pg_probackup: version_pg_probackup.into(),
             version_postgres_supported: (14, 17),
+            layout,
         })
     }
 
@@ -191,6 +235,33 @@ impl BackupStore {
             .find(|b| b.backup_id.eq_ignore_ascii_case(backup_id))
     }
 
+    /// Resolve the expected data root for a given backup id, preferring native layout.
+    pub fn backup_data_root(&self, backup: &BackupMetadata) -> Result<PathBuf> {
+        let native = self
+            .path
+            .join("backups")
+            .join(&self.instance_name)
+            .join(&backup.backup_id)
+            .join("database");
+        if native.exists() {
+            return Ok(native);
+        }
+
+        // Legacy fallback (pre-native layout) for compatibility with older fixtures.
+        let legacy = self.path.join(&backup.backup_id).join("database");
+        if legacy.exists() {
+            return Ok(legacy);
+        }
+
+        Err(Error::InvalidStoreLayout(format!(
+            "backup {} data directory not found (tried native: {}, legacy: {})",
+            backup.backup_id,
+            native.display(),
+            legacy.display()
+        ))
+        .into())
+    }
+
     /// Load backup store metadata by invoking pg_probackup directly.
     ///
     /// This method executes `pg_probackup show -B <path> --instance <instance> --format=json`
@@ -208,13 +279,26 @@ impl BackupStore {
             return Err(Error::InvalidStorePath(path.display().to_string()).into());
         }
 
+        let has_native_layout = path.join("backups").join(instance).is_dir();
+        let json_fallback = path.join("backups.json");
+        if !has_native_layout && !json_fallback.exists() {
+            return Err(Error::InvalidStoreLayout(format!(
+                "{} does not look like a pg_probackup store (missing backups/<instance>/... and backups.json)",
+                path.display()
+            ))
+            .into());
+        }
+
         debug!(
             store_path = %path.display(),
             instance = %instance,
             "invoking pg_probackup to fetch backup metadata"
         );
 
-        let output = match Command::new("pg_probackup")
+        let pg_probackup_bin =
+            std::env::var("PG_PROBACKUP_BIN").unwrap_or_else(|_| "pg_probackup".into());
+
+        let output = match Command::new(&pg_probackup_bin)
             .args([
                 "show",
                 "-B",
@@ -239,13 +323,18 @@ impl BackupStore {
                         "pg_probackup invocation failed ({}), falling back to backups.json",
                         e
                     );
-                    return Self::load_from_json_file(path, &fallback_path, instance);
+                    return Self::load_from_json_file_with_layout(
+                        path,
+                        &fallback_path,
+                        instance,
+                        StoreLayout::JsonFallback,
+                    );
                 }
 
                 return Err(if e.kind() == std::io::ErrorKind::NotFound {
-                    Error::Cli(
-                        "pg_probackup not found in PATH. Please install pg_probackup or ensure it is in your PATH.".into()
-                    )
+                    Error::PgProbackupMissingBinary(pg_probackup_bin.clone())
+                } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    Error::PgProbackupNotExecutable(pg_probackup_bin.clone())
                 } else {
                     Error::Io(e)
                 }
@@ -255,32 +344,20 @@ impl BackupStore {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-
-            // Try fallback to backups.json for permission-related failures
-            let fallback_path = path.join("backups.json");
-            if fallback_path.exists() && stderr.contains("Permission denied") {
-                debug!("pg_probackup failed with permission error, falling back to backups.json");
-                return Self::load_from_json_file(path, &fallback_path, instance);
+            return Err(Error::PgProbackupFailed {
+                code: output.status.code(),
+                message: stderr.trim().to_string(),
             }
-
-            return Err(Error::Cli(format!(
-                "pg_probackup failed with exit code {:?}: {}",
-                output.status.code(),
-                stderr.trim()
-            ))
             .into());
         }
 
         let mut instances: Vec<ShowInstanceJson> = serde_json::from_slice(&output.stdout)
-            .map_err(|e| Error::Cli(format!("failed to parse pg_probackup JSON output: {}", e)))?;
+            .map_err(|e| Error::PgProbackupInvalidJson(e.to_string()))?;
 
         let inst = instances
             .drain(..)
             .find(|i| i.instance == instance)
-            .ok_or_else(|| Error::BindingViolation {
-                expected: instance.to_string(),
-                actual: "<missing>".into(),
-            })?;
+            .ok_or_else(|| Error::PgProbackupInstanceMissing(instance.to_string()))?;
 
         let version_pg_probackup = inst
             .backups
@@ -294,7 +371,13 @@ impl BackupStore {
             .map(|b| backup_from_show(instance, b))
             .collect::<Result<Vec<_>>>()?;
 
-        let store = BackupStore::new(path, inst.instance, version_pg_probackup, backups)?;
+        let layout = if has_native_layout {
+            StoreLayout::Native
+        } else {
+            StoreLayout::JsonFallback
+        };
+
+        let store = BackupStore::new(path, inst.instance, version_pg_probackup, backups, layout)?;
         store.validate()?;
         Ok(store)
     }
@@ -309,6 +392,20 @@ impl BackupStore {
         store_path: P,
         json_path: P,
         instance: &str,
+    ) -> Result<Self> {
+        Self::load_from_json_file_with_layout(
+            store_path,
+            json_path,
+            instance,
+            StoreLayout::JsonFallback,
+        )
+    }
+
+    fn load_from_json_file_with_layout<P: AsRef<Path>>(
+        store_path: P,
+        json_path: P,
+        instance: &str,
+        layout: StoreLayout,
     ) -> Result<Self> {
         let store_path = store_path.as_ref();
         if !store_path.exists() {
@@ -345,7 +442,13 @@ impl BackupStore {
             .map(|b| backup_from_show(instance, b))
             .collect::<Result<Vec<_>>>()?;
 
-        let store = BackupStore::new(store_path, inst.instance, version_pg_probackup, backups)?;
+        let store = BackupStore::new(
+            store_path,
+            inst.instance,
+            version_pg_probackup,
+            backups,
+            layout,
+        )?;
         store.validate()?;
         Ok(store)
     }

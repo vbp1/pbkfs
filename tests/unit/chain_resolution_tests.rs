@@ -1,8 +1,11 @@
+use std::fs;
+
 use pbkfs::backup::chain::{BackupChain, ChainIntegrity, CompressionMix};
 use pbkfs::backup::metadata::{
     BackupMetadata, BackupStatus, BackupStore, BackupType, ChecksumState, Compression,
-    CompressionAlgorithm,
+    CompressionAlgorithm, StoreLayout,
 };
+use tempfile::tempdir;
 
 fn meta(
     id: &str,
@@ -71,7 +74,9 @@ fn constructs_chain_from_incremental() -> pbkfs::Result<()> {
         ),
         meta("INC2", Some("INC1"), BackupType::Incremental, false, None),
     ];
-    let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
+    let tmp = tempdir()?;
+    fs::create_dir_all(tmp.path().join("backups/main"))?;
+    let store = BackupStore::new(tmp.path(), "main", "2.6.0", backups, StoreLayout::Native)?;
 
     let chain = BackupChain::from_target_backup(&store, "INC2")?;
     assert_eq!(3, chain.elements.len());
@@ -92,7 +97,9 @@ fn marks_chain_incomplete_when_parent_missing() -> pbkfs::Result<()> {
         false,
         None,
     )];
-    let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
+    let tmp = tempdir()?;
+    fs::create_dir_all(tmp.path().join("backups/main"))?;
+    let store = BackupStore::new(tmp.path(), "main", "2.6.0", backups, StoreLayout::Native)?;
 
     let chain = BackupChain::from_target_backup(&store, "INC1")?;
     assert_eq!(ChainIntegrity::Incomplete, chain.integrity_state);
@@ -119,7 +126,9 @@ fn captures_multiple_compression_algorithms() -> pbkfs::Result<()> {
             Some(CompressionAlgorithm::Zstd),
         ),
     ];
-    let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
+    let tmp = tempdir()?;
+    fs::create_dir_all(tmp.path().join("backups/main"))?;
+    let store = BackupStore::new(tmp.path(), "main", "2.6.0", backups, StoreLayout::Native)?;
     let chain = BackupChain::from_target_backup(&store, "INC1")?;
     assert_eq!(2, chain.compression_algorithms.len());
     assert!(chain
@@ -151,7 +160,9 @@ fn accepts_done_status_as_valid() -> pbkfs::Result<()> {
             BackupStatus::Done,
         ),
     ];
-    let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
+    let tmp = tempdir()?;
+    fs::create_dir_all(tmp.path().join("backups/main"))?;
+    let store = BackupStore::new(tmp.path(), "main", "2.6.0", backups, StoreLayout::Native)?;
     let chain = BackupChain::from_target_backup(&store, "INC1")?;
 
     // Both DONE and OK should result in Valid chain
@@ -185,7 +196,9 @@ fn marks_chain_corrupt_when_backup_has_error_status() -> pbkfs::Result<()> {
             BackupStatus::Corrupt,
         ),
     ];
-    let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
+    let tmp = tempdir()?;
+    fs::create_dir_all(tmp.path().join("backups/main"))?;
+    let store = BackupStore::new(tmp.path(), "main", "2.6.0", backups, StoreLayout::Native)?;
     let chain = BackupChain::from_target_backup(&store, "INC1")?;
 
     // Chain with corrupt backup should be marked as Corrupt
@@ -222,7 +235,9 @@ fn mixed_ok_and_done_statuses_are_valid() -> pbkfs::Result<()> {
             BackupStatus::Ok,
         ),
     ];
-    let store = BackupStore::new("/tmp", "main", "2.6.0", backups)?;
+    let tmp = tempdir()?;
+    fs::create_dir_all(tmp.path().join("backups/main"))?;
+    let store = BackupStore::new(tmp.path(), "main", "2.6.0", backups, StoreLayout::Native)?;
     let chain = BackupChain::from_target_backup(&store, "INC2")?;
 
     // Mix of OK and DONE should still be Valid
