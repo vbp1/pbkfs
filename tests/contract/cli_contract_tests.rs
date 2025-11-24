@@ -4,6 +4,26 @@ use pbkfs::{binding::BindingRecord, binding::DiffDir, cli::mount::MountArgs, Err
 use tempfile::tempdir;
 use uuid::Uuid;
 
+static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+fn mount_guarded(args: MountArgs) -> pbkfs::Result<pbkfs::cli::mount::MountContext> {
+    let _guard = ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+    pbkfs::cli::mount::mount(args)
+}
+
+fn native_path(
+    store: &std::path::Path,
+    backup_id: &str,
+    rel: &std::path::Path,
+) -> std::path::PathBuf {
+    store
+        .join("backups")
+        .join("main")
+        .join(backup_id)
+        .join("database")
+        .join(rel)
+}
+
 fn expect_error(args: &[&str], expected: Error) {
     let err = pbkfs::run(args.iter().copied()).expect_err("command should fail");
     let actual = err
@@ -59,6 +79,111 @@ fn mount_requires_target_and_store_paths() {
 }
 
 #[test]
+fn mount_errors_for_unknown_store_layout() {
+    let store = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+
+    // No backups/ directory and no backups.json file.
+    let err = mount_guarded(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+    })
+    .expect_err("non-pg_probackup layout should fail");
+
+    let actual = err.downcast_ref::<Error>().expect("should be pbkfs::Error");
+    assert!(matches!(actual, Error::InvalidStoreLayout(_)));
+}
+
+#[test]
+fn mount_prefers_native_layout_over_json_when_both_exist() -> pbkfs::Result<()> {
+    let store = tempdir()?;
+    let target = tempdir()?;
+    let diff = tempdir()?;
+
+    // Native layout data
+    let base_file = native_path(store.path(), "FULL1", std::path::Path::new("data/base.txt"));
+    std::fs::create_dir_all(base_file.parent().unwrap())?;
+    std::fs::write(&base_file, b"native")?;
+
+    // Intentionally write invalid backups.json that would fail if used.
+    std::fs::write(store.path().join("backups.json"), b"not json")?;
+
+    // Provide a stub pg_probackup binary via env override.
+    let bin_dir = tempdir()?;
+    let script_path = bin_dir.path().join("pg_probackup");
+    std::fs::write(
+        &script_path,
+        r#"#!/bin/bash
+cat <<'JSON'
+[
+  {
+    "instance": "main",
+    "backups": [
+      {
+        "id": "FULL1",
+        "parent-backup-id": null,
+        "backup-mode": "FULL",
+        "status": "OK",
+        "compress-alg": "none",
+        "compress-level": null,
+        "start-time": "2024-01-01 00:00:00+00",
+        "data-bytes": 512,
+        "program-version": "2.6.0"
+      }
+    ]
+  }
+]
+JSON
+"#,
+    )?;
+    let mut perms = std::fs::metadata(&script_path)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)?;
+    }
+    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
+    {
+        let _guard = ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        std::env::set_var("PG_PROBACKUP_BIN", &script_path);
+
+        let ctx = pbkfs::cli::mount::mount(MountArgs {
+            pbk_store: Some(store.path().to_path_buf()),
+            mnt_path: Some(target.path().to_path_buf()),
+            diff_dir: Some(diff.path().to_path_buf()),
+            instance: Some("main".into()),
+            backup_id: Some("FULL1".into()),
+            force: false,
+        })?;
+
+        let contents = ctx
+            .overlay
+            .read(std::path::Path::new("data/base.txt"))?
+            .expect("native data should be readable");
+        assert_eq!(b"native", contents.as_slice());
+
+        if let Some(handle) = ctx.fuse_handle {
+            handle.unmount();
+        }
+        let _ = std::fs::remove_file(diff.path().join(pbkfs::binding::LOCK_FILE));
+    }
+
+    if let Some(bin) = old_bin {
+        std::env::set_var("PG_PROBACKUP_BIN", bin);
+    } else {
+        std::env::remove_var("PG_PROBACKUP_BIN");
+    }
+
+    Ok(())
+}
+
+#[test]
 fn unmount_requires_mnt_path() {
     expect_error(
         &["pbkfs", "unmount"],
@@ -75,6 +200,9 @@ fn unmount_requires_mnt_path() {
 }
 
 fn write_metadata(store: &std::path::Path) {
+    let data_root = native_path(store, "FULL1", std::path::Path::new(""));
+    std::fs::create_dir_all(&data_root).unwrap();
+
     let metadata = serde_json::json!([
         {
             "instance": "main",
@@ -102,6 +230,9 @@ fn write_metadata(store: &std::path::Path) {
 }
 
 fn write_corrupt_metadata(store: &std::path::Path) {
+    let data_root = native_path(store, "FULL1", std::path::Path::new(""));
+    std::fs::create_dir_all(&data_root).unwrap();
+
     let metadata = serde_json::json!([
         {
             "instance": "main",
@@ -135,11 +266,7 @@ fn mount_reuses_binding_with_diff_only_arguments() -> pbkfs::Result<()> {
     let diff = tempdir()?;
 
     // Base backup content and metadata
-    let base_file = store
-        .path()
-        .join("FULL1")
-        .join("database")
-        .join("data/base.txt");
+    let base_file = native_path(store.path(), "FULL1", std::path::Path::new("data/base.txt"));
     std::fs::create_dir_all(base_file.parent().unwrap())?;
     std::fs::write(&base_file, b"from-store")?;
     write_metadata(store.path());
@@ -162,7 +289,7 @@ fn mount_reuses_binding_with_diff_only_arguments() -> pbkfs::Result<()> {
     std::fs::create_dir_all(diff_data.parent().unwrap())?;
     std::fs::write(&diff_data, b"from-diff")?;
 
-    let ctx = pbkfs::cli::mount::mount(MountArgs {
+    let ctx = mount_guarded(MountArgs {
         pbk_store: Some(store.path().to_path_buf()),
         mnt_path: Some(target.path().to_path_buf()),
         diff_dir: Some(diff.path().to_path_buf()),
@@ -208,7 +335,7 @@ fn mount_rejects_binding_mismatch_when_instance_differs() {
     );
     binding.write_to_diff(&diff_dir).unwrap();
 
-    let err = pbkfs::cli::mount::mount(MountArgs {
+    let err = mount_guarded(MountArgs {
         pbk_store: Some(store.path().to_path_buf()),
         mnt_path: Some(target.path().to_path_buf()),
         diff_dir: Some(diff.path().to_path_buf()),
@@ -243,7 +370,7 @@ fn mount_rejects_binding_mismatch_when_backup_differs() {
     );
     binding.write_to_diff(&diff_dir).unwrap();
 
-    let err = pbkfs::cli::mount::mount(MountArgs {
+    let err = mount_guarded(MountArgs {
         pbk_store: Some(store.path().to_path_buf()),
         mnt_path: Some(target.path().to_path_buf()),
         diff_dir: Some(diff.path().to_path_buf()),
@@ -281,7 +408,7 @@ fn mount_rejects_binding_mismatch_when_store_differs() {
     );
     binding.write_to_diff(&diff_dir).unwrap();
 
-    let err = pbkfs::cli::mount::mount(MountArgs {
+    let err = mount_guarded(MountArgs {
         pbk_store: Some(store_actual.path().to_path_buf()),
         mnt_path: Some(target.path().to_path_buf()),
         diff_dir: Some(diff.path().to_path_buf()),
@@ -421,16 +548,12 @@ fn mount_rejects_corrupt_chain_without_force() {
     let target = tempdir().unwrap();
     let diff = tempdir().unwrap();
 
-    let base_file = store
-        .path()
-        .join("FULL1")
-        .join("database")
-        .join("data/base.txt");
+    let base_file = native_path(store.path(), "FULL1", std::path::Path::new("data/base.txt"));
     std::fs::create_dir_all(base_file.parent().unwrap()).unwrap();
     std::fs::write(&base_file, b"data").unwrap();
     write_corrupt_metadata(store.path());
 
-    let err = pbkfs::cli::mount::mount(MountArgs {
+    let err = mount_guarded(MountArgs {
         pbk_store: Some(store.path().to_path_buf()),
         mnt_path: Some(target.path().to_path_buf()),
         diff_dir: Some(diff.path().to_path_buf()),
@@ -452,16 +575,12 @@ fn mount_allows_corrupt_chain_with_force() -> pbkfs::Result<()> {
     let target = tempdir()?;
     let diff = tempdir()?;
 
-    let base_file = store
-        .path()
-        .join("FULL1")
-        .join("database")
-        .join("data/base.txt");
+    let base_file = native_path(store.path(), "FULL1", std::path::Path::new("data/base.txt"));
     std::fs::create_dir_all(base_file.parent().unwrap())?;
     std::fs::write(&base_file, b"data")?;
     write_corrupt_metadata(store.path());
 
-    let ctx = pbkfs::cli::mount::mount(MountArgs {
+    let ctx = mount_guarded(MountArgs {
         pbk_store: Some(store.path().to_path_buf()),
         mnt_path: Some(target.path().to_path_buf()),
         diff_dir: Some(diff.path().to_path_buf()),

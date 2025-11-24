@@ -13,6 +13,15 @@ use pbkfs::{
 };
 use tempfile::tempdir;
 
+fn native_path(store: &Path, backup_id: &str, relative: &Path) -> std::path::PathBuf {
+    store
+        .join("backups")
+        .join("main")
+        .join(backup_id)
+        .join("database")
+        .join(relative)
+}
+
 fn write_metadata(store: &Path, _compressed: bool, compression: Option<(&str, Option<u8>)>) {
     let metadata = serde_json::json!([
         {
@@ -62,11 +71,7 @@ fn mounts_backup_and_preserves_store_immutability() -> pbkfs::Result<()> {
     let diff = tempdir()?;
 
     // Base backup content lives under the store path
-    let base_file = store
-        .path()
-        .join("FULL1")
-        .join("database")
-        .join("data/base.txt");
+    let base_file = native_path(store.path(), "FULL1", Path::new("data/base.txt"));
     fs::create_dir_all(base_file.parent().unwrap())?;
     fs::write(&base_file, b"from-store")?;
     write_metadata(store.path(), false, None);
@@ -124,11 +129,7 @@ fn mount_decompresses_compressed_backup_files() -> pbkfs::Result<()> {
     let diff = tempdir()?;
 
     // Create compressed base content in the backup store
-    let base_file = store
-        .path()
-        .join("FULL1")
-        .join("database")
-        .join("data/compressed.dat");
+    let base_file = native_path(store.path(), "FULL1", Path::new("data/compressed.dat"));
     fs::create_dir_all(base_file.parent().unwrap())?;
     let payload = b"postgres-compressed-data";
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));
@@ -178,11 +179,7 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
     let target = tempdir()?;
     let diff = tempdir()?;
 
-    let base_file = store
-        .path()
-        .join("FULL1")
-        .join("database")
-        .join("data/base.txt");
+    let base_file = native_path(store.path(), "FULL1", Path::new("data/base.txt"));
     fs::create_dir_all(base_file.parent().unwrap())?;
     fs::write(&base_file, b"from-store")?;
     write_metadata(store.path(), false, None);
@@ -300,11 +297,7 @@ fn remount_rejects_binding_mismatch() {
     let target = tempdir().unwrap();
     let diff = tempdir().unwrap();
 
-    let base_file = store
-        .path()
-        .join("FULL1")
-        .join("database")
-        .join("data/base.txt");
+    let base_file = native_path(store.path(), "FULL1", Path::new("data/base.txt"));
     fs::create_dir_all(base_file.parent().unwrap()).unwrap();
     fs::write(&base_file, b"from-store").unwrap();
     write_metadata(store.path(), false, None);
@@ -352,11 +345,7 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
     let target = tempdir()?;
     let diff = tempdir()?;
 
-    let base_file = store
-        .path()
-        .join("FULL1")
-        .join("database")
-        .join("data/base.txt");
+    let base_file = native_path(store.path(), "FULL1", Path::new("data/base.txt"));
     fs::create_dir_all(base_file.parent().unwrap())?;
     fs::write(&base_file, b"from-store")?;
     write_metadata(store.path(), false, None);
@@ -447,6 +436,38 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
         },
         diff.path(),
     );
+
+    Ok(())
+}
+
+/// Ignored by default: requires a real pg_probackup catalog and FUSE.
+#[test]
+#[ignore]
+fn mounts_native_pg_probackup_catalog_when_available() -> pbkfs::Result<()> {
+    let Some(store_var) = std::env::var_os("PBKFS_NATIVE_STORE") else {
+        // Environment not provided; skip quietly.
+        return Ok(());
+    };
+    let store_path = std::path::PathBuf::from(store_var);
+    let instance = std::env::var("PBKFS_NATIVE_INSTANCE").unwrap_or_else(|_| "main".into());
+    let backup_id = std::env::var("PBKFS_NATIVE_BACKUP_ID").unwrap_or_else(|_| "FULL1".into());
+
+    let target = tempdir()?;
+    let diff = tempdir()?;
+
+    let ctx = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store_path),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some(instance),
+        backup_id: Some(backup_id),
+        force: false,
+    })?;
+
+    if let Some(handle) = ctx.fuse_handle {
+        handle.unmount();
+    }
+    let _ = std::fs::remove_file(diff.path().join(pbkfs::binding::LOCK_FILE));
 
     Ok(())
 }

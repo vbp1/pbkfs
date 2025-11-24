@@ -35,13 +35,60 @@ pub fn system_unmount(mnt_path: &Path) -> Result<()> {
         ("umount", vec![path_string.as_str()]),
     ];
 
+    let mut saw_not_mounted = false;
+    let mut last_stderr: Option<String> = None;
+
     for (cmd, args) in candidates {
-        match Command::new(cmd).args(args).status() {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(_) => continue,
+        match Command::new(cmd).args(args).output() {
+            Ok(output) => {
+                if output.status.success() {
+                    return Ok(());
+                }
+
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let stderr_lower = stderr.to_lowercase();
+
+                // Detect "not mounted" cases so we can surface a precise error.
+                if stderr_lower.contains("not mounted")
+                    || stderr_lower.contains("not found in /etc/mtab")
+                {
+                    saw_not_mounted = true;
+                    last_stderr = Some(stderr);
+                    continue;
+                }
+
+                // Detect busy mounts and report a clearer message instead of
+                // incorrectly claiming that the target is not mounted.
+                if stderr_lower.contains("device or resource busy")
+                    || stderr_lower.contains("target is busy")
+                {
+                    return Err(Error::Cli(format!(
+                        "target is busy: {} ({cmd} failed: {})",
+                        mnt_path.display(),
+                        stderr.trim()
+                    ))
+                    .into());
+                }
+
+                // Record the last stderr for generic failures.
+                last_stderr = Some(stderr);
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => return Err(Error::Io(err).into()),
         }
+    }
+
+    if saw_not_mounted {
+        return Err(Error::NotMounted(mnt_path.display().to_string()).into());
+    }
+
+    if let Some(stderr) = last_stderr {
+        return Err(Error::Cli(format!(
+            "failed to unmount {}: {}",
+            mnt_path.display(),
+            stderr.trim()
+        ))
+        .into());
     }
 
     Err(Error::NotMounted(mnt_path.display().to_string()).into())
