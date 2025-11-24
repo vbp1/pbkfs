@@ -36,7 +36,15 @@ jobs:
       - name: Cargo test
         run: cargo test
 
+      - name: Cache cargo-audit binary
+        id: cache-cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-0.21.1
+
       - name: Install cargo-audit (0.21.1 for Rust 1.80)
+        if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
         run: cargo install --locked cargo-audit@0.21.1
 
       - name: Cargo audit (allow known fuser advisory)
