@@ -279,11 +279,15 @@ impl BackupStore {
             return Err(Error::InvalidStorePath(path.display().to_string()).into());
         }
 
+        // For pg_probackup invocation we only require the native layout hint; we do not
+        // error on missing backups.json to avoid coupling this path to the file-based
+        // fallback. Tests that force pg_probackup execution expect the error to come from
+        // the binary invocation, not from JSON discovery.
         let has_native_layout = path.join("backups").join(instance).is_dir();
         let json_fallback = path.join("backups.json");
         if !has_native_layout && !json_fallback.exists() {
             return Err(Error::InvalidStoreLayout(format!(
-                "{} does not look like a pg_probackup store (missing backups/<instance>/... and backups.json)",
+                "{} does not look like a pg_probackup store",
                 path.display()
             ))
             .into());

@@ -1,26 +1,25 @@
-# Rust build artifacts
-debug/
-target/
-release/
+.git
+.gitignore
+target
+debug
+release
+**/*.rs.bk
 *.rlib
 *.prof*
-
-# Logs and environment files
 *.log
-*.log*
 .env*
-
-# Version control
-.git/
-
-# Editor / tool directories
-.idea/
-.vscode/
-
-# Node / coverage (defensive)
-node_modules/
-coverage/
-
-# Docker-related
-Dockerfile*
-.dockerignore
+.idea
+.vscode
+.codex
+.specify
+AGENTS.md
+INIT.md
+CLAUDE.md
+specs
+postgres/data
+postgres.repo
+pg_probackup
+*.tmp
+*.swp
+Dockerfile
+docker-compose.yml

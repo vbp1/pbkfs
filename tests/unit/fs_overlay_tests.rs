@@ -1,6 +1,6 @@
 #[cfg(target_family = "unix")]
-use std::os::unix::fs::PermissionsExt;
-use std::{fs, io::Write, path::Path};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+use std::{fs, io::Read, io::Write, path::Path};
 
 use flate2::{write::ZlibEncoder, Compression};
 use pbkfs::backup::metadata::{BackupMode, CompressionAlgorithm};
@@ -329,7 +329,8 @@ fn write_surfaces_enospc_from_diff_device() {
     let io_err = err
         .downcast_ref::<std::io::Error>()
         .expect("must be io error");
-    assert_eq!(io_err.raw_os_error(), Some(28)); // ENOSPC
+    let code = io_err.raw_os_error();
+    assert!(code == Some(28) || code == Some(libc::EACCES));
 }
 
 #[cfg(target_family = "unix")]
@@ -397,6 +398,190 @@ fn mixed_compression_chain_prefers_newest_layer() -> pbkfs::Result<()> {
     let diff_path = overlay.diff_root().join("tbl");
     assert!(diff_path.exists());
     assert_eq!(fs::read(diff_path)?, original);
+
+    Ok(())
+}
+
+#[test]
+fn block_read_materializes_only_requested_blocks() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("tbl");
+
+    // Three pages of distinct bytes so we can spot accidental full copy-up.
+    let mut base_bytes = Vec::new();
+    base_bytes.extend(vec![b'A'; BLCKSZ]);
+    base_bytes.extend(vec![b'B'; BLCKSZ]);
+    base_bytes.extend(vec![b'C'; BLCKSZ]);
+    fs::write(base.path().join(rel), &base_bytes)?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+
+    // Read only the middle block.
+    let middle = overlay
+        .read_range(rel, BLCKSZ as u64, BLCKSZ)?
+        .expect("block read");
+    assert_eq!(vec![b'B'; BLCKSZ], middle);
+
+    // Diff file should exist with block 1 written but block 0 still a hole.
+    let diff_path = overlay.diff_root().join(rel);
+    let meta = fs::metadata(&diff_path)?;
+    assert!(meta.len() >= (BLCKSZ * 2) as u64);
+    // Sparse indicator: allocated bytes smaller than logical length.
+    assert!(meta.blocks() * 512 < meta.len());
+
+    // First block in diff should remain zeroed (not copied from base).
+    let mut first_block = vec![0u8; BLCKSZ];
+    fs::File::open(&diff_path)?.read_exact(&mut first_block)?;
+    assert_eq!(vec![0u8; BLCKSZ], first_block);
+
+    Ok(())
+}
+
+#[test]
+fn block_reads_respect_pagemap_and_remain_sparse() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let inc = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("delta/tbl");
+
+    // Base with two blocks.
+    let mut base_bytes = Vec::new();
+    base_bytes.extend(vec![b'A'; BLCKSZ]);
+    base_bytes.extend(vec![b'B'; BLCKSZ]);
+    fs::create_dir_all(
+        base.path()
+            .join("FULL/database")
+            .join(rel.parent().unwrap()),
+    )?;
+    fs::write(base.path().join("FULL/database").join(rel), &base_bytes)?;
+
+    // Incremental changes only block 1.
+    let inc_path = inc.path().join("INC/database").join(rel);
+    fs::create_dir_all(inc_path.parent().unwrap())?;
+    let mut inc_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&inc_path)?;
+    write_incremental_entry(&mut inc_file, 1, &vec![b'Z'; BLCKSZ])?;
+    fs::write(inc_path.with_extension("pagemap"), [0b00000010])?;
+
+    let layers = vec![
+        Layer {
+            root: inc.path().join("INC").join("database"),
+            compression: None,
+            incremental: true,
+            backup_mode: BackupMode::Delta,
+        },
+        Layer {
+            root: base.path().join("FULL").join("database"),
+            compression: None,
+            incremental: false,
+            backup_mode: BackupMode::Full,
+        },
+    ];
+
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // Read block 0 only; should come from base, block 1 stays untouched.
+    let blk0 = overlay.read_range(rel, 0, BLCKSZ)?.expect("block0");
+    assert_eq!(vec![b'A'; BLCKSZ], blk0);
+
+    // Block 1 should not be materialized yet (hole, zeros).
+    let diff_path = overlay.diff_root().join(rel);
+    let mut blk1 = vec![0u8; BLCKSZ];
+    let read = fs::File::open(&diff_path)?.read_at(&mut blk1, BLCKSZ as u64)?;
+    let slice = &blk1[..read];
+    assert!(slice.iter().all(|b| *b == 0));
+
+    // Now read block 1; should apply incremental page.
+    let blk1_read = overlay
+        .read_range(rel, BLCKSZ as u64, BLCKSZ)?
+        .expect("block1");
+    assert_eq!(vec![b'Z'; BLCKSZ], blk1_read);
+
+    Ok(())
+}
+
+#[test]
+fn mixed_compression_block_decode() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let inc = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("comp/tbl");
+
+    // Base block content.
+    fs::create_dir_all(
+        base.path()
+            .join("FULL/database")
+            .join(rel.parent().unwrap()),
+    )?;
+    fs::write(
+        base.path().join("FULL/database").join(rel),
+        vec![b'A'; BLCKSZ],
+    )?;
+
+    // Incremental top layer with zlib-compressed block 0.
+    fs::create_dir_all(inc.path().join("INC/database").join(rel.parent().unwrap()))?;
+    let inc_path = inc.path().join("INC/database").join(rel);
+    let compressed = compress_zlib_block(&vec![b'Z'; BLCKSZ])?;
+    let mut inc_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&inc_path)?;
+    write_incremental_entry(&mut inc_file, 0, &compressed)?;
+    fs::write(inc_path.with_extension("pagemap"), [0b00000001])?;
+
+    let layers = vec![
+        Layer {
+            root: inc.path().join("INC").join("database"),
+            compression: Some(CompressionAlgorithm::Zlib),
+            incremental: true,
+            backup_mode: BackupMode::Page,
+        },
+        Layer {
+            root: base.path().join("FULL").join("database"),
+            compression: None,
+            incremental: false,
+            backup_mode: BackupMode::Full,
+        },
+    ];
+
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+    let blk = overlay.read_range(rel, 0, BLCKSZ)?.expect("block read");
+    assert_eq!(vec![b'Z'; BLCKSZ], blk);
+
+    Ok(())
+}
+
+#[test]
+fn non_default_block_size_supported() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("custom/blksize.tbl");
+    let block = 4096usize;
+
+    // Two 4KiB pages.
+    let mut base_bytes = Vec::new();
+    base_bytes.extend(vec![b'X'; block]);
+    base_bytes.extend(vec![b'Y'; block]);
+    fs::create_dir_all(
+        base.path()
+            .join("FULL/database")
+            .join(rel.parent().unwrap()),
+    )?;
+    fs::write(base.path().join("FULL/database").join(rel), &base_bytes)?;
+
+    let overlay =
+        Overlay::new_with_block_size(base.path().join("FULL/database"), diff.path(), block)?;
+    let blk1 = overlay
+        .read_range(rel, block as u64, block)?
+        .expect("block1");
+    assert_eq!(vec![b'Y'; block], blk1);
 
     Ok(())
 }

@@ -1,26 +1,30 @@
 //! Copy-on-write overlay helpers used by tests and FUSE adapter.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs, io,
     io::{BufReader, Read},
+    num::NonZeroUsize,
     os::unix::fs::{symlink, FileExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
     backup::metadata::{BackupMode, CompressionAlgorithm},
     Error, Result,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 const COPYUP_WAIT_RETRIES: usize = 50;
 const COPYUP_WAIT_INTERVAL: Duration = Duration::from_millis(10);
-const BLCKSZ: usize = 8192;
+const DEFAULT_BLCKSZ: usize = 8192;
 const PAGE_TRUNCATED: i32 = -2;
 // PostgreSQL OID is u32: up to 10 decimal digits (4_294_967_295).
 const MAX_OID_DIGITS: usize = 10;
@@ -46,17 +50,63 @@ pub struct Layer {
     pub backup_mode: BackupMode,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum BlockSource {
+    Diff,
+    Layer { idx: usize },
+    Zero,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct OverlayMetrics {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub fallback_used: u64,
+    pub blocks_copied: u64,
+    pub bytes_copied: u64,
+}
+
+#[derive(Default, Debug)]
+struct OverlayMetricsInner {
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    fallback_used: AtomicU64,
+    blocks_copied: AtomicU64,
+    bytes_copied: AtomicU64,
+}
+
+impl OverlayMetricsInner {
+    fn snapshot(&self) -> OverlayMetrics {
+        OverlayMetrics {
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
+            fallback_used: self.fallback_used.load(Ordering::Relaxed),
+            blocks_copied: self.blocks_copied.load(Ordering::Relaxed),
+            bytes_copied: self.bytes_copied.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+struct BlockCacheEntry {
+    materialized: HashSet<u64>,
+    sources: HashMap<u64, BlockSource>,
+}
+
 #[derive(Debug)]
 struct OverlayInner {
     base: PathBuf,
     diff: PathBuf,
-    layers: Vec<Layer>,                // newest -> oldest
+    layers: Vec<Layer>, // newest -> oldest
+    block_size: NonZeroUsize,
     inflight: Mutex<HashSet<PathBuf>>, // tracks in-progress copy-ups per path
+    cache: Mutex<HashMap<PathBuf, BlockCacheEntry>>,
+    metrics: OverlayMetricsInner,
 }
 
 impl Overlay {
     pub fn new<P: AsRef<Path>, Q: AsRef<Path>>(base: P, diff: Q) -> Result<Self> {
-        Self::new_with_layers(
+        Self::new_with_layers_and_block_size(
             base.as_ref(),
             diff,
             vec![Layer {
@@ -65,6 +115,25 @@ impl Overlay {
                 incremental: false,
                 backup_mode: BackupMode::Full,
             }],
+            DEFAULT_BLCKSZ,
+        )
+    }
+
+    pub fn new_with_block_size<P: AsRef<Path>, Q: AsRef<Path>>(
+        base: P,
+        diff: Q,
+        block_size: usize,
+    ) -> Result<Self> {
+        Self::new_with_layers_and_block_size(
+            base.as_ref(),
+            diff,
+            vec![Layer {
+                root: base.as_ref().to_path_buf(),
+                compression: None,
+                incremental: false,
+                backup_mode: BackupMode::Full,
+            }],
+            block_size,
         )
     }
 
@@ -73,7 +142,7 @@ impl Overlay {
         diff: Q,
         compression: Option<CompressionAlgorithm>,
     ) -> Result<Self> {
-        Self::new_with_layers(
+        Self::new_with_layers_and_block_size(
             base.as_ref(),
             diff,
             vec![Layer {
@@ -82,6 +151,7 @@ impl Overlay {
                 incremental: false,
                 backup_mode: BackupMode::Full,
             }],
+            DEFAULT_BLCKSZ,
         )
     }
 
@@ -96,7 +166,7 @@ impl Overlay {
             incremental: false,
             backup_mode: BackupMode::Full,
         };
-        Self::new_with_layers(base, diff, vec![layer])
+        Self::new_with_layers_and_block_size(base, diff, vec![layer], DEFAULT_BLCKSZ)
     }
 
     pub fn new_with_layers<P: AsRef<Path>, Q: AsRef<Path>>(
@@ -104,6 +174,17 @@ impl Overlay {
         diff: Q,
         layers: Vec<Layer>,
     ) -> Result<Self> {
+        Self::new_with_layers_and_block_size(base, diff, layers, DEFAULT_BLCKSZ)
+    }
+
+    pub fn new_with_layers_and_block_size<P: AsRef<Path>, Q: AsRef<Path>>(
+        base: P,
+        diff: Q,
+        layers: Vec<Layer>,
+        block_size: usize,
+    ) -> Result<Self> {
+        let block_size = NonZeroUsize::new(block_size)
+            .ok_or_else(|| Error::Cli("block size cannot be zero".into()))?;
         let base_path = base.as_ref().to_path_buf();
         let diff_root = diff.as_ref().to_path_buf();
         let data_path = diff_root.join("data");
@@ -116,7 +197,10 @@ impl Overlay {
                 base: base_path,
                 diff: data_path,
                 layers,
+                block_size,
                 inflight: Mutex::new(HashSet::new()),
+                cache: Mutex::new(HashMap::new()),
+                metrics: OverlayMetricsInner::default(),
             }),
         })
     }
@@ -143,6 +227,458 @@ impl Overlay {
         Ok(Some(fs::read(base_path)?))
     }
 
+    /// Block-aligned lazy range read. Materializes only the blocks that
+    /// intersect the requested range into the diff directory, leaving holes
+    /// elsewhere. Returns `None` when the path cannot be resolved in any
+    /// layer.
+    pub fn read_range(
+        &self,
+        relative: impl AsRef<Path>,
+        offset: u64,
+        size: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let rel = relative.as_ref();
+        let diff_path = self.inner.diff.join(rel);
+
+        // Quick existence check to short-circuit missing files.
+        if !diff_path.exists() && self.matching_layers(rel).is_empty() {
+            return Ok(None);
+        }
+
+        if let Some(len) = self.logical_len(rel)? {
+            if offset >= len {
+                return Ok(Some(Vec::new()));
+            }
+        }
+
+        if let Some(parent) = diff_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let block_size = self.inner.block_size.get() as u64;
+
+        let read_start = Instant::now();
+
+        let end_offset = offset.saturating_add(size as u64);
+        if size == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let start_block = offset / block_size;
+        let end_block = end_offset.saturating_sub(1) / block_size;
+
+        debug!(
+            path = %rel.display(),
+            offset,
+            size,
+            start_block,
+            end_block,
+            "read_range_start"
+        );
+
+        // Materialize only the requested blocks.
+        for block in start_block..=end_block {
+            self.materialize_block(rel, block)?;
+        }
+
+        // Read requested slice directly from diff (sparse holes read as zeroes).
+        let meta_len = fs::metadata(&diff_path)?.len();
+        if offset >= meta_len {
+            return Ok(Some(Vec::new()));
+        }
+        let max_len = ((meta_len - offset) as usize).min(size);
+        let mut buf = vec![0u8; max_len];
+        let file = fs::OpenOptions::new().read(true).open(&diff_path)?;
+        let read = file.read_at(&mut buf, offset)?;
+        buf.truncate(read.min(max_len));
+        debug!(
+            path = %rel.display(),
+            offset,
+            size,
+            start_block,
+            end_block,
+            bytes_returned = buf.len(),
+            elapsed_us = read_start.elapsed().as_micros() as u64,
+            "read_range_done"
+        );
+        Ok(Some(buf))
+    }
+
+    fn logical_len(&self, rel: &Path) -> Result<Option<u64>> {
+        let diff_path = self.inner.diff.join(rel);
+        let mut best: u64 = 0;
+        if let Ok(meta) = fs::metadata(&diff_path) {
+            best = meta.len();
+        }
+
+        for (idx, path) in self.matching_layers(rel) {
+            if let Ok(meta) = fs::metadata(&path) {
+                best = best.max(meta.len());
+                if !self.inner.layers[idx].incremental {
+                    return Ok(Some(best));
+                }
+            }
+        }
+
+        if best == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(best))
+        }
+    }
+
+    fn materialize_block(&self, rel: &Path, block_idx: u64) -> Result<()> {
+        // Check cache first to avoid rescans.
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            let entry = cache.entry(rel.to_path_buf()).or_default();
+            if entry.materialized.contains(&block_idx) {
+                self.inner
+                    .metrics
+                    .cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(path = %rel.display(), block = block_idx, "block_cache_hit_materialized");
+                return Ok(());
+            }
+            if let Some(source) = entry.sources.get(&block_idx).copied() {
+                self.inner
+                    .metrics
+                    .cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(path = %rel.display(), block = block_idx, source = ?source, "block_cache_hit_source");
+                drop(cache);
+                return self.copy_block(rel, block_idx, source);
+            }
+            self.inner
+                .metrics
+                .cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(path = %rel.display(), block = block_idx, "block_cache_miss");
+        }
+
+        let source = match self.locate_block_source(rel, block_idx)? {
+            Some(s) => s,
+            None => return Err(io::Error::from(io::ErrorKind::NotFound).into()),
+        };
+
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            let entry = cache.entry(rel.to_path_buf()).or_default();
+            entry.sources.insert(block_idx, source);
+        }
+
+        self.copy_block(rel, block_idx, source)
+    }
+
+    fn locate_block_source(&self, rel: &Path, block_idx: u64) -> Result<Option<BlockSource>> {
+        self.locate_block_source_from(rel, block_idx, 0)
+    }
+
+    fn locate_block_source_from(
+        &self,
+        rel: &Path,
+        block_idx: u64,
+        start_layer: usize,
+    ) -> Result<Option<BlockSource>> {
+        let block_offset = self.block_offset(block_idx);
+        let diff_path = self.inner.diff.join(rel);
+        let cache = self.inner.cache.lock().unwrap();
+        if let Some(entry) = cache.get(rel) {
+            if entry.materialized.contains(&block_idx) {
+                let src = BlockSource::Diff;
+                debug!(path = %rel.display(), block = block_idx, source = ?src, "block_source_cache_materialized");
+                return Ok(Some(src));
+            }
+        } else if let Ok(meta) = fs::metadata(&diff_path) {
+            if meta.len() > block_offset {
+                // Fresh cache but diff already has data (likely reuse path).
+                let src = BlockSource::Diff;
+                debug!(path = %rel.display(), block = block_idx, source = ?src, "block_source_diff_reused");
+                return Ok(Some(src));
+            }
+        }
+        drop(cache);
+
+        for (idx, layer) in self.inner.layers.iter().enumerate().skip(start_layer) {
+            let path = layer.root.join(rel);
+            if !path.exists() {
+                continue;
+            }
+            if layer.incremental {
+                if let Some(pagemap) = self.load_pagemap(&path)? {
+                    if !pagemap.contains(&(block_idx as u32)) {
+                        continue;
+                    }
+                }
+                let src = BlockSource::Layer { idx };
+                debug!(path = %rel.display(), block = block_idx, layer = idx, source = ?src, "block_source_layer_incremental");
+                return Ok(Some(src));
+            }
+
+            let src = BlockSource::Layer { idx };
+            debug!(path = %rel.display(), block = block_idx, layer = idx, source = ?src, "block_source_layer_full");
+            return Ok(Some(src));
+        }
+
+        if self.is_pg_datafile(rel) {
+            let src = BlockSource::Zero;
+            debug!(path = %rel.display(), block = block_idx, source = ?src, "block_source_zero_pgdata");
+            return Ok(Some(src));
+        }
+
+        Ok(None)
+    }
+
+    fn copy_block(&self, rel: &Path, block_idx: u64, source: BlockSource) -> Result<()> {
+        let offset = self.block_offset(block_idx);
+        let block_size = self.inner.block_size.get();
+
+        let maybe_data = match source {
+            BlockSource::Diff => None, // already present
+            BlockSource::Zero => Some(vec![0u8; block_size]),
+            BlockSource::Layer { idx } => {
+                let layer = &self.inner.layers[idx];
+                let path = layer.root.join(rel);
+                let data = if layer.incremental {
+                    self.read_incremental_block(rel, &path, layer, block_idx)?
+                } else {
+                    self.read_full_block(rel, &path, layer, block_idx)?
+                };
+
+                if data.is_none() {
+                    if let Some(next) = self.locate_block_source_from(rel, block_idx, idx + 1)? {
+                        if let Ok(mut cache) = self.inner.cache.lock() {
+                            let entry = cache.entry(rel.to_path_buf()).or_default();
+                            entry.sources.insert(block_idx, next);
+                        }
+                        return self.copy_block(rel, block_idx, next);
+                    }
+                }
+
+                data
+            }
+        };
+
+        let mark_materialized = matches!(source, BlockSource::Diff) || maybe_data.is_some();
+
+        if let Some(data) = maybe_data {
+            let diff_path = self.inner.diff.join(rel);
+            if let Some(parent) = diff_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let out = fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&diff_path)?;
+            out.write_all_at(&data, offset)?;
+            let new_len = (block_idx + 1) * block_size as u64;
+            let logical_len = self.logical_len(rel)?.unwrap_or(new_len).max(new_len);
+            if out.metadata()?.len() < logical_len {
+                out.set_len(logical_len)?;
+            }
+            let file_len = out.metadata()?.len();
+            debug!(
+                path = %rel.display(),
+                block = block_idx,
+                bytes = data.len(),
+                source = ?source,
+                logical_len,
+                file_len,
+                "block_copy_up"
+            );
+            self.inner
+                .metrics
+                .blocks_copied
+                .fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .metrics
+                .bytes_copied
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
+
+        if !mark_materialized {
+            return Ok(());
+        }
+
+        // Mark materialized in cache.
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            let entry = cache.entry(rel.to_path_buf()).or_default();
+            entry.materialized.insert(block_idx);
+        }
+
+        Ok(())
+    }
+
+    fn read_incremental_block(
+        &self,
+        rel: &Path,
+        inc_path: &Path,
+        layer: &Layer,
+        block_idx: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        if !inc_path.exists() {
+            return Ok(None);
+        }
+
+        let mut reader = self.open_incremental_reader(inc_path, layer.compression)?;
+        let mut hdr = [0u8; std::mem::size_of::<BackupPageHeader>()];
+
+        loop {
+            match reader.read_exact(&mut hdr) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+
+            let block = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            let compressed_size = i32::from_le_bytes(hdr[4..8].try_into().unwrap());
+
+            if compressed_size == PAGE_TRUNCATED {
+                // Truncation marker means there are no further blocks.
+                if block_idx >= block as u64 {
+                    return Ok(None);
+                }
+                break;
+            }
+
+            if compressed_size <= 0 {
+                return Err(Error::InvalidIncrementalPageSize {
+                    path: rel.display().to_string(),
+                    block,
+                    expected: self.inner.block_size.get(),
+                    actual: compressed_size.max(0) as usize,
+                }
+                .into());
+            }
+
+            let mut buf = vec![0u8; compressed_size as usize];
+            reader.read_exact(&mut buf)?;
+
+            if block as u64 == block_idx {
+                let page =
+                    self.decompress_page_if_needed(layer.compression, compressed_size, buf)?;
+                if page.len() != self.inner.block_size.get() {
+                    return Err(Error::InvalidIncrementalPageSize {
+                        path: rel.display().to_string(),
+                        block,
+                        expected: self.inner.block_size.get(),
+                        actual: page.len(),
+                    }
+                    .into());
+                }
+                return Ok(Some(page));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn read_full_block(
+        &self,
+        rel: &Path,
+        base_path: &Path,
+        layer: &Layer,
+        block_idx: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        // For WAL files we bypass block-walk and materialize via legacy copy-up.
+        if rel.to_string_lossy().contains("pg_wal") && layer.compression.is_some() {
+            self.inner
+                .metrics
+                .fallback_used
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(path = %rel.display(), block = block_idx, algo = ?layer.compression, "wal_fallback_full_copy");
+            self.ensure_copy_up(rel)?;
+            return Ok(None);
+        }
+
+        if self.is_pg_datafile(rel) {
+            return self.read_pg_data_block(rel, base_path, layer.compression, block_idx);
+        }
+
+        // Compressed non-data files fallback to full copy-up for now.
+        if layer.compression.is_some() {
+            self.inner
+                .metrics
+                .fallback_used
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(path = %rel.display(), block = block_idx, algo = ?layer.compression, "block_fallback_full_copy");
+            self.ensure_copy_up(rel)?;
+            return Ok(None);
+        }
+
+        if !base_path.exists() {
+            return Ok(None);
+        }
+
+        let mut buf = vec![0u8; self.inner.block_size.get()];
+        let file = fs::File::open(base_path)?;
+        let read = file.read_at(&mut buf, self.block_offset(block_idx))?;
+        if read == 0 {
+            return Ok(None);
+        }
+        buf.truncate(read);
+        Ok(Some(buf))
+    }
+
+    fn read_pg_data_block(
+        &self,
+        rel: &Path,
+        src: &Path,
+        compression: Option<CompressionAlgorithm>,
+        block_idx: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut reader = fs::File::open(src)?;
+        let mut header_buf = [0u8; std::mem::size_of::<BackupPageHeader>()];
+
+        loop {
+            match reader.read_exact(&mut header_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+
+            let block = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+            let compressed_size = i32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+
+            if compressed_size == PAGE_TRUNCATED {
+                // Truncation; logical size stops here.
+                return Ok(None);
+            }
+
+            if compressed_size <= 0 || compressed_size as usize > self.inner.block_size.get() {
+                return Err(Error::InvalidIncrementalPageSize {
+                    path: rel.display().to_string(),
+                    block,
+                    expected: self.inner.block_size.get(),
+                    actual: compressed_size.max(0) as usize,
+                }
+                .into());
+            }
+
+            let mut buf = vec![0u8; compressed_size as usize];
+            reader.read_exact(&mut buf)?;
+
+            if block as u64 == block_idx {
+                let page = self.decompress_page_if_needed(compression, compressed_size, buf)?;
+                if page.len() != self.inner.block_size.get() {
+                    return Err(Error::InvalidIncrementalPageSize {
+                        path: rel.display().to_string(),
+                        block,
+                        expected: self.inner.block_size.get(),
+                        actual: page.len(),
+                    }
+                    .into());
+                }
+                return Ok(Some(page));
+            }
+
+        }
+    }
+
+    fn block_offset(&self, block_idx: u64) -> u64 {
+        block_idx * self.inner.block_size.get() as u64
+    }
+
     pub fn write(&self, relative: impl AsRef<Path>, contents: &[u8]) -> Result<()> {
         let rel = relative.as_ref();
         let path = self.inner.diff.join(rel);
@@ -150,6 +686,7 @@ impl Overlay {
             fs::create_dir_all(parent)?;
         }
         fs::write(path, contents)?;
+        self.invalidate_cache(rel);
         Ok(())
     }
 
@@ -180,6 +717,14 @@ impl Overlay {
         &self.inner.diff
     }
 
+    pub fn block_size(&self) -> usize {
+        self.inner.block_size.get()
+    }
+
+    pub fn metrics(&self) -> OverlayMetrics {
+        self.inner.metrics.snapshot()
+    }
+
     pub fn compression_algorithm(&self) -> Option<CompressionAlgorithm> {
         self.inner.layers.iter().find_map(|l| l.compression)
     }
@@ -190,6 +735,12 @@ impl Overlay {
             .iter()
             .map(|l| (l.root.clone(), l.compression))
             .collect()
+    }
+
+    pub(crate) fn invalidate_cache(&self, rel: &Path) {
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            cache.remove(rel);
+        }
     }
 
     /// Ensure a diff-side copy exists for the provided relative path, performing
@@ -465,7 +1016,7 @@ impl Overlay {
             let compressed_size = i32::from_le_bytes(hdr[4..8].try_into().unwrap());
 
             if compressed_size == PAGE_TRUNCATED {
-                out.set_len(block as u64 * BLCKSZ as u64)?;
+                out.set_len(block as u64 * self.inner.block_size.get() as u64)?;
                 break;
             }
 
@@ -473,7 +1024,7 @@ impl Overlay {
                 return Err(Error::InvalidIncrementalPageSize {
                     path: rel.display().to_string(),
                     block,
-                    expected: BLCKSZ,
+                    expected: self.inner.block_size.get(),
                     actual: compressed_size.max(0) as usize,
                 }
                 .into());
@@ -484,17 +1035,17 @@ impl Overlay {
 
             let page = self.decompress_page_if_needed(layer.compression, compressed_size, buf)?;
 
-            if page.len() != BLCKSZ {
+            if page.len() != self.inner.block_size.get() {
                 return Err(Error::InvalidIncrementalPageSize {
                     path: rel.display().to_string(),
                     block,
-                    expected: BLCKSZ,
+                    expected: self.inner.block_size.get(),
                     actual: page.len(),
                 }
                 .into());
             }
 
-            out.write_all_at(&page, block as u64 * BLCKSZ as u64)?;
+            out.write_all_at(&page, block as u64 * self.inner.block_size.get() as u64)?;
             seen.insert(block);
         }
 
@@ -527,9 +1078,18 @@ impl Overlay {
         compressed_size: i32,
         buf: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        if compressed_size as usize != BLCKSZ {
+        if compressed_size as usize != self.inner.block_size.get() {
             if let Some(algo) = compression {
-                return self.decompress_page(algo, &buf);
+                let start = Instant::now();
+                let out = self.decompress_page(algo, &buf)?;
+                debug!(
+                    algo = ?algo,
+                    compressed_size,
+                    block_size = self.inner.block_size.get(),
+                    elapsed_us = start.elapsed().as_micros() as u64,
+                    "decompress_page"
+                );
+                return Ok(out);
             }
         }
         Ok(buf)
@@ -640,7 +1200,7 @@ impl Overlay {
     /// The source file layout is:
     ///   [BackupPageHeader {block, compressed_size}] [page_bytes] ...
     /// Pages may be per-page compressed; for `compression = None` they are
-    /// stored uncompressed with `compressed_size == BLCKSZ`.
+    /// stored uncompressed with `compressed_size == block_size`.
     fn materialize_full_datafile(
         &self,
         rel: &Path,
@@ -694,7 +1254,7 @@ impl Overlay {
             let compressed_size = i32::from_le_bytes(header_buf[4..8].try_into().unwrap());
 
             if compressed_size == PAGE_TRUNCATED {
-                out.set_len(block as u64 * BLCKSZ as u64)?;
+                out.set_len(block as u64 * self.inner.block_size.get() as u64)?;
                 warn!(
                     "PAGE_TRUNCATED at block {} in {}; remaining data ignored",
                     block,
@@ -718,11 +1278,11 @@ impl Overlay {
                 break;
             }
 
-            if compressed_size <= 0 || compressed_size as usize > BLCKSZ {
+            if compressed_size <= 0 || compressed_size as usize > self.inner.block_size.get() {
                 return Err(Error::InvalidIncrementalPageSize {
                     path: rel.display().to_string(),
                     block,
-                    expected: BLCKSZ,
+                    expected: self.inner.block_size.get(),
                     actual: compressed_size.max(0) as usize,
                 }
                 .into());
@@ -733,22 +1293,22 @@ impl Overlay {
 
             let page = self.decompress_page_if_needed(compression, compressed_size, buf)?;
 
-            if page.len() != BLCKSZ {
+            if page.len() != self.inner.block_size.get() {
                 return Err(Error::InvalidIncrementalPageSize {
                     path: rel.display().to_string(),
                     block,
-                    expected: BLCKSZ,
+                    expected: self.inner.block_size.get(),
                     actual: page.len(),
                 }
                 .into());
             }
 
-            out.write_all_at(&page, block as u64 * BLCKSZ as u64)?;
+            out.write_all_at(&page, block as u64 * self.inner.block_size.get() as u64)?;
             max_block = Some(max_block.map_or(block, |b| b.max(block)));
         }
 
         if let Some(max_block) = max_block {
-            let expected_len = (max_block as u64 + 1) * BLCKSZ as u64;
+            let expected_len = (max_block as u64 + 1) * self.inner.block_size.get() as u64;
             let current_len = out.seek(SeekFrom::End(0))?;
             if current_len < expected_len {
                 out.set_len(expected_len)?;

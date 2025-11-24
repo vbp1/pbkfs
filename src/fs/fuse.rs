@@ -308,16 +308,9 @@ impl Filesystem for OverlayFs {
             return;
         }
 
-        match self.overlay.read(&rel) {
-            Ok(Some(bytes)) => {
-                let start = offset.max(0) as usize;
-                if start >= bytes.len() {
-                    reply.data(&[]);
-                    return;
-                }
-                let end = bytes.len().min(start + size as usize);
-                reply.data(&bytes[start..end]);
-            }
+        let off = if offset < 0 { 0 } else { offset as u64 };
+        match self.overlay.read_range(&rel, off, size as usize) {
+            Ok(Some(bytes)) => reply.data(&bytes),
             Ok(None) => reply.error(ENOENT),
             Err(_) => reply.error(EIO),
         }
@@ -661,6 +654,8 @@ impl Filesystem for OverlayFs {
             }
         }
 
+        self.overlay.invalidate_cache(&rel);
+
         reply.ok();
     }
 
@@ -796,6 +791,8 @@ impl Filesystem for OverlayFs {
                         return;
                     }
                 }
+                self.overlay.invalidate_cache(&src_rel);
+                self.overlay.invalidate_cache(&dst_rel);
                 reply.ok();
             }
             Err(err) => reply.error(Self::err_code(err)),
@@ -849,6 +846,7 @@ impl Filesystem for OverlayFs {
                         reply.error(Self::err_code(err));
                         return;
                     }
+                    self.overlay.invalidate_cache(&rel);
                 }
                 Err(err) => {
                     reply.error(Self::err_code(err));
