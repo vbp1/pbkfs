@@ -240,8 +240,33 @@ impl Overlay {
         let rel = relative.as_ref();
         let diff_path = self.inner.diff.join(rel);
 
+        // If already in diff and the path is NOT present in any base layer
+        // (brand-new file), serve directly without block materialization to
+        // avoid copy-up on creation.
+        let layers = self.matching_layers(rel);
+        if layers.is_empty() && diff_path.exists() {
+            let meta_len = fs::metadata(&diff_path)?.len();
+            if offset >= meta_len {
+                self.inner
+                    .metrics
+                    .cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(Vec::new()));
+            }
+            let max_len = ((meta_len - offset) as usize).min(size);
+            let mut buf = vec![0u8; max_len];
+            let file = fs::OpenOptions::new().read(true).open(&diff_path)?;
+            let read = file.read_at(&mut buf, offset)?;
+            buf.truncate(read.min(max_len));
+            self.inner
+                .metrics
+                .cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(buf));
+        }
+
         // Quick existence check to short-circuit missing files.
-        if !diff_path.exists() && self.matching_layers(rel).is_empty() {
+        if layers.is_empty() {
             return Ok(None);
         }
 

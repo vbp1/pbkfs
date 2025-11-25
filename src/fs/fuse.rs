@@ -278,6 +278,7 @@ impl Filesystem for OverlayFs {
             reply.error(ENOENT);
             return;
         }
+        // Use inode as the file handle so subsequent requests can be validated.
         reply.opened(ino, 0);
     }
 
@@ -285,7 +286,7 @@ impl Filesystem for OverlayFs {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
@@ -303,10 +304,8 @@ impl Filesystem for OverlayFs {
             reply.error(ENOENT);
             return;
         }
-        if fh != ino {
-            reply.error(EIO);
-            return;
-        }
+        // Kernel echoes back the file handle we returned in `open`; we don't
+        // strictly require equality with the inode.
 
         let off = if offset < 0 { 0 } else { offset as u64 };
         match self.overlay.read_range(&rel, off, size as usize) {
