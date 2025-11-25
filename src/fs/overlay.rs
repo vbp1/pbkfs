@@ -471,10 +471,13 @@ impl Overlay {
                 .truncate(false)
                 .open(&diff_path)?;
             out.write_all_at(&data, offset)?;
-            let new_len = (block_idx + 1) * block_size as u64;
-            let logical_len = self.logical_len(rel)?.unwrap_or(new_len).max(new_len);
-            if out.metadata()?.len() < logical_len {
-                out.set_len(logical_len)?;
+            // Preserve the logical file length reported by source layers without
+            // artificially extending to full block size for small files.
+            let data_end = offset.saturating_add(data.len() as u64);
+            let logical_len = self.logical_len(rel)?.unwrap_or(data_end);
+            let required_len = logical_len.max(data_end);
+            if out.metadata()?.len() < required_len {
+                out.set_len(required_len)?;
             }
             let file_len = out.metadata()?.len();
             debug!(
@@ -482,7 +485,7 @@ impl Overlay {
                 block = block_idx,
                 bytes = data.len(),
                 source = ?source,
-                logical_len,
+                logical_len = required_len,
                 file_len,
                 "block_copy_up"
             );
