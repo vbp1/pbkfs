@@ -684,8 +684,7 @@ impl Overlay {
         let mut buf = vec![0u8; target.compressed_size as usize];
         reader.read_exact(&mut buf)?;
 
-        let page =
-            self.decompress_page_if_needed(compression, target.compressed_size, buf)?;
+        let page = self.decompress_page_if_needed(compression, target.compressed_size, buf)?;
         if page.len() != self.inner.block_size.get() {
             return Err(Error::InvalidIncrementalPageSize {
                 path: rel.display().to_string(),
