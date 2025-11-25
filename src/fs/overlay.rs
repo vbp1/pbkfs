@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs, io,
-    io::{BufReader, Read},
+    io::{BufReader, Read, Seek, SeekFrom},
     num::NonZeroUsize,
     os::unix::fs::{symlink, FileExt},
     path::{Path, PathBuf},
@@ -91,6 +91,14 @@ impl OverlayMetricsInner {
 struct BlockCacheEntry {
     materialized: HashSet<u64>,
     sources: HashMap<u64, BlockSource>,
+    pg_block_index: Option<Vec<BlockIndexEntry>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockIndexEntry {
+    block: u32,
+    offset: u64,
+    compressed_size: i32,
 }
 
 #[derive(Debug)]
@@ -655,51 +663,39 @@ impl Overlay {
         compression: Option<CompressionAlgorithm>,
         block_idx: u64,
     ) -> Result<Option<Vec<u8>>> {
+        // Build or reuse block index to avoid rescanning the whole file.
+        let index = {
+            let mut cache = self.inner.cache.lock().unwrap();
+            let entry = cache.entry(rel.to_path_buf()).or_default();
+            if entry.pg_block_index.is_none() {
+                entry.pg_block_index = Some(self.build_pg_block_index(rel, src)?);
+            }
+            entry.pg_block_index.as_ref().unwrap().clone()
+        };
+
+        let target = index.iter().find(|e| e.block as u64 == block_idx);
+        let target = match target {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
         let mut reader = fs::File::open(src)?;
-        let mut header_buf = [0u8; std::mem::size_of::<BackupPageHeader>()];
+        reader.seek(SeekFrom::Start(target.offset))?;
+        let mut buf = vec![0u8; target.compressed_size as usize];
+        reader.read_exact(&mut buf)?;
 
-        loop {
-            match reader.read_exact(&mut header_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => return Err(e.into()),
+        let page =
+            self.decompress_page_if_needed(compression, target.compressed_size, buf)?;
+        if page.len() != self.inner.block_size.get() {
+            return Err(Error::InvalidIncrementalPageSize {
+                path: rel.display().to_string(),
+                block: target.block,
+                expected: self.inner.block_size.get(),
+                actual: page.len(),
             }
-
-            let block = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-            let compressed_size = i32::from_le_bytes(header_buf[4..8].try_into().unwrap());
-
-            if compressed_size == PAGE_TRUNCATED {
-                // Truncation; logical size stops here.
-                return Ok(None);
-            }
-
-            if compressed_size <= 0 || compressed_size as usize > self.inner.block_size.get() {
-                return Err(Error::InvalidIncrementalPageSize {
-                    path: rel.display().to_string(),
-                    block,
-                    expected: self.inner.block_size.get(),
-                    actual: compressed_size.max(0) as usize,
-                }
-                .into());
-            }
-
-            let mut buf = vec![0u8; compressed_size as usize];
-            reader.read_exact(&mut buf)?;
-
-            if block as u64 == block_idx {
-                let page = self.decompress_page_if_needed(compression, compressed_size, buf)?;
-                if page.len() != self.inner.block_size.get() {
-                    return Err(Error::InvalidIncrementalPageSize {
-                        path: rel.display().to_string(),
-                        block,
-                        expected: self.inner.block_size.get(),
-                        actual: page.len(),
-                    }
-                    .into());
-                }
-                return Ok(Some(page));
-            }
+            .into());
         }
+        Ok(Some(page))
     }
 
     fn block_offset(&self, block_idx: u64) -> u64 {
@@ -1135,6 +1131,50 @@ impl Overlay {
             CompressionAlgorithm::Zstd => zstd::stream::decode_all(data)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e).into()),
         }
+    }
+
+    fn build_pg_block_index(&self, rel: &Path, src: &Path) -> Result<Vec<BlockIndexEntry>> {
+        let mut reader = BufReader::new(fs::File::open(src)?);
+        let mut header_buf = [0u8; std::mem::size_of::<BackupPageHeader>()];
+        let mut offset: u64 = 0;
+        let mut index = Vec::new();
+
+        loop {
+            match reader.read_exact(&mut header_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+
+            let block = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+            let compressed_size = i32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+
+            if compressed_size == PAGE_TRUNCATED {
+                break;
+            }
+
+            if compressed_size <= 0 || compressed_size as usize > self.inner.block_size.get() {
+                return Err(Error::InvalidIncrementalPageSize {
+                    path: rel.display().to_string(),
+                    block,
+                    expected: self.inner.block_size.get(),
+                    actual: compressed_size.max(0) as usize,
+                }
+                .into());
+            }
+
+            let data_offset = offset + header_buf.len() as u64;
+            index.push(BlockIndexEntry {
+                block,
+                offset: data_offset,
+                compressed_size,
+            });
+
+            reader.seek(SeekFrom::Current(compressed_size as i64))?;
+            offset = data_offset + compressed_size as u64;
+        }
+
+        Ok(index)
     }
 
     fn load_pagemap(&self, inc_path: &Path) -> Result<Option<HashSet<u32>>> {
