@@ -608,6 +608,19 @@ fn pg_datafile_range_read_does_not_extend_past_logical_len() -> pbkfs::Result<()
         write_incremental_entry(&mut file, block, &payload)?;
     }
 
+    // pg_probackup records relation existence and datafile status in
+    // backup_content.control. Create a minimal mock alongside the FULL root
+    // so that Overlay::top_layer_has_datafile() and logical_len() behave as
+    // they do for a real backup.
+    let content_path = base.path().join("FULL").join("backup_content.control");
+    fs::write(
+        &content_path,
+        concat!(
+            r#"{"path":"base/1/2662","size":"-1","mode":"33152","is_datafile":"1","is_cfs":"0","crc":"0","compress_alg":"none","external_dir_num":"0","dbOid":"1","segno":"0","n_blocks":"4"}"#,
+            "\n"
+        ),
+    )?;
+
     // Single FULL layer providing the per-page formatted datafile.
     let layers = vec![Layer {
         root: data_root.clone(),
@@ -656,6 +669,19 @@ fn compressed_incremental_non_data_prefers_newest_layer() -> pbkfs::Result<()> {
     let new_root = inc_new.path().join("INC_NEW");
     fs::create_dir_all(new_root.join("global"))?;
     fs::write(new_root.join(rel), b"NEW_CTRL")?;
+
+    // In real pg_probackup backups, pg_control is explicitly marked as
+    // uncompressed (compress_alg = "none") in backup_content.control, even
+    // when backup-level compression is enabled. Provide a minimal mock to
+    // exercise the same behavior.
+    let new_content = inc_new.path().join("backup_content.control");
+    fs::write(
+        &new_content,
+        concat!(
+            r#"{"path":"global/pg_control","size":"8192","mode":"33152","is_datafile":"0","is_cfs":"0","crc":"0","compress_alg":"none","external_dir_num":"0","dbOid":"0"}"#,
+            "\n"
+        ),
+    )?;
 
     // Base FULL layer with different contents.
     let base_root = base.path().join("FULL");
