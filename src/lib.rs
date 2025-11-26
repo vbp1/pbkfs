@@ -20,7 +20,9 @@ pub enum Error {
     ChainCycle(String),
     #[error("missing backup: {0}")]
     MissingBackup(String),
-    #[error("binding violation: expected {expected}, got {actual}")]
+    #[error(
+        "binding violation: expected {expected}, got {actual}. The diff directory is already bound; mount with the recorded instance/backup or clean it with `pbkfs cleanup --diff-dir <path> --force`."
+    )]
     BindingViolation { expected: String, actual: String },
     #[error("diff directory not writable: {0}")]
     DiffDirNotWritable(String),
