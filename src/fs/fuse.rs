@@ -25,6 +25,10 @@ use crate::Result;
 
 const TTL: Duration = Duration::from_secs(1);
 const GENERATION: u64 = 0;
+// PostgreSQL OID is u32: up to 10 decimal digits (4_294_967_295).
+const MAX_OID_DIGITS: usize = 10;
+// pg_probackup segment numbers are bounded (pgFileSize): up to 5 digits.
+const MAX_SEGMENT_DIGITS: usize = 5;
 
 pub struct OverlayFs {
     overlay: Overlay,
@@ -142,6 +146,74 @@ impl OverlayFs {
             .map_err(|err| io::Error::from_raw_os_error(Self::err_from_anyhow(err)))
     }
 
+    fn is_database_map(rel: &Path) -> bool {
+        rel == Path::new("database_map")
+    }
+
+    fn is_pg_wal_dir(rel: &Path) -> bool {
+        rel == Path::new("pg_wal")
+    }
+
+    fn is_pg_wal_child(rel: &Path) -> bool {
+        rel.parent() == Some(Path::new("pg_wal"))
+    }
+
+    /// Heuristic to detect PostgreSQL main-fork relation filenames based on
+    /// pg_probackup's `is_datafile` rules: `<oid>` or `<oid>.<segno>` where
+    /// both components are decimal without leading zeros and within reasonable
+    /// bounds.
+    fn is_rel_filename(name: &str) -> bool {
+        let mut chars = name.chars().peekable();
+        let first = match chars.next() {
+            Some(c) if c.is_ascii_digit() => c,
+            _ => return false,
+        };
+        if first == '0' {
+            return false;
+        }
+
+        // Parse OID digits, enforcing an upper bound.
+        let mut oid_digits = 1usize;
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() {
+                oid_digits += 1;
+                if oid_digits > MAX_OID_DIGITS {
+                    return false;
+                }
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        match chars.next() {
+            None => true, // pure "<oid>"
+            Some('.') => {
+                // Optional ".<segno>" with 1..5 digits, no leading zero.
+                let mut seg_digits = 0usize;
+                let mut first_seg: Option<char> = None;
+                for c in chars {
+                    if !c.is_ascii_digit() {
+                        return false;
+                    }
+                    if seg_digits == 0 {
+                        first_seg = Some(c);
+                        if c == '0' {
+                            return false;
+                        }
+                    }
+                    seg_digits += 1;
+                    if seg_digits > MAX_SEGMENT_DIGITS {
+                        return false;
+                    }
+                }
+                seg_digits > 0 && first_seg.is_some()
+            }
+            // Any other suffix marks it as non-datafile.
+            Some(_) => false,
+        }
+    }
+
     fn visible_dir_entries(&self, rel: &Path) -> io::Result<Vec<String>> {
         let mut names = HashSet::new();
         let diff_dir = self.overlay.diff_root().join(rel);
@@ -156,21 +228,65 @@ impl OverlayFs {
             }
         }
 
-        for (root, _) in self.overlay.layer_roots() {
+        let layer_roots = self.overlay.layer_roots();
+        for (idx, (root, _)) in layer_roots.iter().enumerate() {
             let base_dir = root.join(rel);
             if let Ok(read_dir) = fs::read_dir(&base_dir) {
                 for entry in read_dir.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
+                    // `database_map` is never restored by pg_probackup, so
+                    // hide it from the projected tree to match restore
+                    // semantics.
+                    if rel.as_os_str().is_empty() && name == "database_map" {
+                        continue;
+                    }
                     let child_rel = if rel.as_os_str().is_empty() {
                         PathBuf::from(&name)
                     } else {
                         rel.join(&name)
                     };
+                    // Hide stale relation files that existed only in older
+                    // backups but are absent from the target backup's
+                    // metadata. For forks (_fsm, _vm, etc.) we consult the
+                    // main-fork relation path.
+                    if idx > 0 {
+                        let (main_name, main_rel_path) =
+                            if let Some((base, _suffix)) = name.split_once('_') {
+                                // Handle forks like 16413_fsm, 16413_vm, etc.
+                                let mut p = rel.to_path_buf();
+                                p.push(base);
+                                (base.to_string(), p)
+                            } else {
+                                (name.clone(), child_rel.clone())
+                            };
+
+                        if Self::is_rel_filename(&main_name)
+                            && !self.overlay.top_layer_has_datafile(&main_rel_path)
+                        {
+                            continue;
+                        }
+                    }
                     if self.is_whiteouted(&child_rel) {
                         continue;
                     }
                     names.insert(name);
                 }
+            }
+
+            // For WAL we must not union segments from all backups: pg_probackup
+            // restore leaves only WAL files of the target backup in PGDATA.
+            // Limit directory listing of `pg_wal` to the newest layer only.
+            if Self::is_pg_wal_dir(rel) && idx == 0 {
+                break;
+            }
+        }
+
+        // Synthesized zero-length relation files that exist only in
+        // backup_content.control for the newest backup but have no physical
+        // representation in any layer or diff.
+        if !rel.as_os_str().is_empty() {
+            for name in self.overlay.virtual_datafile_children(rel) {
+                names.insert(name);
             }
         }
 
@@ -188,6 +304,12 @@ impl OverlayFs {
             return None;
         }
 
+        // `database_map` is never restored into PGDATA by pg_probackup
+        // (restore.c skips it), so present it as absent in the mounted view.
+        if Self::is_database_map(rel) {
+            return None;
+        }
+
         // Prefer diff over base; if neither has the path but this looks like a
         // PostgreSQL datafile, let the overlay materialize an appropriate
         // backing file (including zero-length relations that existed without
@@ -196,7 +318,19 @@ impl OverlayFs {
         let (meta, from_diff) = match fs::symlink_metadata(&diff_candidate) {
             Ok(m) => (m, true),
             Err(_) => {
-                if let Some((base_path, _, _)) = self.overlay.find_layer_path(rel) {
+                // For WAL segments we follow pg_probackup restore semantics
+                // and only expose files that exist in the newest backup's
+                // data directory, ignoring older layers.
+                if Self::is_pg_wal_child(rel) {
+                    let layer_roots = self.overlay.layer_roots();
+                    if let Some((primary_root, _)) = layer_roots.first() {
+                        let base_path = primary_root.join(rel);
+                        let meta = fs::symlink_metadata(&base_path).ok()?;
+                        (meta, false)
+                    } else {
+                        return None;
+                    }
+                } else if let Some((base_path, _, _)) = self.overlay.find_layer_path(rel) {
                     let meta = fs::symlink_metadata(base_path).ok()?;
                     (meta, false)
                 } else {
@@ -222,9 +356,22 @@ impl OverlayFs {
             FileType::RegularFile
         };
 
+        // Prefer logical length from overlay so that sizes of PostgreSQL
+        // relation files and other objects that pg_probackup stores in its own
+        // on-disk format match the view produced by `pg_probackup restore`.
+        let logical_size = if file_type.is_file() {
+            self.overlay
+                .logical_len_for(rel)
+                .ok()
+                .flatten()
+                .unwrap_or(meta.len())
+        } else {
+            meta.len()
+        };
+
         let attr = FileAttr {
             ino: self.get_or_insert_ino(rel),
-            size: meta.len(),
+            size: logical_size,
             blocks: meta.blocks(),
             atime: meta.accessed().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
             mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
@@ -278,6 +425,7 @@ impl Filesystem for OverlayFs {
             reply.error(ENOENT);
             return;
         }
+        // Use inode as the file handle so subsequent requests can be validated.
         reply.opened(ino, 0);
     }
 
@@ -285,7 +433,7 @@ impl Filesystem for OverlayFs {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
@@ -303,21 +451,12 @@ impl Filesystem for OverlayFs {
             reply.error(ENOENT);
             return;
         }
-        if fh != ino {
-            reply.error(EIO);
-            return;
-        }
+        // Kernel echoes back the file handle we returned in `open`; we don't
+        // strictly require equality with the inode.
 
-        match self.overlay.read(&rel) {
-            Ok(Some(bytes)) => {
-                let start = offset.max(0) as usize;
-                if start >= bytes.len() {
-                    reply.data(&[]);
-                    return;
-                }
-                let end = bytes.len().min(start + size as usize);
-                reply.data(&bytes[start..end]);
-            }
+        let off = if offset < 0 { 0 } else { offset as u64 };
+        match self.overlay.read_range(&rel, off, size as usize) {
+            Ok(Some(bytes)) => reply.data(&bytes),
             Ok(None) => reply.error(ENOENT),
             Err(_) => reply.error(EIO),
         }
@@ -661,6 +800,8 @@ impl Filesystem for OverlayFs {
             }
         }
 
+        self.overlay.invalidate_cache(&rel);
+
         reply.ok();
     }
 
@@ -796,6 +937,8 @@ impl Filesystem for OverlayFs {
                         return;
                     }
                 }
+                self.overlay.invalidate_cache(&src_rel);
+                self.overlay.invalidate_cache(&dst_rel);
                 reply.ok();
             }
             Err(err) => reply.error(Self::err_code(err)),
@@ -849,6 +992,7 @@ impl Filesystem for OverlayFs {
                         reply.error(Self::err_code(err));
                         return;
                     }
+                    self.overlay.invalidate_cache(&rel);
                 }
                 Err(err) => {
                     reply.error(Self::err_code(err));

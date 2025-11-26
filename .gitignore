@@ -38,6 +38,7 @@ CLAUDE.md
 pg_probackup
 postgres.repo
 postgres/data/
+postgres/
 
 # OS / editor cruft
 .DS_Store

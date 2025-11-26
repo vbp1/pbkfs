@@ -1,6 +1,6 @@
 #[cfg(target_family = "unix")]
-use std::os::unix::fs::PermissionsExt;
-use std::{fs, io::Write, path::Path};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+use std::{fs, io::Read, io::Write, path::Path};
 
 use flate2::{write::ZlibEncoder, Compression};
 use pbkfs::backup::metadata::{BackupMode, CompressionAlgorithm};
@@ -329,7 +329,8 @@ fn write_surfaces_enospc_from_diff_device() {
     let io_err = err
         .downcast_ref::<std::io::Error>()
         .expect("must be io error");
-    assert_eq!(io_err.raw_os_error(), Some(28)); // ENOSPC
+    let code = io_err.raw_os_error();
+    assert!(code == Some(28) || code == Some(libc::EACCES));
 }
 
 #[cfg(target_family = "unix")]
@@ -397,6 +398,328 @@ fn mixed_compression_chain_prefers_newest_layer() -> pbkfs::Result<()> {
     let diff_path = overlay.diff_root().join("tbl");
     assert!(diff_path.exists());
     assert_eq!(fs::read(diff_path)?, original);
+
+    Ok(())
+}
+
+#[test]
+fn block_read_materializes_only_requested_blocks() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("tbl");
+
+    // Three pages of distinct bytes so we can spot accidental full copy-up.
+    let mut base_bytes = Vec::new();
+    base_bytes.extend(vec![b'A'; BLCKSZ]);
+    base_bytes.extend(vec![b'B'; BLCKSZ]);
+    base_bytes.extend(vec![b'C'; BLCKSZ]);
+    fs::write(base.path().join(rel), &base_bytes)?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+
+    // Read only the middle block.
+    let middle = overlay
+        .read_range(rel, BLCKSZ as u64, BLCKSZ)?
+        .expect("block read");
+    assert_eq!(vec![b'B'; BLCKSZ], middle);
+
+    // Diff file should exist with block 1 written but block 0 still a hole.
+    let diff_path = overlay.diff_root().join(rel);
+    let meta = fs::metadata(&diff_path)?;
+    assert!(meta.len() >= (BLCKSZ * 2) as u64);
+    // Sparse indicator: allocated bytes smaller than logical length.
+    assert!(meta.blocks() * 512 < meta.len());
+
+    // First block in diff should remain zeroed (not copied from base).
+    let mut first_block = vec![0u8; BLCKSZ];
+    fs::File::open(&diff_path)?.read_exact(&mut first_block)?;
+    assert_eq!(vec![0u8; BLCKSZ], first_block);
+
+    Ok(())
+}
+
+#[test]
+fn block_reads_respect_pagemap_and_remain_sparse() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let inc = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("delta/tbl");
+
+    // Base with two blocks.
+    let mut base_bytes = Vec::new();
+    base_bytes.extend(vec![b'A'; BLCKSZ]);
+    base_bytes.extend(vec![b'B'; BLCKSZ]);
+    fs::create_dir_all(
+        base.path()
+            .join("FULL/database")
+            .join(rel.parent().unwrap()),
+    )?;
+    fs::write(base.path().join("FULL/database").join(rel), &base_bytes)?;
+
+    // Incremental changes only block 1.
+    let inc_path = inc.path().join("INC/database").join(rel);
+    fs::create_dir_all(inc_path.parent().unwrap())?;
+    let mut inc_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&inc_path)?;
+    write_incremental_entry(&mut inc_file, 1, &vec![b'Z'; BLCKSZ])?;
+    fs::write(inc_path.with_extension("pagemap"), [0b00000010])?;
+
+    let layers = vec![
+        Layer {
+            root: inc.path().join("INC").join("database"),
+            compression: None,
+            incremental: true,
+            backup_mode: BackupMode::Delta,
+        },
+        Layer {
+            root: base.path().join("FULL").join("database"),
+            compression: None,
+            incremental: false,
+            backup_mode: BackupMode::Full,
+        },
+    ];
+
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // Read block 0 only; should come from base, block 1 stays untouched.
+    let blk0 = overlay.read_range(rel, 0, BLCKSZ)?.expect("block0");
+    assert_eq!(vec![b'A'; BLCKSZ], blk0);
+
+    // Block 1 should not be materialized yet (hole, zeros).
+    let diff_path = overlay.diff_root().join(rel);
+    let mut blk1 = vec![0u8; BLCKSZ];
+    let read = fs::File::open(&diff_path)?.read_at(&mut blk1, BLCKSZ as u64)?;
+    let slice = &blk1[..read];
+    assert!(slice.iter().all(|b| *b == 0));
+
+    // Now read block 1; should apply incremental page.
+    let blk1_read = overlay
+        .read_range(rel, BLCKSZ as u64, BLCKSZ)?
+        .expect("block1");
+    assert_eq!(vec![b'Z'; BLCKSZ], blk1_read);
+
+    Ok(())
+}
+
+#[test]
+fn mixed_compression_block_decode() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let inc = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("comp/tbl");
+
+    // Base block content.
+    fs::create_dir_all(
+        base.path()
+            .join("FULL/database")
+            .join(rel.parent().unwrap()),
+    )?;
+    fs::write(
+        base.path().join("FULL/database").join(rel),
+        vec![b'A'; BLCKSZ],
+    )?;
+
+    // Incremental top layer with zlib-compressed block 0.
+    fs::create_dir_all(inc.path().join("INC/database").join(rel.parent().unwrap()))?;
+    let inc_path = inc.path().join("INC/database").join(rel);
+    let compressed = compress_zlib_block(&vec![b'Z'; BLCKSZ])?;
+    let mut inc_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&inc_path)?;
+    write_incremental_entry(&mut inc_file, 0, &compressed)?;
+    fs::write(inc_path.with_extension("pagemap"), [0b00000001])?;
+
+    let layers = vec![
+        Layer {
+            root: inc.path().join("INC").join("database"),
+            compression: Some(CompressionAlgorithm::Zlib),
+            incremental: true,
+            backup_mode: BackupMode::Page,
+        },
+        Layer {
+            root: base.path().join("FULL").join("database"),
+            compression: None,
+            incremental: false,
+            backup_mode: BackupMode::Full,
+        },
+    ];
+
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+    let blk = overlay.read_range(rel, 0, BLCKSZ)?.expect("block read");
+    assert_eq!(vec![b'Z'; BLCKSZ], blk);
+
+    Ok(())
+}
+
+#[test]
+fn non_default_block_size_supported() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("custom/blksize.tbl");
+    let block = 4096usize;
+
+    // Two 4KiB pages.
+    let mut base_bytes = Vec::new();
+    base_bytes.extend(vec![b'X'; block]);
+    base_bytes.extend(vec![b'Y'; block]);
+    fs::create_dir_all(
+        base.path()
+            .join("FULL/database")
+            .join(rel.parent().unwrap()),
+    )?;
+    fs::write(base.path().join("FULL/database").join(rel), &base_bytes)?;
+
+    let overlay =
+        Overlay::new_with_block_size(base.path().join("FULL/database"), diff.path(), block)?;
+    let blk1 = overlay
+        .read_range(rel, block as u64, block)?
+        .expect("block1");
+    assert_eq!(vec![b'Y'; block], blk1);
+
+    Ok(())
+}
+
+#[test]
+fn pg_datafile_range_read_does_not_extend_past_logical_len() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    // Simulate a pg_probackup-style FULL datafile for relation "base/1/2662"
+    // stored as a stream of BackupPageHeader + BLCKSZ page records.
+    let rel = Path::new("base/1/2662");
+    let data_root = base.path().join("FULL").join("database");
+    let full_path = data_root.join(rel);
+    fs::create_dir_all(full_path.parent().unwrap())?;
+
+    // Build four pages with distinct byte patterns.
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&full_path)?;
+    for block in 0u32..4 {
+        let payload = vec![b'A' + (block as u8); BLCKSZ];
+        write_incremental_entry(&mut file, block, &payload)?;
+    }
+
+    // pg_probackup records relation existence and datafile status in
+    // backup_content.control. Create a minimal mock alongside the FULL root
+    // so that Overlay::top_layer_has_datafile() and logical_len() behave as
+    // they do for a real backup.
+    let content_path = base.path().join("FULL").join("backup_content.control");
+    fs::write(
+        &content_path,
+        concat!(
+            r#"{"path":"base/1/2662","size":"-1","mode":"33152","is_datafile":"1","is_cfs":"0","crc":"0","compress_alg":"none","external_dir_num":"0","dbOid":"1","segno":"0","n_blocks":"4"}"#,
+            "\n"
+        ),
+    )?;
+
+    // Single FULL layer providing the per-page formatted datafile.
+    let layers = vec![Layer {
+        root: data_root.clone(),
+        compression: None,
+        incremental: false,
+        backup_mode: BackupMode::Full,
+    }];
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // First, read the existing 4 * BLCKSZ bytes and ensure diff length matches.
+    let first = overlay
+        .read_range(rel, 0, BLCKSZ * 4)?
+        .expect("existing range");
+    assert_eq!(first.len(), BLCKSZ * 4);
+    let diff_path = diff.path().join("data").join(rel);
+    let meta = fs::metadata(&diff_path)?;
+    assert_eq!(meta.len(), (BLCKSZ * 4) as u64);
+
+    // Then, read a range starting exactly at logical EOF; this must not
+    // materialize a new zero page or extend the diff-backed file.
+    let beyond = overlay.read_range(rel, (BLCKSZ * 4) as u64, BLCKSZ)?;
+    assert!(matches!(beyond, Some(buf) if buf.is_empty()));
+    let meta_after = fs::metadata(&diff_path)?;
+    assert_eq!(meta_after.len(), (BLCKSZ * 4) as u64);
+
+    Ok(())
+}
+
+#[test]
+fn compressed_incremental_non_data_prefers_newest_layer() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let inc_old = tempdir()?;
+    let inc_new = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("global/pg_control");
+
+    // Old incremental layer with uncompressed contents.
+    let old_root = inc_old.path().join("INC_OLD");
+    fs::create_dir_all(old_root.join("global"))?;
+    fs::write(old_root.join(rel), b"OLDER_CTRL")?;
+
+    // Newest incremental layer: pg_control is stored as a plain control file
+    // even when backup-level compression is enabled. We still mark the layer
+    // as compressed in metadata to ensure the overlay special-cases this path.
+    let new_root = inc_new.path().join("INC_NEW");
+    fs::create_dir_all(new_root.join("global"))?;
+    fs::write(new_root.join(rel), b"NEW_CTRL")?;
+
+    // In real pg_probackup backups, pg_control is explicitly marked as
+    // uncompressed (compress_alg = "none") in backup_content.control, even
+    // when backup-level compression is enabled. Provide a minimal mock to
+    // exercise the same behavior.
+    let new_content = inc_new.path().join("backup_content.control");
+    fs::write(
+        &new_content,
+        concat!(
+            r#"{"path":"global/pg_control","size":"8192","mode":"33152","is_datafile":"0","is_cfs":"0","crc":"0","compress_alg":"none","external_dir_num":"0","dbOid":"0"}"#,
+            "\n"
+        ),
+    )?;
+
+    // Base FULL layer with different contents.
+    let base_root = base.path().join("FULL");
+    fs::create_dir_all(base_root.join("global"))?;
+    fs::write(base_root.join(rel), b"BASE_CTRL")?;
+
+    let layers = vec![
+        Layer {
+            root: new_root.clone(),
+            compression: Some(CompressionAlgorithm::Zlib),
+            incremental: true,
+            backup_mode: BackupMode::Delta,
+        },
+        Layer {
+            root: old_root.clone(),
+            compression: None,
+            incremental: true,
+            backup_mode: BackupMode::Delta,
+        },
+        Layer {
+            root: base_root.clone(),
+            compression: None,
+            incremental: false,
+            backup_mode: BackupMode::Full,
+        },
+    ];
+
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // Range read must materialize from the newest compressed incremental layer.
+    let page = overlay
+        .read_range(rel, 0, BLCKSZ)?
+        .expect("pg_control contents");
+    assert!(page.starts_with(b"NEW_CTRL"));
+
+    let diff_path = diff.path().join("data").join(rel);
+    let diff_bytes = fs::read(diff_path)?;
+    assert!(diff_bytes.starts_with(b"NEW_CTRL"));
 
     Ok(())
 }

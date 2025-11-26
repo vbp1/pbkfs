@@ -1,26 +1,31 @@
 //! Copy-on-write overlay helpers used by tests and FUSE adapter.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs, io,
-    io::{BufReader, Read},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    num::NonZeroUsize,
     os::unix::fs::{symlink, FileExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
     backup::metadata::{BackupMode, CompressionAlgorithm},
     Error, Result,
 };
-use tracing::warn;
+use serde::Deserialize;
+use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 const COPYUP_WAIT_RETRIES: usize = 50;
 const COPYUP_WAIT_INTERVAL: Duration = Duration::from_millis(10);
-const BLCKSZ: usize = 8192;
+const DEFAULT_BLCKSZ: usize = 8192;
 const PAGE_TRUNCATED: i32 = -2;
 // PostgreSQL OID is u32: up to 10 decimal digits (4_294_967_295).
 const MAX_OID_DIGITS: usize = 10;
@@ -31,6 +36,24 @@ const MAX_SEGMENT_DIGITS: usize = 5;
 struct BackupPageHeader {
     block: u32,
     compressed_size: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileMeta {
+    compression: Option<CompressionAlgorithm>,
+    is_datafile: bool,
+    external_dir_num: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupContentEntry {
+    path: String,
+    #[serde(rename = "compress_alg")]
+    compress_alg: Option<String>,
+    #[serde(rename = "is_datafile")]
+    is_datafile: Option<String>,
+    #[serde(rename = "external_dir_num")]
+    external_dir_num: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,17 +69,81 @@ pub struct Layer {
     pub backup_mode: BackupMode,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum BlockSource {
+    Diff,
+    Layer { idx: usize },
+    Zero,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct OverlayMetrics {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub fallback_used: u64,
+    pub blocks_copied: u64,
+    pub bytes_copied: u64,
+}
+
+#[derive(Default, Debug)]
+struct OverlayMetricsInner {
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    fallback_used: AtomicU64,
+    blocks_copied: AtomicU64,
+    bytes_copied: AtomicU64,
+}
+
+impl OverlayMetricsInner {
+    fn snapshot(&self) -> OverlayMetrics {
+        OverlayMetrics {
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
+            fallback_used: self.fallback_used.load(Ordering::Relaxed),
+            blocks_copied: self.blocks_copied.load(Ordering::Relaxed),
+            bytes_copied: self.bytes_copied.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+struct BlockCacheEntry {
+    materialized: HashSet<u64>,
+    sources: HashMap<u64, BlockSource>,
+    // Block indexes per physical path (layer or diff file) to avoid mixing
+    // incremental/full variants of the same relation.
+    pg_block_index: HashMap<PathBuf, Vec<BlockIndexEntry>>,
+    // Cached logical length for this path. We only cache successful
+    // computations (Some(len)) to avoid repeatedly scanning large
+    // pg_probackup datafiles during sequential reads; `None` still
+    // means "not cached or no logical length".
+    logical_len: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockIndexEntry {
+    block: u32,
+    offset: u64,
+    compressed_size: i32,
+}
+
 #[derive(Debug)]
 struct OverlayInner {
     base: PathBuf,
     diff: PathBuf,
-    layers: Vec<Layer>,                // newest -> oldest
+    layers: Vec<Layer>, // newest -> oldest
+    block_size: NonZeroUsize,
     inflight: Mutex<HashSet<PathBuf>>, // tracks in-progress copy-ups per path
+    cache: Mutex<HashMap<PathBuf, BlockCacheEntry>>,
+    metrics: OverlayMetricsInner,
+    // Per-layer file metadata loaded from pg_probackup's backup_content.control.
+    // Keyed by layer root -> relative path -> metadata.
+    file_meta: Mutex<HashMap<PathBuf, HashMap<String, FileMeta>>>,
 }
 
 impl Overlay {
     pub fn new<P: AsRef<Path>, Q: AsRef<Path>>(base: P, diff: Q) -> Result<Self> {
-        Self::new_with_layers(
+        Self::new_with_layers_and_block_size(
             base.as_ref(),
             diff,
             vec![Layer {
@@ -65,6 +152,25 @@ impl Overlay {
                 incremental: false,
                 backup_mode: BackupMode::Full,
             }],
+            DEFAULT_BLCKSZ,
+        )
+    }
+
+    pub fn new_with_block_size<P: AsRef<Path>, Q: AsRef<Path>>(
+        base: P,
+        diff: Q,
+        block_size: usize,
+    ) -> Result<Self> {
+        Self::new_with_layers_and_block_size(
+            base.as_ref(),
+            diff,
+            vec![Layer {
+                root: base.as_ref().to_path_buf(),
+                compression: None,
+                incremental: false,
+                backup_mode: BackupMode::Full,
+            }],
+            block_size,
         )
     }
 
@@ -73,7 +179,7 @@ impl Overlay {
         diff: Q,
         compression: Option<CompressionAlgorithm>,
     ) -> Result<Self> {
-        Self::new_with_layers(
+        Self::new_with_layers_and_block_size(
             base.as_ref(),
             diff,
             vec![Layer {
@@ -82,6 +188,7 @@ impl Overlay {
                 incremental: false,
                 backup_mode: BackupMode::Full,
             }],
+            DEFAULT_BLCKSZ,
         )
     }
 
@@ -96,7 +203,7 @@ impl Overlay {
             incremental: false,
             backup_mode: BackupMode::Full,
         };
-        Self::new_with_layers(base, diff, vec![layer])
+        Self::new_with_layers_and_block_size(base, diff, vec![layer], DEFAULT_BLCKSZ)
     }
 
     pub fn new_with_layers<P: AsRef<Path>, Q: AsRef<Path>>(
@@ -104,6 +211,17 @@ impl Overlay {
         diff: Q,
         layers: Vec<Layer>,
     ) -> Result<Self> {
+        Self::new_with_layers_and_block_size(base, diff, layers, DEFAULT_BLCKSZ)
+    }
+
+    pub fn new_with_layers_and_block_size<P: AsRef<Path>, Q: AsRef<Path>>(
+        base: P,
+        diff: Q,
+        layers: Vec<Layer>,
+        block_size: usize,
+    ) -> Result<Self> {
+        let block_size = NonZeroUsize::new(block_size)
+            .ok_or_else(|| Error::Cli("block size cannot be zero".into()))?;
         let base_path = base.as_ref().to_path_buf();
         let diff_root = diff.as_ref().to_path_buf();
         let data_path = diff_root.join("data");
@@ -116,7 +234,11 @@ impl Overlay {
                 base: base_path,
                 diff: data_path,
                 layers,
+                block_size,
                 inflight: Mutex::new(HashSet::new()),
+                cache: Mutex::new(HashMap::new()),
+                metrics: OverlayMetricsInner::default(),
+                file_meta: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -143,6 +265,631 @@ impl Overlay {
         Ok(Some(fs::read(base_path)?))
     }
 
+    /// Block-aligned lazy range read. Materializes only the blocks that
+    /// intersect the requested range into the diff directory, leaving holes
+    /// elsewhere. Returns `None` when the path cannot be resolved in any
+    /// layer.
+    pub fn read_range(
+        &self,
+        relative: impl AsRef<Path>,
+        offset: u64,
+        size: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let rel = relative.as_ref();
+        let diff_path = self.inner.diff.join(rel);
+
+        // If already in diff and the path is NOT present in any base layer
+        // (brand-new file), serve directly without block materialization to
+        // avoid copy-up on creation.
+        let layers = self.matching_layers(rel);
+        if layers.is_empty() && diff_path.exists() {
+            let meta_len = fs::metadata(&diff_path)?.len();
+            if offset >= meta_len {
+                self.inner
+                    .metrics
+                    .cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(Vec::new()));
+            }
+            let max_len = ((meta_len - offset) as usize).min(size);
+            let mut buf = vec![0u8; max_len];
+            let file = fs::OpenOptions::new().read(true).open(&diff_path)?;
+            let read = file.read_at(&mut buf, offset)?;
+            buf.truncate(read.min(max_len));
+            self.inner
+                .metrics
+                .cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(buf));
+        }
+
+        // Quick existence check to short-circuit missing files.
+        if layers.is_empty() {
+            return Ok(None);
+        }
+
+        // Respect logical length for all files (including PostgreSQL datafiles).
+        // For heap/index files stored in pg_probackup's per-page format, this
+        // uses page indexes rather than raw physical sizes to avoid extending
+        // relations past their recorded length.
+        let mut end_offset = offset.saturating_add(size as u64);
+        if let Some(len) = self.cached_logical_len(rel)? {
+            if offset >= len {
+                return Ok(Some(Vec::new()));
+            }
+            // Clamp reads that run past EOF so we only materialize existing
+            // logical blocks instead of synthesizing trailing zero pages.
+            end_offset = end_offset.min(len);
+        }
+
+        if let Some(parent) = diff_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let block_size = self.inner.block_size.get() as u64;
+
+        let read_start = Instant::now();
+
+        if size == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let start_block = offset / block_size;
+        let end_block = end_offset.saturating_sub(1) / block_size;
+
+        debug!(
+            path = %rel.display(),
+            offset,
+            size,
+            start_block,
+            end_block,
+            "read_range_start"
+        );
+
+        // Materialize only the requested blocks.
+        for block in start_block..=end_block {
+            self.materialize_block(rel, block)?;
+        }
+
+        // Read requested slice directly from diff (sparse holes read as zeroes).
+        let meta_len = fs::metadata(&diff_path)?.len();
+        if offset >= meta_len {
+            return Ok(Some(Vec::new()));
+        }
+        let max_len = ((meta_len - offset) as usize).min(size);
+        let mut buf = vec![0u8; max_len];
+        let file = fs::OpenOptions::new().read(true).open(&diff_path)?;
+        let read = file.read_at(&mut buf, offset)?;
+        buf.truncate(read.min(max_len));
+        debug!(
+            path = %rel.display(),
+            offset,
+            size,
+            start_block,
+            end_block,
+            bytes_returned = buf.len(),
+            elapsed_us = read_start.elapsed().as_micros() as u64,
+            "read_range_done"
+        );
+        Ok(Some(buf))
+    }
+
+    fn logical_len(&self, rel: &Path) -> Result<Option<u64>> {
+        // For PostgreSQL transaction/status files we should not combine lengths
+        // from multiple backups: use the diff file if present, otherwise the
+        // file from the newest matching layer only.
+        if self.is_system_status_file(rel) {
+            let diff_path = self.inner.diff.join(rel);
+            if let Ok(meta) = fs::metadata(&diff_path) {
+                return Ok(Some(meta.len()));
+            }
+
+            let matches = self.matching_layers(rel);
+            if let Some((_, path)) = matches.first() {
+                if let Ok(meta) = fs::metadata(path) {
+                    return Ok(Some(meta.len()));
+                }
+            }
+            return Ok(None);
+        }
+
+        // For heap/index files stored in page-mode format, physical file size
+        // (with per-page headers/compression) is not the logical size. Derive
+        // length from the highest page number we can observe.
+        if self.is_pg_datafile(rel) {
+            // If the top (target) backup does not list this relation as a
+            // datafile in backup_content.control, treat it as absent (e.g.,
+            // dropped relation) even if older backups still have the file.
+            if !self.top_layer_has_datafile(rel) {
+                return Ok(None);
+            }
+            return self.datafile_logical_len(rel);
+        }
+
+        let diff_path = self.inner.diff.join(rel);
+        let mut best: u64 = 0;
+        if let Ok(meta) = fs::metadata(&diff_path) {
+            best = meta.len();
+        }
+
+        for (idx, path) in self.matching_layers(rel) {
+            if let Ok(meta) = fs::metadata(&path) {
+                best = best.max(meta.len());
+                if !self.inner.layers[idx].incremental {
+                    return Ok(Some(best));
+                }
+            }
+        }
+
+        if best == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(best))
+        }
+    }
+
+    /// Compute logical length for PostgreSQL datafiles (tables and indexes)
+    /// using page indexes rather than raw compressed file sizes.
+    fn datafile_logical_len(&self, rel: &Path) -> Result<Option<u64>> {
+        let matches = self.matching_layers(rel);
+        if matches.is_empty() {
+            // Fall back to diff-only length for brand new relations.
+            let diff_len = fs::metadata(self.inner.diff.join(rel))
+                .map(|m| m.len())
+                .ok();
+            return Ok(diff_len);
+        }
+
+        let mut best = 0u64;
+
+        for (idx, path) in matches {
+            let layer = &self.inner.layers[idx];
+
+            // For per-page stored files (all pg_probackup main-fork datafiles),
+            // inspect BackupPageHeader stream to find highest block.
+            let logical = match self.pg_block_index(rel, &path) {
+                Ok(index) if !index.is_empty() => index
+                    .iter()
+                    .map(|e| self.block_offset(e.block as u64 + 1))
+                    .max(),
+                _ => fs::metadata(&path).ok().map(|m| m.len()),
+            };
+
+            if let Some(len) = logical {
+                best = best.max(len);
+                // If we hit a full (non-incremental) layer, that's the base;
+                // later incrementals cannot extend logical length beyond it.
+                if !layer.incremental {
+                    break;
+                }
+            }
+        }
+
+        // Diff may contain user writes; prefer the larger of diff and layers.
+        if let Ok(meta) = fs::metadata(self.inner.diff.join(rel)) {
+            best = best.max(meta.len());
+        }
+
+        if best == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(best))
+        }
+    }
+
+    /// Identify PostgreSQL "status" files where PostgreSQL tracks transaction
+    /// state and similar metadata (pg_xact, pg_multixact, pg_subtrans,
+    /// pg_commit_ts). For these files pg_probackup restore effectively uses the
+    /// version from the destination backup itself; combining lengths from older
+    /// backups can extend them beyond what exists in the target backup.
+    fn is_system_status_file(&self, rel: &Path) -> bool {
+        let mut components = rel.components();
+        let first = match components.next() {
+            Some(c) => c.as_os_str().to_string_lossy(),
+            None => return false,
+        };
+        matches!(
+            first.as_ref(),
+            "pg_xact" | "pg_multixact" | "pg_subtrans" | "pg_commit_ts"
+        )
+    }
+
+    fn materialize_block(&self, rel: &Path, block_idx: u64) -> Result<()> {
+        // Check cache first to avoid rescans.
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            let entry = cache.entry(rel.to_path_buf()).or_default();
+            if entry.materialized.contains(&block_idx) {
+                self.inner
+                    .metrics
+                    .cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(path = %rel.display(), block = block_idx, "block_cache_hit_materialized");
+                return Ok(());
+            }
+            if let Some(source) = entry.sources.get(&block_idx).copied() {
+                self.inner
+                    .metrics
+                    .cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(path = %rel.display(), block = block_idx, source = ?source, "block_cache_hit_source");
+                drop(cache);
+                return self.copy_block(rel, block_idx, source);
+            }
+            self.inner
+                .metrics
+                .cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(path = %rel.display(), block = block_idx, "block_cache_miss");
+        }
+
+        let source = match self.locate_block_source(rel, block_idx)? {
+            Some(s) => s,
+            None => return Err(io::Error::from(io::ErrorKind::NotFound).into()),
+        };
+
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            let entry = cache.entry(rel.to_path_buf()).or_default();
+            entry.sources.insert(block_idx, source);
+        }
+
+        self.copy_block(rel, block_idx, source)
+    }
+
+    fn locate_block_source(&self, rel: &Path, block_idx: u64) -> Result<Option<BlockSource>> {
+        self.locate_block_source_from(rel, block_idx, 0)
+    }
+
+    fn locate_block_source_from(
+        &self,
+        rel: &Path,
+        block_idx: u64,
+        start_layer: usize,
+    ) -> Result<Option<BlockSource>> {
+        let block_offset = self.block_offset(block_idx);
+        let diff_path = self.inner.diff.join(rel);
+        let cache = self.inner.cache.lock().unwrap();
+        if let Some(entry) = cache.get(rel) {
+            if entry.materialized.contains(&block_idx) {
+                let src = BlockSource::Diff;
+                debug!(path = %rel.display(), block = block_idx, source = ?src, "block_source_cache_materialized");
+                return Ok(Some(src));
+            }
+        } else if let Ok(meta) = fs::metadata(&diff_path) {
+            if meta.len() > block_offset {
+                // Fresh cache but diff already has data (likely reuse path).
+                let src = BlockSource::Diff;
+                debug!(path = %rel.display(), block = block_idx, source = ?src, "block_source_diff_reused");
+                return Ok(Some(src));
+            }
+        }
+        drop(cache);
+
+        for (idx, layer) in self.inner.layers.iter().enumerate().skip(start_layer) {
+            let path = layer.root.join(rel);
+            if !path.exists() {
+                continue;
+            }
+            if layer.incremental {
+                if let Some(pagemap) = self.load_pagemap(&path)? {
+                    if !pagemap.contains(&(block_idx as u32)) {
+                        continue;
+                    }
+                }
+                let src = BlockSource::Layer { idx };
+                debug!(path = %rel.display(), block = block_idx, layer = idx, source = ?src, "block_source_layer_incremental");
+                return Ok(Some(src));
+            }
+
+            let src = BlockSource::Layer { idx };
+            debug!(path = %rel.display(), block = block_idx, layer = idx, source = ?src, "block_source_layer_full");
+            return Ok(Some(src));
+        }
+
+        if self.is_pg_datafile(rel) {
+            let src = BlockSource::Zero;
+            debug!(path = %rel.display(), block = block_idx, source = ?src, "block_source_zero_pgdata");
+            return Ok(Some(src));
+        }
+
+        Ok(None)
+    }
+
+    fn copy_block(&self, rel: &Path, block_idx: u64, source: BlockSource) -> Result<()> {
+        let offset = self.block_offset(block_idx);
+        let block_size = self.inner.block_size.get();
+
+        let maybe_data = match source {
+            BlockSource::Diff => None, // already present
+            BlockSource::Zero => Some(vec![0u8; block_size]),
+            BlockSource::Layer { idx } => {
+                let layer = &self.inner.layers[idx];
+                let path = layer.root.join(rel);
+                let file_algo = self.file_compression_for_layer(idx, rel);
+                let data = if layer.incremental {
+                    let has_pagemap = path.with_extension("pagemap").exists();
+                    if has_pagemap || self.is_pg_datafile(rel) {
+                        // Incremental page-mode files use per-page BackupPageHeader records.
+                        self.read_pg_data_block(rel, &path, file_algo, block_idx)?
+                    } else {
+                        // Non-page incremental entries are stored as whole files.
+                        self.read_full_block(rel, &path, layer, file_algo, block_idx)?
+                    }
+                } else {
+                    self.read_full_block(rel, &path, layer, file_algo, block_idx)?
+                };
+
+                if data.is_none() {
+                    if let Some(next) = self.locate_block_source_from(rel, block_idx, idx + 1)? {
+                        if let Ok(mut cache) = self.inner.cache.lock() {
+                            let entry = cache.entry(rel.to_path_buf()).or_default();
+                            entry.sources.insert(block_idx, next);
+                        }
+                        return self.copy_block(rel, block_idx, next);
+                    }
+                }
+
+                data
+            }
+        };
+
+        let mark_materialized = matches!(source, BlockSource::Diff) || maybe_data.is_some();
+
+        if let Some(data) = maybe_data {
+            let diff_path = self.inner.diff.join(rel);
+            if let Some(parent) = diff_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let out = fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&diff_path)?;
+            out.write_all_at(&data, offset)?;
+            // Preserve the logical file length reported by source layers without
+            // artificially extending to full block size for small files.
+            let data_end = offset.saturating_add(data.len() as u64);
+
+            // Computing logical length for PostgreSQL datafiles can be
+            // expensive (it may require scanning pg_probackup page streams).
+            // Cache it per-path so we only pay this cost once per file instead
+            // of once per block during large sequential reads (e.g. `cmp`).
+            let logical_len = self.cached_logical_len(rel)?.unwrap_or(data_end);
+            let required_len = logical_len.max(data_end);
+            if out.metadata()?.len() < required_len {
+                out.set_len(required_len)?;
+            }
+            let file_len = out.metadata()?.len();
+            debug!(
+                path = %rel.display(),
+                block = block_idx,
+                bytes = data.len(),
+                source = ?source,
+                logical_len = required_len,
+                file_len,
+                "block_copy_up"
+            );
+            self.inner
+                .metrics
+                .blocks_copied
+                .fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .metrics
+                .bytes_copied
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
+
+        if !mark_materialized {
+            return Ok(());
+        }
+
+        // Mark materialized in cache.
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            let entry = cache.entry(rel.to_path_buf()).or_default();
+            entry.materialized.insert(block_idx);
+        }
+
+        Ok(())
+    }
+
+    /// Cached wrapper around `logical_len()` that avoids recomputing logical
+    /// length for the same path, which for PostgreSQL datafiles would
+    /// repeatedly rescan pg_probackup page streams and dominate I/O during
+    /// large sequential reads.
+    fn cached_logical_len(&self, rel: &Path) -> Result<Option<u64>> {
+        // Fast path: if we already cached a non-empty logical length, use it.
+        if let Ok(cache) = self.inner.cache.lock() {
+            if let Some(entry) = cache.get(rel) {
+                if let Some(len) = entry.logical_len {
+                    return Ok(Some(len));
+                }
+            }
+        }
+
+        // Compute logical length once and remember successful result.
+        let len = self.logical_len(rel)?;
+        if let Some(actual) = len {
+            if let Ok(mut cache) = self.inner.cache.lock() {
+                let entry = cache.entry(rel.to_path_buf()).or_default();
+                entry.logical_len = Some(actual);
+            }
+        }
+        Ok(len)
+    }
+
+    #[allow(dead_code)]
+    fn read_incremental_block(
+        &self,
+        rel: &Path,
+        inc_path: &Path,
+        layer: &Layer,
+        block_idx: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        if !inc_path.exists() {
+            return Ok(None);
+        }
+
+        let mut reader = self.open_incremental_reader(inc_path, layer.compression)?;
+        let mut hdr = [0u8; std::mem::size_of::<BackupPageHeader>()];
+
+        loop {
+            match reader.read_exact(&mut hdr) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+
+            let block = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            let compressed_size = i32::from_le_bytes(hdr[4..8].try_into().unwrap());
+
+            if compressed_size == PAGE_TRUNCATED {
+                // Truncation marker means there are no further blocks.
+                if block_idx >= block as u64 {
+                    return Ok(None);
+                }
+                break;
+            }
+
+            if compressed_size <= 0 {
+                return Err(Error::InvalidIncrementalPageSize {
+                    path: rel.display().to_string(),
+                    block,
+                    expected: self.inner.block_size.get(),
+                    actual: compressed_size.max(0) as usize,
+                }
+                .into());
+            }
+
+            let mut buf = vec![0u8; compressed_size as usize];
+            reader.read_exact(&mut buf)?;
+
+            if block as u64 == block_idx {
+                let page =
+                    self.decompress_page_if_needed(layer.compression, compressed_size, buf)?;
+                if page.len() != self.inner.block_size.get() {
+                    return Err(Error::InvalidIncrementalPageSize {
+                        path: rel.display().to_string(),
+                        block,
+                        expected: self.inner.block_size.get(),
+                        actual: page.len(),
+                    }
+                    .into());
+                }
+                return Ok(Some(page));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn read_full_block(
+        &self,
+        rel: &Path,
+        base_path: &Path,
+        _layer: &Layer,
+        compression: Option<CompressionAlgorithm>,
+        block_idx: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        // For WAL files we bypass block-walk and materialize via legacy copy-up.
+        if rel.to_string_lossy().contains("pg_wal") && compression.is_some() {
+            self.inner
+                .metrics
+                .fallback_used
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(path = %rel.display(), block = block_idx, algo = ?compression, "wal_fallback_full_copy");
+            self.ensure_copy_up(rel)?;
+            return Ok(None);
+        }
+
+        if self.is_pg_datafile(rel) {
+            return self.read_pg_data_block(rel, base_path, compression, block_idx);
+        }
+
+        // Compressed non-data files (both FULL and incremental) are stored as
+        // whole files, not per-page streams. Materialize a single decompressed
+        // copy in the diff directory from the newest matching layer and serve
+        // reads from there instead of falling back to older layers.
+        if compression.is_some() {
+            self.inner
+                .metrics
+                .fallback_used
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                path = %rel.display(),
+                block = block_idx,
+                algo = ?compression,
+                "block_fallback_full_copy"
+            );
+
+            self.ensure_copy_up(rel)?;
+
+            let diff_path = self.inner.diff.join(rel);
+            if !diff_path.exists() {
+                return Ok(None);
+            }
+
+            let mut buf = vec![0u8; self.inner.block_size.get()];
+            let file = fs::File::open(&diff_path)?;
+            let read = file.read_at(&mut buf, self.block_offset(block_idx))?;
+            if read == 0 {
+                return Ok(None);
+            }
+            buf.truncate(read);
+            return Ok(Some(buf));
+        }
+
+        if !base_path.exists() {
+            return Ok(None);
+        }
+
+        let mut buf = vec![0u8; self.inner.block_size.get()];
+        let file = fs::File::open(base_path)?;
+        let read = file.read_at(&mut buf, self.block_offset(block_idx))?;
+        if read == 0 {
+            return Ok(None);
+        }
+        buf.truncate(read);
+        Ok(Some(buf))
+    }
+
+    fn read_pg_data_block(
+        &self,
+        rel: &Path,
+        src: &Path,
+        compression: Option<CompressionAlgorithm>,
+        block_idx: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        // Build or reuse block index to avoid rescanning the whole file.
+        let index = self.pg_block_index(rel, src)?;
+
+        let target = index.iter().find(|e| e.block as u64 == block_idx);
+        let target = match target {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let mut reader = fs::File::open(src)?;
+        reader.seek(SeekFrom::Start(target.offset))?;
+        let mut buf = vec![0u8; target.compressed_size as usize];
+        reader.read_exact(&mut buf)?;
+
+        let page = self.decompress_page_if_needed(compression, target.compressed_size, buf)?;
+        if page.len() != self.inner.block_size.get() {
+            return Err(Error::InvalidIncrementalPageSize {
+                path: rel.display().to_string(),
+                block: target.block,
+                expected: self.inner.block_size.get(),
+                actual: page.len(),
+            }
+            .into());
+        }
+        Ok(Some(page))
+    }
+
+    fn block_offset(&self, block_idx: u64) -> u64 {
+        block_idx * self.inner.block_size.get() as u64
+    }
+
     pub fn write(&self, relative: impl AsRef<Path>, contents: &[u8]) -> Result<()> {
         let rel = relative.as_ref();
         let path = self.inner.diff.join(rel);
@@ -150,6 +897,7 @@ impl Overlay {
             fs::create_dir_all(parent)?;
         }
         fs::write(path, contents)?;
+        self.invalidate_cache(rel);
         Ok(())
     }
 
@@ -180,6 +928,14 @@ impl Overlay {
         &self.inner.diff
     }
 
+    pub fn block_size(&self) -> usize {
+        self.inner.block_size.get()
+    }
+
+    pub fn metrics(&self) -> OverlayMetrics {
+        self.inner.metrics.snapshot()
+    }
+
     pub fn compression_algorithm(&self) -> Option<CompressionAlgorithm> {
         self.inner.layers.iter().find_map(|l| l.compression)
     }
@@ -190,6 +946,222 @@ impl Overlay {
             .iter()
             .map(|l| (l.root.clone(), l.compression))
             .collect()
+    }
+
+    /// Public wrapper for computing logical length of a path as seen through the
+    /// overlay (diff + all layers).
+    ///
+    /// Used by the FUSE adapter to report file sizes that match what PostgreSQL
+    /// and `pg_probackup restore` see, rather than raw on-disk sizes of backup
+    /// files (e.g. pg_probackup page streams with per-page headers).
+    pub fn logical_len_for(&self, relative: impl AsRef<Path>) -> Result<Option<u64>> {
+        let rel = relative.as_ref();
+        self.cached_logical_len(rel)
+    }
+
+    pub fn top_layer_has_datafile(&self, relative: impl AsRef<Path>) -> bool {
+        let rel = relative.as_ref();
+
+        if !self.is_pg_datafile(rel) {
+            return false;
+        }
+
+        let top_root = match self.inner.layers.first() {
+            Some(layer) => layer.root.clone(),
+            None => return false,
+        };
+
+        let mut cache = match self.inner.file_meta.lock() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        let layer_map = if let Some(m) = cache.get(&top_root) {
+            m
+        } else {
+            let map = Self::load_backup_content_for_root(&top_root);
+            cache.insert(top_root.clone(), map);
+            cache.get(&top_root).unwrap()
+        };
+
+        let key = rel.to_string_lossy();
+        if let Some(meta) = layer_map.get(key.as_ref()) {
+            meta.is_datafile && meta.external_dir_num == 0
+        } else {
+            false
+        }
+    }
+
+    /// Return names of virtual datafiles that exist only in backup metadata
+    /// (backup_content.control) for the newest layer but are missing from all
+    /// physical layers and diff, scoped to a given directory.
+    pub fn virtual_datafile_children(&self, rel: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+
+        // We only ever synthesize datafiles for the newest layer (target backup).
+        let top_root = match self.inner.layers.first() {
+            Some(layer) => layer.root.clone(),
+            None => return out,
+        };
+
+        // Root directory is always backed by a real directory; we only synthesize
+        // children inside existing directories like base/DBOID, global, etc.
+        if rel.as_os_str().is_empty() {
+            return out;
+        }
+
+        let mut cache = match self.inner.file_meta.lock() {
+            Ok(c) => c,
+            Err(_) => return out,
+        };
+
+        let layer_map = if let Some(m) = cache.get(&top_root) {
+            m
+        } else {
+            let map = Self::load_backup_content_for_root(&top_root);
+            cache.insert(top_root.clone(), map);
+            cache.get(&top_root).unwrap()
+        };
+
+        for (path, meta) in layer_map.iter() {
+            if !meta.is_datafile || meta.external_dir_num != 0 {
+                continue;
+            }
+            let entry_path = Path::new(path);
+
+            // Only consider direct children of `rel`.
+            if entry_path.parent() != Some(rel) {
+                continue;
+            }
+
+            // Skip files that already exist in diff or any base layer.
+            if self.inner.diff.join(entry_path).exists() {
+                continue;
+            }
+            if !self.matching_layers(entry_path).is_empty() {
+                continue;
+            }
+
+            if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                out.push(name.to_string());
+            }
+        }
+
+        out
+    }
+
+    /// Determine per-file compression algorithm for a given layer and relative
+    /// path using pg_probackup's `backup_content.control`, falling back to
+    /// backup-level compression when file-level metadata is missing.
+    fn file_compression_for_layer(
+        &self,
+        layer_idx: usize,
+        rel: &Path,
+    ) -> Option<CompressionAlgorithm> {
+        // Datafiles continue to use backup-level compression; pg_probackup
+        // writes page streams for them and we already interpret those at the
+        // page level.
+        if self.is_pg_datafile(rel) {
+            return self.inner.layers.get(layer_idx).and_then(|l| l.compression);
+        }
+
+        let layer_comp = self.inner.layers.get(layer_idx).and_then(|l| l.compression);
+
+        let root = match self.inner.layers.get(layer_idx) {
+            Some(layer) => layer.root.clone(),
+            None => return layer_comp,
+        };
+
+        let rel_key = rel.to_string_lossy().to_string();
+
+        // Fast path: try to read from cache, populating per-layer metadata map
+        // on first access. If there is no entry for `rel_key` in
+        // backup_content.control (or the file is not listed there at all),
+        // fall back to the backup-level compression algorithm.
+        if let Ok(mut cache) = self.inner.file_meta.lock() {
+            let layer_map = if let Some(existing) = cache.get(&root) {
+                existing
+            } else {
+                let map = Self::load_backup_content_for_root(&root);
+                cache.insert(root.clone(), map);
+                cache.get(&root).unwrap()
+            };
+
+            if let Some(meta) = layer_map.get(&rel_key) {
+                // Honour explicit per-file compression ("zlib", "lz4",
+                // "zstd" or "none") without falling back to the backup-level
+                // algorithm. When compress_alg = "none" in
+                // backup_content.control, pg_probackup stores this file
+                // uncompressed even if the backup as a whole is compressed.
+                return meta.compression;
+            }
+        }
+
+        // No per-file metadata: use backup-level compression, if any.
+        layer_comp
+    }
+
+    fn load_backup_content_for_root(root: &Path) -> HashMap<String, FileMeta> {
+        let mut result = HashMap::new();
+        let parent = match root.parent() {
+            Some(p) => p,
+            None => return result,
+        };
+
+        let path = parent.join("backup_content.control");
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return result,
+        };
+
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let entry: BackupContentEntry = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let alg = entry.compress_alg.as_ref().and_then(|s| {
+                if s.eq_ignore_ascii_case("none") {
+                    None
+                } else {
+                    CompressionAlgorithm::from_pg_probackup(s).ok()
+                }
+            });
+
+            let is_datafile = entry
+                .is_datafile
+                .as_ref()
+                .map(|s| s == "1")
+                .unwrap_or(false);
+
+            let external_dir_num = entry
+                .external_dir_num
+                .as_ref()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+
+            result.insert(
+                entry.path,
+                FileMeta {
+                    compression: alg,
+                    is_datafile,
+                    external_dir_num,
+                },
+            );
+        }
+
+        result
+    }
+
+    pub(crate) fn invalidate_cache(&self, rel: &Path) {
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            cache.remove(rel);
+        }
     }
 
     /// Ensure a diff-side copy exists for the provided relative path, performing
@@ -203,11 +1175,16 @@ impl Overlay {
         let matches = self.matching_layers(rel);
         if matches.is_empty() {
             // If this looks like a main-fork relation file (datafile) but is
-            // absent from all layers, it most likely represents a relation
-            // that existed but had no pages at backup time. PostgreSQL and
-            // pg_probackup restore such relations as zero-length files, so
-            // materialize an empty file in the diff to match that behavior.
+            // absent from all layers, it may represent either:
+            //   - a relation that existed but had no pages at backup time
+            //     (present in backup_content.control, size == 0), or
+            //   - a relation that was dropped before the target backup
+            //     (absent from backup_content.control for the top layer).
+            // Only the first case should materialize a zero-length file.
             if self.is_pg_datafile(rel) {
+                if !self.top_layer_has_datafile(rel) {
+                    return Err(io::Error::from(io::ErrorKind::NotFound).into());
+                }
                 if let Some(parent) = diff_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -247,6 +1224,23 @@ impl Overlay {
         }
 
         if top_layer.incremental {
+            let has_pagemap = top_path.with_extension("pagemap").exists();
+
+            // Non-data files in DELTA/PAGE backups are stored as whole files, not
+            // per-page BackupPageHeader streams. Treat them as full-file copies to
+            // avoid mis-parsing (e.g., WAL segments, config files).
+            if !has_pagemap && !self.is_pg_datafile(rel) {
+                if let Some(parent) = diff_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let file_algo = self.file_compression_for_layer(*top_idx, rel);
+                if let Some(algo) = file_algo {
+                    return self.decompress_file(rel, top_path, &diff_path, algo);
+                }
+                fs::copy(top_path, &diff_path)?;
+                return Ok(());
+            }
+
             return self.materialize_incremental_chain(rel, &diff_path, matches);
         }
 
@@ -262,7 +1256,7 @@ impl Overlay {
             );
         }
 
-        if let Some(algo) = top_layer.compression {
+        if let Some(algo) = self.file_compression_for_layer(*top_idx, rel) {
             return self.decompress_file(rel, top_path, &diff_path, algo);
         }
 
@@ -465,7 +1459,7 @@ impl Overlay {
             let compressed_size = i32::from_le_bytes(hdr[4..8].try_into().unwrap());
 
             if compressed_size == PAGE_TRUNCATED {
-                out.set_len(block as u64 * BLCKSZ as u64)?;
+                out.set_len(block as u64 * self.inner.block_size.get() as u64)?;
                 break;
             }
 
@@ -473,7 +1467,7 @@ impl Overlay {
                 return Err(Error::InvalidIncrementalPageSize {
                     path: rel.display().to_string(),
                     block,
-                    expected: BLCKSZ,
+                    expected: self.inner.block_size.get(),
                     actual: compressed_size.max(0) as usize,
                 }
                 .into());
@@ -484,17 +1478,17 @@ impl Overlay {
 
             let page = self.decompress_page_if_needed(layer.compression, compressed_size, buf)?;
 
-            if page.len() != BLCKSZ {
+            if page.len() != self.inner.block_size.get() {
                 return Err(Error::InvalidIncrementalPageSize {
                     path: rel.display().to_string(),
                     block,
-                    expected: BLCKSZ,
+                    expected: self.inner.block_size.get(),
                     actual: page.len(),
                 }
                 .into());
             }
 
-            out.write_all_at(&page, block as u64 * BLCKSZ as u64)?;
+            out.write_all_at(&page, block as u64 * self.inner.block_size.get() as u64)?;
             seen.insert(block);
         }
 
@@ -527,9 +1521,18 @@ impl Overlay {
         compressed_size: i32,
         buf: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        if compressed_size as usize != BLCKSZ {
+        if compressed_size as usize != self.inner.block_size.get() {
             if let Some(algo) = compression {
-                return self.decompress_page(algo, &buf);
+                let start = Instant::now();
+                let out = self.decompress_page(algo, &buf)?;
+                debug!(
+                    algo = ?algo,
+                    compressed_size,
+                    block_size = self.inner.block_size.get(),
+                    elapsed_us = start.elapsed().as_micros() as u64,
+                    "decompress_page"
+                );
+                return Ok(out);
             }
         }
         Ok(buf)
@@ -548,6 +1551,71 @@ impl Overlay {
             CompressionAlgorithm::Zstd => zstd::stream::decode_all(data)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e).into()),
         }
+    }
+
+    /// Build or fetch from cache the pg_probackup block index for a given
+    /// relation path and physical source file. Shared between logical length
+    /// calculation and page reads so that we scan the on-disk page stream at
+    /// most once per file.
+    fn pg_block_index(&self, rel: &Path, src: &Path) -> Result<Vec<BlockIndexEntry>> {
+        let mut cache = self.inner.cache.lock().unwrap();
+        let entry = cache.entry(rel.to_path_buf()).or_default();
+        if let Some(idx) = entry.pg_block_index.get(src) {
+            return Ok(idx.clone());
+        }
+        drop(cache);
+
+        let built = self.build_pg_block_index(rel, src)?;
+        let mut cache = self.inner.cache.lock().unwrap();
+        let entry = cache.entry(rel.to_path_buf()).or_default();
+        entry
+            .pg_block_index
+            .insert(src.to_path_buf(), built.clone());
+        Ok(built)
+    }
+
+    fn build_pg_block_index(&self, rel: &Path, src: &Path) -> Result<Vec<BlockIndexEntry>> {
+        let mut reader = BufReader::new(fs::File::open(src)?);
+        let mut header_buf = [0u8; std::mem::size_of::<BackupPageHeader>()];
+        let mut offset: u64 = 0;
+        let mut index = Vec::new();
+
+        loop {
+            match reader.read_exact(&mut header_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+
+            let block = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+            let compressed_size = i32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+
+            if compressed_size == PAGE_TRUNCATED {
+                break;
+            }
+
+            if compressed_size <= 0 || compressed_size as usize > self.inner.block_size.get() {
+                return Err(Error::InvalidIncrementalPageSize {
+                    path: rel.display().to_string(),
+                    block,
+                    expected: self.inner.block_size.get(),
+                    actual: compressed_size.max(0) as usize,
+                }
+                .into());
+            }
+
+            let data_offset = offset + header_buf.len() as u64;
+            index.push(BlockIndexEntry {
+                block,
+                offset: data_offset,
+                compressed_size,
+            });
+
+            reader.seek(SeekFrom::Current(compressed_size as i64))?;
+            offset = data_offset + compressed_size as u64;
+        }
+
+        Ok(index)
     }
 
     fn load_pagemap(&self, inc_path: &Path) -> Result<Option<HashSet<u32>>> {
@@ -640,7 +1708,7 @@ impl Overlay {
     /// The source file layout is:
     ///   [BackupPageHeader {block, compressed_size}] [page_bytes] ...
     /// Pages may be per-page compressed; for `compression = None` they are
-    /// stored uncompressed with `compressed_size == BLCKSZ`.
+    /// stored uncompressed with `compressed_size == block_size`.
     fn materialize_full_datafile(
         &self,
         rel: &Path,
@@ -694,7 +1762,7 @@ impl Overlay {
             let compressed_size = i32::from_le_bytes(header_buf[4..8].try_into().unwrap());
 
             if compressed_size == PAGE_TRUNCATED {
-                out.set_len(block as u64 * BLCKSZ as u64)?;
+                out.set_len(block as u64 * self.inner.block_size.get() as u64)?;
                 warn!(
                     "PAGE_TRUNCATED at block {} in {}; remaining data ignored",
                     block,
@@ -718,11 +1786,11 @@ impl Overlay {
                 break;
             }
 
-            if compressed_size <= 0 || compressed_size as usize > BLCKSZ {
+            if compressed_size <= 0 || compressed_size as usize > self.inner.block_size.get() {
                 return Err(Error::InvalidIncrementalPageSize {
                     path: rel.display().to_string(),
                     block,
-                    expected: BLCKSZ,
+                    expected: self.inner.block_size.get(),
                     actual: compressed_size.max(0) as usize,
                 }
                 .into());
@@ -733,22 +1801,22 @@ impl Overlay {
 
             let page = self.decompress_page_if_needed(compression, compressed_size, buf)?;
 
-            if page.len() != BLCKSZ {
+            if page.len() != self.inner.block_size.get() {
                 return Err(Error::InvalidIncrementalPageSize {
                     path: rel.display().to_string(),
                     block,
-                    expected: BLCKSZ,
+                    expected: self.inner.block_size.get(),
                     actual: page.len(),
                 }
                 .into());
             }
 
-            out.write_all_at(&page, block as u64 * BLCKSZ as u64)?;
+            out.write_all_at(&page, block as u64 * self.inner.block_size.get() as u64)?;
             max_block = Some(max_block.map_or(block, |b| b.max(block)));
         }
 
         if let Some(max_block) = max_block {
-            let expected_len = (max_block as u64 + 1) * BLCKSZ as u64;
+            let expected_len = (max_block as u64 + 1) * self.inner.block_size.get() as u64;
             let current_len = out.seek(SeekFrom::End(0))?;
             if current_len < expected_len {
                 out.set_len(expected_len)?;
