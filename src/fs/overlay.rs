@@ -372,15 +372,13 @@ impl Overlay {
     /// Compute logical length for PostgreSQL datafiles (tables and indexes)
     /// using page indexes rather than raw compressed file sizes.
     fn datafile_logical_len(&self, rel: &Path) -> Result<Option<u64>> {
-        // Prefer already-materialized diff copy.
-        let diff_path = self.inner.diff.join(rel);
-        if let Ok(meta) = fs::metadata(&diff_path) {
-            return Ok(Some(meta.len()));
-        }
-
         let matches = self.matching_layers(rel);
         if matches.is_empty() {
-            return Ok(None);
+            // Fall back to diff-only length for brand new relations.
+            let diff_len = fs::metadata(self.inner.diff.join(rel))
+                .map(|m| m.len())
+                .ok();
+            return Ok(diff_len);
         }
 
         let mut best = 0u64;
@@ -406,6 +404,11 @@ impl Overlay {
                     break;
                 }
             }
+        }
+
+        // Diff may contain user writes; prefer the larger of diff and layers.
+        if let Ok(meta) = fs::metadata(self.inner.diff.join(rel)) {
+            best = best.max(meta.len());
         }
 
         if best == 0 {
