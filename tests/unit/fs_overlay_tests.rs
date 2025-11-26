@@ -586,6 +586,118 @@ fn non_default_block_size_supported() -> pbkfs::Result<()> {
     Ok(())
 }
 
+#[test]
+fn pg_datafile_range_read_does_not_extend_past_logical_len() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    // Simulate a pg_probackup-style FULL datafile for relation "base/1/2662"
+    // stored as a stream of BackupPageHeader + BLCKSZ page records.
+    let rel = Path::new("base/1/2662");
+    let data_root = base.path().join("FULL").join("database");
+    let full_path = data_root.join(rel);
+    fs::create_dir_all(full_path.parent().unwrap())?;
+
+    // Build four pages with distinct byte patterns.
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&full_path)?;
+    for block in 0u32..4 {
+        let payload = vec![b'A' + (block as u8); BLCKSZ];
+        write_incremental_entry(&mut file, block, &payload)?;
+    }
+
+    // Single FULL layer providing the per-page formatted datafile.
+    let layers = vec![Layer {
+        root: data_root.clone(),
+        compression: None,
+        incremental: false,
+        backup_mode: BackupMode::Full,
+    }];
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // First, read the existing 4 * BLCKSZ bytes and ensure diff length matches.
+    let first = overlay
+        .read_range(rel, 0, BLCKSZ * 4)?
+        .expect("existing range");
+    assert_eq!(first.len(), BLCKSZ * 4);
+    let diff_path = diff.path().join("data").join(rel);
+    let meta = fs::metadata(&diff_path)?;
+    assert_eq!(meta.len(), (BLCKSZ * 4) as u64);
+
+    // Then, read a range starting exactly at logical EOF; this must not
+    // materialize a new zero page or extend the diff-backed file.
+    let beyond = overlay.read_range(rel, (BLCKSZ * 4) as u64, BLCKSZ)?;
+    assert!(matches!(beyond, Some(buf) if buf.is_empty()));
+    let meta_after = fs::metadata(&diff_path)?;
+    assert_eq!(meta_after.len(), (BLCKSZ * 4) as u64);
+
+    Ok(())
+}
+
+#[test]
+fn compressed_incremental_non_data_prefers_newest_layer() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let inc_old = tempdir()?;
+    let inc_new = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("global/pg_control");
+
+    // Old incremental layer with uncompressed contents.
+    let old_root = inc_old.path().join("INC_OLD");
+    fs::create_dir_all(old_root.join("global"))?;
+    fs::write(old_root.join(rel), b"OLDER_CTRL")?;
+
+    // Newest incremental layer: pg_control is stored as a plain control file
+    // even when backup-level compression is enabled. We still mark the layer
+    // as compressed in metadata to ensure the overlay special-cases this path.
+    let new_root = inc_new.path().join("INC_NEW");
+    fs::create_dir_all(new_root.join("global"))?;
+    fs::write(new_root.join(rel), b"NEW_CTRL")?;
+
+    // Base FULL layer with different contents.
+    let base_root = base.path().join("FULL");
+    fs::create_dir_all(base_root.join("global"))?;
+    fs::write(base_root.join(rel), b"BASE_CTRL")?;
+
+    let layers = vec![
+        Layer {
+            root: new_root.clone(),
+            compression: Some(CompressionAlgorithm::Zlib),
+            incremental: true,
+            backup_mode: BackupMode::Delta,
+        },
+        Layer {
+            root: old_root.clone(),
+            compression: None,
+            incremental: true,
+            backup_mode: BackupMode::Delta,
+        },
+        Layer {
+            root: base_root.clone(),
+            compression: None,
+            incremental: false,
+            backup_mode: BackupMode::Full,
+        },
+    ];
+
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // Range read must materialize from the newest compressed incremental layer.
+    let page = overlay
+        .read_range(rel, 0, BLCKSZ)?
+        .expect("pg_control contents");
+    assert!(page.starts_with(b"NEW_CTRL"));
+
+    let diff_path = diff.path().join("data").join(rel);
+    let diff_bytes = fs::read(diff_path)?;
+    assert!(diff_bytes.starts_with(b"NEW_CTRL"));
+
+    Ok(())
+}
+
 fn write_incremental_entry(file: &mut fs::File, block: u32, payload: &[u8]) -> pbkfs::Result<()> {
     file.write_all(&block.to_le_bytes())?;
     let size = payload.len() as i32;

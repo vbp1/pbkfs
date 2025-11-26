@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs, io,
-    io::{BufReader, Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     num::NonZeroUsize,
     os::unix::fs::{symlink, FileExt},
     path::{Path, PathBuf},
@@ -19,6 +19,7 @@ use crate::{
     backup::metadata::{BackupMode, CompressionAlgorithm},
     Error, Result,
 };
+use serde::Deserialize;
 use tracing::{debug, warn};
 use walkdir::WalkDir;
 
@@ -35,6 +36,24 @@ const MAX_SEGMENT_DIGITS: usize = 5;
 struct BackupPageHeader {
     block: u32,
     compressed_size: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileMeta {
+    compression: Option<CompressionAlgorithm>,
+    is_datafile: bool,
+    external_dir_num: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupContentEntry {
+    path: String,
+    #[serde(rename = "compress_alg")]
+    compress_alg: Option<String>,
+    #[serde(rename = "is_datafile")]
+    is_datafile: Option<String>,
+    #[serde(rename = "external_dir_num")]
+    external_dir_num: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +131,9 @@ struct OverlayInner {
     inflight: Mutex<HashSet<PathBuf>>, // tracks in-progress copy-ups per path
     cache: Mutex<HashMap<PathBuf, BlockCacheEntry>>,
     metrics: OverlayMetricsInner,
+    // Per-layer file metadata loaded from pg_probackup's backup_content.control.
+    // Keyed by layer root -> relative path -> metadata.
+    file_meta: Mutex<HashMap<PathBuf, HashMap<String, FileMeta>>>,
 }
 
 impl Overlay {
@@ -211,6 +233,7 @@ impl Overlay {
                 inflight: Mutex::new(HashSet::new()),
                 cache: Mutex::new(HashMap::new()),
                 metrics: OverlayMetricsInner::default(),
+                file_meta: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -280,12 +303,18 @@ impl Overlay {
             return Ok(None);
         }
 
-        if !self.is_pg_datafile(rel) {
-            if let Some(len) = self.logical_len(rel)? {
-                if offset >= len {
-                    return Ok(Some(Vec::new()));
-                }
+        // Respect logical length for all files (including PostgreSQL datafiles).
+        // For heap/index files stored in pg_probackup's per-page format, this
+        // uses page indexes rather than raw physical sizes to avoid extending
+        // relations past their recorded length.
+        let mut end_offset = offset.saturating_add(size as u64);
+        if let Some(len) = self.logical_len(rel)? {
+            if offset >= len {
+                return Ok(Some(Vec::new()));
             }
+            // Clamp reads that run past EOF so we only materialize existing
+            // logical blocks instead of synthesizing trailing zero pages.
+            end_offset = end_offset.min(len);
         }
 
         if let Some(parent) = diff_path.parent() {
@@ -296,7 +325,6 @@ impl Overlay {
 
         let read_start = Instant::now();
 
-        let end_offset = offset.saturating_add(size as u64);
         if size == 0 {
             return Ok(Some(Vec::new()));
         }
@@ -342,10 +370,34 @@ impl Overlay {
     }
 
     fn logical_len(&self, rel: &Path) -> Result<Option<u64>> {
+        // For PostgreSQL transaction/status files we should not combine lengths
+        // from multiple backups: use the diff file if present, otherwise the
+        // file from the newest matching layer only.
+        if self.is_system_status_file(rel) {
+            let diff_path = self.inner.diff.join(rel);
+            if let Ok(meta) = fs::metadata(&diff_path) {
+                return Ok(Some(meta.len()));
+            }
+
+            let matches = self.matching_layers(rel);
+            if let Some((_, path)) = matches.first() {
+                if let Ok(meta) = fs::metadata(path) {
+                    return Ok(Some(meta.len()));
+                }
+            }
+            return Ok(None);
+        }
+
         // For heap/index files stored in page-mode format, physical file size
         // (with per-page headers/compression) is not the logical size. Derive
         // length from the highest page number we can observe.
         if self.is_pg_datafile(rel) {
+            // If the top (target) backup does not list this relation as a
+            // datafile in backup_content.control, treat it as absent (e.g.,
+            // dropped relation) even if older backups still have the file.
+            if !self.top_layer_has_datafile(rel) {
+                return Ok(None);
+            }
             return self.datafile_logical_len(rel);
         }
 
@@ -418,6 +470,23 @@ impl Overlay {
         } else {
             Ok(Some(best))
         }
+    }
+
+    /// Identify PostgreSQL "status" files where PostgreSQL tracks transaction
+    /// state and similar metadata (pg_xact, pg_multixact, pg_subtrans,
+    /// pg_commit_ts). For these files pg_probackup restore effectively uses the
+    /// version from the destination backup itself; combining lengths from older
+    /// backups can extend them beyond what exists in the target backup.
+    fn is_system_status_file(&self, rel: &Path) -> bool {
+        let mut components = rel.components();
+        let first = match components.next() {
+            Some(c) => c.as_os_str().to_string_lossy(),
+            None => return false,
+        };
+        matches!(
+            first.as_ref(),
+            "pg_xact" | "pg_multixact" | "pg_subtrans" | "pg_commit_ts"
+        )
     }
 
     fn materialize_block(&self, rel: &Path, block_idx: u64) -> Result<()> {
@@ -530,17 +599,18 @@ impl Overlay {
             BlockSource::Layer { idx } => {
                 let layer = &self.inner.layers[idx];
                 let path = layer.root.join(rel);
+                let file_algo = self.file_compression_for_layer(idx, rel);
                 let data = if layer.incremental {
                     let has_pagemap = path.with_extension("pagemap").exists();
                     if has_pagemap || self.is_pg_datafile(rel) {
                         // Incremental page-mode files use per-page BackupPageHeader records.
-                        self.read_pg_data_block(rel, &path, layer.compression, block_idx)?
+                        self.read_pg_data_block(rel, &path, file_algo, block_idx)?
                     } else {
                         // Non-page incremental entries are stored as whole files.
-                        self.read_full_block(rel, &path, layer, block_idx)?
+                        self.read_full_block(rel, &path, layer, file_algo, block_idx)?
                     }
                 } else {
-                    self.read_full_block(rel, &path, layer, block_idx)?
+                    self.read_full_block(rel, &path, layer, file_algo, block_idx)?
                 };
 
                 if data.is_none() {
@@ -682,33 +752,56 @@ impl Overlay {
         &self,
         rel: &Path,
         base_path: &Path,
-        layer: &Layer,
+        _layer: &Layer,
+        compression: Option<CompressionAlgorithm>,
         block_idx: u64,
     ) -> Result<Option<Vec<u8>>> {
         // For WAL files we bypass block-walk and materialize via legacy copy-up.
-        if rel.to_string_lossy().contains("pg_wal") && layer.compression.is_some() {
+        if rel.to_string_lossy().contains("pg_wal") && compression.is_some() {
             self.inner
                 .metrics
                 .fallback_used
                 .fetch_add(1, Ordering::Relaxed);
-            debug!(path = %rel.display(), block = block_idx, algo = ?layer.compression, "wal_fallback_full_copy");
+            debug!(path = %rel.display(), block = block_idx, algo = ?compression, "wal_fallback_full_copy");
             self.ensure_copy_up(rel)?;
             return Ok(None);
         }
 
         if self.is_pg_datafile(rel) {
-            return self.read_pg_data_block(rel, base_path, layer.compression, block_idx);
+            return self.read_pg_data_block(rel, base_path, compression, block_idx);
         }
 
-        // Compressed non-data files fallback to full copy-up for now.
-        if layer.compression.is_some() {
+        // Compressed non-data files (both FULL and incremental) are stored as
+        // whole files, not per-page streams. Materialize a single decompressed
+        // copy in the diff directory from the newest matching layer and serve
+        // reads from there instead of falling back to older layers.
+        if compression.is_some() {
             self.inner
                 .metrics
                 .fallback_used
                 .fetch_add(1, Ordering::Relaxed);
-            debug!(path = %rel.display(), block = block_idx, algo = ?layer.compression, "block_fallback_full_copy");
+            debug!(
+                path = %rel.display(),
+                block = block_idx,
+                algo = ?compression,
+                "block_fallback_full_copy"
+            );
+
             self.ensure_copy_up(rel)?;
-            return Ok(None);
+
+            let diff_path = self.inner.diff.join(rel);
+            if !diff_path.exists() {
+                return Ok(None);
+            }
+
+            let mut buf = vec![0u8; self.inner.block_size.get()];
+            let file = fs::File::open(&diff_path)?;
+            let read = file.read_at(&mut buf, self.block_offset(block_idx))?;
+            if read == 0 {
+                return Ok(None);
+            }
+            buf.truncate(read);
+            return Ok(Some(buf));
         }
 
         if !base_path.exists() {
@@ -836,6 +929,206 @@ impl Overlay {
             .collect()
     }
 
+    /// Public wrapper for computing logical length of a path as seen through the
+    /// overlay (diff + all layers).
+    ///
+    /// Used by the FUSE adapter to report file sizes that match what PostgreSQL
+    /// and `pg_probackup restore` see, rather than raw on-disk sizes of backup
+    /// files (e.g. pg_probackup page streams with per-page headers).
+    pub fn logical_len_for(&self, relative: impl AsRef<Path>) -> Result<Option<u64>> {
+        let rel = relative.as_ref();
+        self.logical_len(rel)
+    }
+
+    pub fn top_layer_has_datafile(&self, relative: impl AsRef<Path>) -> bool {
+        let rel = relative.as_ref();
+
+        if !self.is_pg_datafile(rel) {
+            return false;
+        }
+
+        let top_root = match self.inner.layers.first() {
+            Some(layer) => layer.root.clone(),
+            None => return false,
+        };
+
+        let mut cache = match self.inner.file_meta.lock() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        let layer_map = if let Some(m) = cache.get(&top_root) {
+            m
+        } else {
+            let map = Self::load_backup_content_for_root(&top_root);
+            cache.insert(top_root.clone(), map);
+            cache.get(&top_root).unwrap()
+        };
+
+        let key = rel.to_string_lossy();
+        if let Some(meta) = layer_map.get(key.as_ref()) {
+            meta.is_datafile && meta.external_dir_num == 0
+        } else {
+            false
+        }
+    }
+
+    /// Return names of virtual datafiles that exist only in backup metadata
+    /// (backup_content.control) for the newest layer but are missing from all
+    /// physical layers and diff, scoped to a given directory.
+    pub fn virtual_datafile_children(&self, rel: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+
+        // We only ever synthesize datafiles for the newest layer (target backup).
+        let top_root = match self.inner.layers.first() {
+            Some(layer) => layer.root.clone(),
+            None => return out,
+        };
+
+        // Root directory is always backed by a real directory; we only synthesize
+        // children inside existing directories like base/DBOID, global, etc.
+        if rel.as_os_str().is_empty() {
+            return out;
+        }
+
+        let mut cache = match self.inner.file_meta.lock() {
+            Ok(c) => c,
+            Err(_) => return out,
+        };
+
+        let layer_map = if let Some(m) = cache.get(&top_root) {
+            m
+        } else {
+            let map = Self::load_backup_content_for_root(&top_root);
+            cache.insert(top_root.clone(), map);
+            cache.get(&top_root).unwrap()
+        };
+
+        for (path, meta) in layer_map.iter() {
+            if !meta.is_datafile || meta.external_dir_num != 0 {
+                continue;
+            }
+            let entry_path = Path::new(path);
+
+            // Only consider direct children of `rel`.
+            if entry_path.parent() != Some(rel) {
+                continue;
+            }
+
+            // Skip files that already exist in diff or any base layer.
+            if self.inner.diff.join(entry_path).exists() {
+                continue;
+            }
+            if !self.matching_layers(entry_path).is_empty() {
+                continue;
+            }
+
+            if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                out.push(name.to_string());
+            }
+        }
+
+        out
+    }
+
+    /// Determine per-file compression algorithm for a given layer and relative
+    /// path using pg_probackup's `backup_content.control`, falling back to
+    /// backup-level compression when file-level metadata is missing.
+    fn file_compression_for_layer(
+        &self,
+        layer_idx: usize,
+        rel: &Path,
+    ) -> Option<CompressionAlgorithm> {
+        // Datafiles continue to use backup-level compression; pg_probackup
+        // writes page streams for them and we already interpret those at the
+        // page level.
+        if self.is_pg_datafile(rel) {
+            return self.inner.layers.get(layer_idx).and_then(|l| l.compression);
+        }
+
+        let root = match self.inner.layers.get(layer_idx) {
+            Some(layer) => layer.root.clone(),
+            None => return None,
+        };
+
+        let rel_key = rel.to_string_lossy().to_string();
+
+        // Fast path: try to read from cache.
+        if let Ok(mut cache) = self.inner.file_meta.lock() {
+            if let Some(layer_map) = cache.get(&root) {
+                if let Some(meta) = layer_map.get(&rel_key) {
+                    return meta.compression;
+                }
+            } else {
+                // Populate per-layer metadata map on first access.
+                let map = Self::load_backup_content_for_root(&root);
+                let result = map.get(&rel_key).and_then(|m| m.compression);
+                cache.insert(root, map);
+                return result;
+            }
+        }
+
+        // If metadata is unavailable, fall back to backup-level compression.
+        self.inner.layers.get(layer_idx).and_then(|l| l.compression)
+    }
+
+    fn load_backup_content_for_root(root: &Path) -> HashMap<String, FileMeta> {
+        let mut result = HashMap::new();
+        let parent = match root.parent() {
+            Some(p) => p,
+            None => return result,
+        };
+
+        let path = parent.join("backup_content.control");
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return result,
+        };
+
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let entry: BackupContentEntry = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let alg = entry.compress_alg.as_ref().and_then(|s| {
+                if s.eq_ignore_ascii_case("none") {
+                    None
+                } else {
+                    CompressionAlgorithm::from_pg_probackup(s).ok()
+                }
+            });
+
+            let is_datafile = entry
+                .is_datafile
+                .as_ref()
+                .map(|s| s == "1")
+                .unwrap_or(false);
+
+            let external_dir_num = entry
+                .external_dir_num
+                .as_ref()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+
+            result.insert(
+                entry.path,
+                FileMeta {
+                    compression: alg,
+                    is_datafile,
+                    external_dir_num,
+                },
+            );
+        }
+
+        result
+    }
+
     pub(crate) fn invalidate_cache(&self, rel: &Path) {
         if let Ok(mut cache) = self.inner.cache.lock() {
             cache.remove(rel);
@@ -853,11 +1146,16 @@ impl Overlay {
         let matches = self.matching_layers(rel);
         if matches.is_empty() {
             // If this looks like a main-fork relation file (datafile) but is
-            // absent from all layers, it most likely represents a relation
-            // that existed but had no pages at backup time. PostgreSQL and
-            // pg_probackup restore such relations as zero-length files, so
-            // materialize an empty file in the diff to match that behavior.
+            // absent from all layers, it may represent either:
+            //   - a relation that existed but had no pages at backup time
+            //     (present in backup_content.control, size == 0), or
+            //   - a relation that was dropped before the target backup
+            //     (absent from backup_content.control for the top layer).
+            // Only the first case should materialize a zero-length file.
             if self.is_pg_datafile(rel) {
+                if !self.top_layer_has_datafile(rel) {
+                    return Err(io::Error::from(io::ErrorKind::NotFound).into());
+                }
                 if let Some(parent) = diff_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -901,12 +1199,13 @@ impl Overlay {
 
             // Non-data files in DELTA/PAGE backups are stored as whole files, not
             // per-page BackupPageHeader streams. Treat them as full-file copies to
-            // avoid mis-parsing (e.g., WAL segments, pg_control, config files).
+            // avoid mis-parsing (e.g., WAL segments, config files).
             if !has_pagemap && !self.is_pg_datafile(rel) {
                 if let Some(parent) = diff_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                if let Some(algo) = top_layer.compression {
+                let file_algo = self.file_compression_for_layer(*top_idx, rel);
+                if let Some(algo) = file_algo {
                     return self.decompress_file(rel, top_path, &diff_path, algo);
                 }
                 fs::copy(top_path, &diff_path)?;
@@ -928,7 +1227,7 @@ impl Overlay {
             );
         }
 
-        if let Some(algo) = top_layer.compression {
+        if let Some(algo) = self.file_compression_for_layer(*top_idx, rel) {
             return self.decompress_file(rel, top_path, &diff_path, algo);
         }
 
