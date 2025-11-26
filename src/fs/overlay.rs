@@ -91,7 +91,9 @@ impl OverlayMetricsInner {
 struct BlockCacheEntry {
     materialized: HashSet<u64>,
     sources: HashMap<u64, BlockSource>,
-    pg_block_index: Option<Vec<BlockIndexEntry>>,
+    // Block indexes per physical path (layer or diff file) to avoid mixing
+    // incremental/full variants of the same relation.
+    pg_block_index: HashMap<PathBuf, Vec<BlockIndexEntry>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -376,27 +378,40 @@ impl Overlay {
             return Ok(Some(meta.len()));
         }
 
-        // Use newest matching layer to infer the highest block.
         let matches = self.matching_layers(rel);
         if matches.is_empty() {
             return Ok(None);
         }
-        let (_idx, path) = &matches[0];
 
-        // Build or reuse block index to find the maximum block number.
-        let index = {
-            let mut cache = self.inner.cache.lock().unwrap();
-            let entry = cache.entry(rel.to_path_buf()).or_default();
-            if entry.pg_block_index.is_none() {
-                entry.pg_block_index = Some(self.build_pg_block_index(rel, path)?);
+        let mut best = 0u64;
+
+        for (idx, path) in matches {
+            let layer = &self.inner.layers[idx];
+
+            // For per-page stored files (all pg_probackup main-fork datafiles),
+            // inspect BackupPageHeader stream to find highest block.
+            let logical = match self.build_pg_block_index(rel, &path) {
+                Ok(index) if !index.is_empty() => index
+                    .iter()
+                    .map(|e| self.block_offset(e.block as u64 + 1))
+                    .max(),
+                _ => fs::metadata(&path).ok().map(|m| m.len()),
+            };
+
+            if let Some(len) = logical {
+                best = best.max(len);
+                // If we hit a full (non-incremental) layer, that's the base;
+                // later incrementals cannot extend logical length beyond it.
+                if !layer.incremental {
+                    break;
+                }
             }
-            entry.pg_block_index.as_ref().unwrap().clone()
-        };
+        }
 
-        let max_block = index.iter().map(|e| e.block as u64).max();
-        match max_block {
-            Some(b) => Ok(Some(self.block_offset(b + 1))),
-            None => Ok(Some(0)),
+        if best == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(best))
         }
     }
 
@@ -716,10 +731,18 @@ impl Overlay {
         let index = {
             let mut cache = self.inner.cache.lock().unwrap();
             let entry = cache.entry(rel.to_path_buf()).or_default();
-            if entry.pg_block_index.is_none() {
-                entry.pg_block_index = Some(self.build_pg_block_index(rel, src)?);
+            if let Some(idx) = entry.pg_block_index.get(src) {
+                idx.clone()
+            } else {
+                drop(cache);
+                let built = self.build_pg_block_index(rel, src)?;
+                let mut cache = self.inner.cache.lock().unwrap();
+                let entry = cache.entry(rel.to_path_buf()).or_default();
+                entry
+                    .pg_block_index
+                    .insert(src.to_path_buf(), built.clone());
+                built
             }
-            entry.pg_block_index.as_ref().unwrap().clone()
         };
 
         let target = index.iter().find(|e| e.block as u64 == block_idx);
