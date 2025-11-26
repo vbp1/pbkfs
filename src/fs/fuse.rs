@@ -250,16 +250,15 @@ impl OverlayFs {
                     // metadata. For forks (_fsm, _vm, etc.) we consult the
                     // main-fork relation path.
                     if idx > 0 {
-                        let (main_name, main_rel_path) = if let Some((base, _suffix)) =
-                            name.split_once('_')
-                        {
-                            // Handle forks like 16413_fsm, 16413_vm, etc.
-                            let mut p = rel.to_path_buf();
-                            p.push(base);
-                            (base.to_string(), p)
-                        } else {
-                            (name.clone(), child_rel.clone())
-                        };
+                        let (main_name, main_rel_path) =
+                            if let Some((base, _suffix)) = name.split_once('_') {
+                                // Handle forks like 16413_fsm, 16413_vm, etc.
+                                let mut p = rel.to_path_buf();
+                                p.push(base);
+                                (base.to_string(), p)
+                            } else {
+                                (name.clone(), child_rel.clone())
+                            };
 
                         if Self::is_rel_filename(&main_name)
                             && !self.overlay.top_layer_has_datafile(&main_rel_path)
