@@ -471,7 +471,14 @@ impl Overlay {
                 let layer = &self.inner.layers[idx];
                 let path = layer.root.join(rel);
                 let data = if layer.incremental {
-                    self.read_incremental_block(rel, &path, layer, block_idx)?
+                    let has_pagemap = path.with_extension("pagemap").exists();
+                    if has_pagemap || self.is_pg_datafile(rel) {
+                        // Incremental page-mode files use per-page BackupPageHeader records.
+                        self.read_pg_data_block(rel, &path, layer.compression, block_idx)?
+                    } else {
+                        // Non-page incremental entries are stored as whole files.
+                        self.read_full_block(rel, &path, layer, block_idx)?
+                    }
                 } else {
                     self.read_full_block(rel, &path, layer, block_idx)?
                 };
@@ -545,6 +552,7 @@ impl Overlay {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn read_incremental_block(
         &self,
         rel: &Path,
