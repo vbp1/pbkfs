@@ -113,6 +113,11 @@ struct BlockCacheEntry {
     // Block indexes per physical path (layer or diff file) to avoid mixing
     // incremental/full variants of the same relation.
     pg_block_index: HashMap<PathBuf, Vec<BlockIndexEntry>>,
+    // Cached logical length for this path. We only cache successful
+    // computations (Some(len)) to avoid repeatedly scanning large
+    // pg_probackup datafiles during sequential reads; `None` still
+    // means "not cached or no logical length".
+    logical_len: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -308,7 +313,7 @@ impl Overlay {
         // uses page indexes rather than raw physical sizes to avoid extending
         // relations past their recorded length.
         let mut end_offset = offset.saturating_add(size as u64);
-        if let Some(len) = self.logical_len(rel)? {
+        if let Some(len) = self.cached_logical_len(rel)? {
             if offset >= len {
                 return Ok(Some(Vec::new()));
             }
@@ -442,7 +447,7 @@ impl Overlay {
 
             // For per-page stored files (all pg_probackup main-fork datafiles),
             // inspect BackupPageHeader stream to find highest block.
-            let logical = match self.build_pg_block_index(rel, &path) {
+            let logical = match self.pg_block_index(rel, &path) {
                 Ok(index) if !index.is_empty() => index
                     .iter()
                     .map(|e| self.block_offset(e.block as u64 + 1))
@@ -645,7 +650,11 @@ impl Overlay {
             // artificially extending to full block size for small files.
             let data_end = offset.saturating_add(data.len() as u64);
 
-            let logical_len = self.logical_len(rel)?.unwrap_or(data_end);
+            // Computing logical length for PostgreSQL datafiles can be
+            // expensive (it may require scanning pg_probackup page streams).
+            // Cache it per-path so we only pay this cost once per file instead
+            // of once per block during large sequential reads (e.g. `cmp`).
+            let logical_len = self.cached_logical_len(rel)?.unwrap_or(data_end);
             let required_len = logical_len.max(data_end);
             if out.metadata()?.len() < required_len {
                 out.set_len(required_len)?;
@@ -681,6 +690,31 @@ impl Overlay {
         }
 
         Ok(())
+    }
+
+    /// Cached wrapper around `logical_len()` that avoids recomputing logical
+    /// length for the same path, which for PostgreSQL datafiles would
+    /// repeatedly rescan pg_probackup page streams and dominate I/O during
+    /// large sequential reads.
+    fn cached_logical_len(&self, rel: &Path) -> Result<Option<u64>> {
+        // Fast path: if we already cached a non-empty logical length, use it.
+        if let Ok(cache) = self.inner.cache.lock() {
+            if let Some(entry) = cache.get(rel) {
+                if let Some(len) = entry.logical_len {
+                    return Ok(Some(len));
+                }
+            }
+        }
+
+        // Compute logical length once and remember successful result.
+        let len = self.logical_len(rel)?;
+        if let Some(actual) = len {
+            if let Ok(mut cache) = self.inner.cache.lock() {
+                let entry = cache.entry(rel.to_path_buf()).or_default();
+                entry.logical_len = Some(actual);
+            }
+        }
+        Ok(len)
     }
 
     #[allow(dead_code)]
@@ -826,22 +860,7 @@ impl Overlay {
         block_idx: u64,
     ) -> Result<Option<Vec<u8>>> {
         // Build or reuse block index to avoid rescanning the whole file.
-        let index = {
-            let mut cache = self.inner.cache.lock().unwrap();
-            let entry = cache.entry(rel.to_path_buf()).or_default();
-            if let Some(idx) = entry.pg_block_index.get(src) {
-                idx.clone()
-            } else {
-                drop(cache);
-                let built = self.build_pg_block_index(rel, src)?;
-                let mut cache = self.inner.cache.lock().unwrap();
-                let entry = cache.entry(rel.to_path_buf()).or_default();
-                entry
-                    .pg_block_index
-                    .insert(src.to_path_buf(), built.clone());
-                built
-            }
-        };
+        let index = self.pg_block_index(rel, src)?;
 
         let target = index.iter().find(|e| e.block as u64 == block_idx);
         let target = match target {
@@ -937,7 +956,7 @@ impl Overlay {
     /// files (e.g. pg_probackup page streams with per-page headers).
     pub fn logical_len_for(&self, relative: impl AsRef<Path>) -> Result<Option<u64>> {
         let rel = relative.as_ref();
-        self.logical_len(rel)
+        self.cached_logical_len(rel)
     }
 
     pub fn top_layer_has_datafile(&self, relative: impl AsRef<Path>) -> bool {
@@ -1522,6 +1541,27 @@ impl Overlay {
             CompressionAlgorithm::Zstd => zstd::stream::decode_all(data)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e).into()),
         }
+    }
+
+    /// Build or fetch from cache the pg_probackup block index for a given
+    /// relation path and physical source file. Shared between logical length
+    /// calculation and page reads so that we scan the on-disk page stream at
+    /// most once per file.
+    fn pg_block_index(&self, rel: &Path, src: &Path) -> Result<Vec<BlockIndexEntry>> {
+        let mut cache = self.inner.cache.lock().unwrap();
+        let entry = cache.entry(rel.to_path_buf()).or_default();
+        if let Some(idx) = entry.pg_block_index.get(src) {
+            return Ok(idx.clone());
+        }
+        drop(cache);
+
+        let built = self.build_pg_block_index(rel, src)?;
+        let mut cache = self.inner.cache.lock().unwrap();
+        let entry = cache.entry(rel.to_path_buf()).or_default();
+        entry
+            .pg_block_index
+            .insert(src.to_path_buf(), built.clone());
+        Ok(built)
     }
 
     fn build_pg_block_index(&self, rel: &Path, src: &Path) -> Result<Vec<BlockIndexEntry>> {
