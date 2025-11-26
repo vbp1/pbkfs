@@ -338,6 +338,13 @@ impl Overlay {
     }
 
     fn logical_len(&self, rel: &Path) -> Result<Option<u64>> {
+        // For heap/index files stored in page-mode format, physical file size
+        // (with per-page headers/compression) is not the logical size. Derive
+        // length from the highest page number we can observe.
+        if self.is_pg_datafile(rel) {
+            return self.datafile_logical_len(rel);
+        }
+
         let diff_path = self.inner.diff.join(rel);
         let mut best: u64 = 0;
         if let Ok(meta) = fs::metadata(&diff_path) {
@@ -357,6 +364,39 @@ impl Overlay {
             Ok(None)
         } else {
             Ok(Some(best))
+        }
+    }
+
+    /// Compute logical length for PostgreSQL datafiles (tables and indexes)
+    /// using page indexes rather than raw compressed file sizes.
+    fn datafile_logical_len(&self, rel: &Path) -> Result<Option<u64>> {
+        // Prefer already-materialized diff copy.
+        let diff_path = self.inner.diff.join(rel);
+        if let Ok(meta) = fs::metadata(&diff_path) {
+            return Ok(Some(meta.len()));
+        }
+
+        // Use newest matching layer to infer the highest block.
+        let matches = self.matching_layers(rel);
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        let (_idx, path) = &matches[0];
+
+        // Build or reuse block index to find the maximum block number.
+        let index = {
+            let mut cache = self.inner.cache.lock().unwrap();
+            let entry = cache.entry(rel.to_path_buf()).or_default();
+            if entry.pg_block_index.is_none() {
+                entry.pg_block_index = Some(self.build_pg_block_index(rel, path)?);
+            }
+            entry.pg_block_index.as_ref().unwrap().clone()
+        };
+
+        let max_block = index.iter().map(|e| e.block as u64).max();
+        match max_block {
+            Some(b) => Ok(Some(self.block_offset(b + 1))),
+            None => Ok(Some(0)),
         }
     }
 
@@ -515,18 +555,8 @@ impl Overlay {
             // artificially extending to full block size for small files.
             let data_end = offset.saturating_add(data.len() as u64);
 
-            // Logical length must reflect blocks, not compressed file sizes.
-            // For PostgreSQL datafiles (including indexes) force length to include
-            // the current block to avoid undersizing files restored from
-            // compressed/page-mode backups whose on-disk size is smaller than the
-            // logical heap size.
-            let required_len = if self.is_pg_datafile(rel) {
-                let block_based = self.block_offset(block_idx + 1);
-                data_end.max(block_based)
-            } else {
-                let logical_len = self.logical_len(rel)?.unwrap_or(data_end);
-                logical_len.max(data_end)
-            };
+            let logical_len = self.logical_len(rel)?.unwrap_or(data_end);
+            let required_len = logical_len.max(data_end);
             if out.metadata()?.len() < required_len {
                 out.set_len(required_len)?;
             }
