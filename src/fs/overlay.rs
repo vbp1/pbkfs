@@ -1065,30 +1065,40 @@ impl Overlay {
             return self.inner.layers.get(layer_idx).and_then(|l| l.compression);
         }
 
+        let layer_comp = self.inner.layers.get(layer_idx).and_then(|l| l.compression);
+
         let root = match self.inner.layers.get(layer_idx) {
             Some(layer) => layer.root.clone(),
-            None => return None,
+            None => return layer_comp,
         };
 
         let rel_key = rel.to_string_lossy().to_string();
 
-        // Fast path: try to read from cache.
+        // Fast path: try to read from cache, populating per-layer metadata map
+        // on first access. If there is no entry for `rel_key` in
+        // backup_content.control (or the file is not listed there at all),
+        // fall back to the backup-level compression algorithm.
         if let Ok(mut cache) = self.inner.file_meta.lock() {
-            if let Some(layer_map) = cache.get(&root) {
-                if let Some(meta) = layer_map.get(&rel_key) {
-                    return meta.compression;
-                }
+            let layer_map = if let Some(existing) = cache.get(&root) {
+                existing
             } else {
-                // Populate per-layer metadata map on first access.
                 let map = Self::load_backup_content_for_root(&root);
-                let result = map.get(&rel_key).and_then(|m| m.compression);
-                cache.insert(root, map);
-                return result;
+                cache.insert(root.clone(), map);
+                cache.get(&root).unwrap()
+            };
+
+            if let Some(meta) = layer_map.get(&rel_key) {
+                // Honour explicit per-file compression ("zlib", "lz4",
+                // "zstd" or "none") without falling back to the backup-level
+                // algorithm. When compress_alg = "none" in
+                // backup_content.control, pg_probackup stores this file
+                // uncompressed even if the backup as a whole is compressed.
+                return meta.compression;
             }
         }
 
-        // If metadata is unavailable, fall back to backup-level compression.
-        self.inner.layers.get(layer_idx).and_then(|l| l.compression)
+        // No per-file metadata: use backup-level compression, if any.
+        layer_comp
     }
 
     fn load_backup_content_for_root(root: &Path) -> HashMap<String, FileMeta> {
