@@ -280,9 +280,11 @@ impl Overlay {
             return Ok(None);
         }
 
-        if let Some(len) = self.logical_len(rel)? {
-            if offset >= len {
-                return Ok(Some(Vec::new()));
+        if !self.is_pg_datafile(rel) {
+            if let Some(len) = self.logical_len(rel)? {
+                if offset >= len {
+                    return Ok(Some(Vec::new()));
+                }
             }
         }
 
