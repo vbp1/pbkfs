@@ -514,8 +514,19 @@ impl Overlay {
             // Preserve the logical file length reported by source layers without
             // artificially extending to full block size for small files.
             let data_end = offset.saturating_add(data.len() as u64);
-            let logical_len = self.logical_len(rel)?.unwrap_or(data_end);
-            let required_len = logical_len.max(data_end);
+
+            // Logical length must reflect blocks, not compressed file sizes.
+            // For PostgreSQL datafiles (including indexes) force length to include
+            // the current block to avoid undersizing files restored from
+            // compressed/page-mode backups whose on-disk size is smaller than the
+            // logical heap size.
+            let required_len = if self.is_pg_datafile(rel) {
+                let block_based = self.block_offset(block_idx + 1);
+                data_end.max(block_based)
+            } else {
+                let logical_len = self.logical_len(rel)?.unwrap_or(data_end);
+                logical_len.max(data_end)
+            };
             if out.metadata()?.len() < required_len {
                 out.set_len(required_len)?;
             }
