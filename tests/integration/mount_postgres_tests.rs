@@ -76,16 +76,26 @@ fn mounts_backup_and_preserves_store_immutability() -> pbkfs::Result<()> {
     fs::write(&base_file, b"from-store")?;
     write_metadata(store.path(), false, None);
 
-    let args = MountArgs {
-        pbk_store: Some(store.path().to_path_buf()),
-        mnt_path: Some(target.path().to_path_buf()),
-        diff_dir: Some(diff.path().to_path_buf()),
-        instance: Some("main".into()),
-        backup_id: Some("FULL1".into()),
-        force: false,
+    // Force BackupStore::load_from_pg_probackup() to use JSON metadata
+    // instead of invoking a real pg_probackup binary that may be present
+    // in the environment.
+    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
+    let ctx = {
+        std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
+        pbkfs::cli::mount::mount(MountArgs {
+            pbk_store: Some(store.path().to_path_buf()),
+            mnt_path: Some(target.path().to_path_buf()),
+            diff_dir: Some(diff.path().to_path_buf()),
+            instance: Some("main".into()),
+            backup_id: Some("FULL1".into()),
+            force: false,
+        })?
     };
-
-    let ctx = pbkfs::cli::mount::mount(args)?;
+    if let Some(bin) = old_bin {
+        std::env::set_var("PG_PROBACKUP_BIN", bin);
+    } else {
+        std::env::remove_var("PG_PROBACKUP_BIN");
+    }
 
     // Reads come from base
     let contents = ctx
@@ -140,16 +150,23 @@ fn mount_decompresses_compressed_backup_files() -> pbkfs::Result<()> {
 
     write_metadata(store.path(), true, Some(("zlib", Some(6))));
 
-    let args = MountArgs {
-        pbk_store: Some(store.path().to_path_buf()),
-        mnt_path: Some(target.path().to_path_buf()),
-        diff_dir: Some(diff.path().to_path_buf()),
-        instance: Some("main".into()),
-        backup_id: Some("FULL1".into()),
-        force: false,
+    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
+    let ctx = {
+        std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
+        pbkfs::cli::mount::mount(MountArgs {
+            pbk_store: Some(store.path().to_path_buf()),
+            mnt_path: Some(target.path().to_path_buf()),
+            diff_dir: Some(diff.path().to_path_buf()),
+            instance: Some("main".into()),
+            backup_id: Some("FULL1".into()),
+            force: false,
+        })?
     };
-
-    let ctx = pbkfs::cli::mount::mount(args)?;
+    if let Some(bin) = old_bin {
+        std::env::set_var("PG_PROBACKUP_BIN", bin);
+    } else {
+        std::env::remove_var("PG_PROBACKUP_BIN");
+    }
 
     let contents = ctx
         .overlay
@@ -183,6 +200,9 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
     fs::create_dir_all(base_file.parent().unwrap())?;
     fs::write(&base_file, b"from-store")?;
     write_metadata(store.path(), false, None);
+
+    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
+    std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
 
     let initial = match pbkfs::cli::mount::mount(MountArgs {
         pbk_store: Some(store.path().to_path_buf()),
@@ -253,6 +273,12 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
         }
     };
 
+    if let Some(bin) = old_bin {
+        std::env::set_var("PG_PROBACKUP_BIN", bin);
+    } else {
+        std::env::remove_var("PG_PROBACKUP_BIN");
+    }
+
     let reread = remount
         .overlay
         .read(Path::new("data/base.txt"))?
@@ -302,6 +328,9 @@ fn remount_rejects_binding_mismatch() {
     fs::write(&base_file, b"from-store").unwrap();
     write_metadata(store.path(), false, None);
 
+    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
+    std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
+
     let initial = pbkfs::cli::mount::mount(MountArgs {
         pbk_store: Some(store.path().to_path_buf()),
         mnt_path: Some(target.path().to_path_buf()),
@@ -337,6 +366,12 @@ fn remount_rejects_binding_mismatch() {
         .downcast_ref::<pbkfs::Error>()
         .expect("should be pbkfs::Error");
     assert!(matches!(actual, pbkfs::Error::BindingViolation { .. }));
+
+    if let Some(bin) = old_bin {
+        std::env::set_var("PG_PROBACKUP_BIN", bin);
+    } else {
+        std::env::remove_var("PG_PROBACKUP_BIN");
+    }
 }
 
 #[test]
@@ -349,6 +384,9 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
     fs::create_dir_all(base_file.parent().unwrap())?;
     fs::write(&base_file, b"from-store")?;
     write_metadata(store.path(), false, None);
+
+    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
+    std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
 
     let initial = match pbkfs::cli::mount::mount(MountArgs {
         pbk_store: Some(store.path().to_path_buf()),
@@ -411,6 +449,12 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
             return Err(err);
         }
     };
+
+    if let Some(bin) = old_bin {
+        std::env::set_var("PG_PROBACKUP_BIN", bin);
+    } else {
+        std::env::remove_var("PG_PROBACKUP_BIN");
+    }
 
     let binding_after =
         match BindingRecord::load_from_diff(&pbkfs::binding::DiffDir::new(diff.path())?) {
