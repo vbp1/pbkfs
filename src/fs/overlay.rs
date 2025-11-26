@@ -828,6 +828,22 @@ impl Overlay {
         }
 
         if top_layer.incremental {
+            let has_pagemap = top_path.with_extension("pagemap").exists();
+
+            // Non-data files in DELTA/PAGE backups are stored as whole files, not
+            // per-page BackupPageHeader streams. Treat them as full-file copies to
+            // avoid mis-parsing (e.g., WAL segments, pg_control, config files).
+            if !has_pagemap && !self.is_pg_datafile(rel) {
+                if let Some(parent) = diff_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if let Some(algo) = top_layer.compression {
+                    return self.decompress_file(rel, top_path, &diff_path, algo);
+                }
+                fs::copy(top_path, &diff_path)?;
+                return Ok(());
+            }
+
             return self.materialize_incremental_chain(rel, &diff_path, matches);
         }
 
