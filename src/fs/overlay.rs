@@ -1272,10 +1272,7 @@ impl Overlay {
     pub(crate) fn record_write(&self, rel: &Path, offset: u64, len: usize) {
         let block_sz = self.inner.block_size.get() as u64;
         let start_block = offset / block_sz;
-        let end_block = offset
-            .saturating_add(len as u64)
-            .saturating_sub(1)
-            / block_sz;
+        let end_block = offset.saturating_add(len as u64).saturating_sub(1) / block_sz;
         let logical_end = offset.saturating_add(len as u64);
 
         if let Ok(mut cache) = self.inner.cache.lock() {
