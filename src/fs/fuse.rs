@@ -6,13 +6,17 @@ use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{FileExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Mutex,
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::Error as AnyhowError;
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use fuser::{
     BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate,
     ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite,
@@ -30,11 +34,316 @@ const MAX_OID_DIGITS: usize = 10;
 // pg_probackup segment numbers are bounded (pgFileSize): up to 5 digits.
 const MAX_SEGMENT_DIGITS: usize = 5;
 
+#[derive(Debug)]
+struct FsWorkerMetricsInner {
+    queue_depth: AtomicUsize,
+    max_queue_depth: AtomicUsize,
+    tasks_total: AtomicU64,
+    tasks_failed: AtomicU64,
+    rejected: AtomicU64,
+    last_task_latency_us: AtomicU64,
+}
+
+impl Default for FsWorkerMetricsInner {
+    fn default() -> Self {
+        Self {
+            queue_depth: AtomicUsize::new(0),
+            max_queue_depth: AtomicUsize::new(0),
+            tasks_total: AtomicU64::new(0),
+            tasks_failed: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            last_task_latency_us: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FsWorkerMetrics {
+    pub queue_depth: usize,
+    pub max_queue_depth: usize,
+    pub tasks_total: u64,
+    pub tasks_failed: u64,
+    pub rejected: u64,
+    pub last_task_latency_us: u64,
+}
+
+impl FsWorkerMetricsInner {
+    fn snapshot(&self) -> FsWorkerMetrics {
+        FsWorkerMetrics {
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            max_queue_depth: self.max_queue_depth.load(Ordering::Relaxed),
+            tasks_total: self.tasks_total.load(Ordering::Relaxed),
+            tasks_failed: self.tasks_failed.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+            last_task_latency_us: self.last_task_latency_us.load(Ordering::Relaxed),
+        }
+    }
+
+    fn increment_queued(&self) {
+        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        self.max_queue_depth.fetch_max(depth, Ordering::Relaxed);
+    }
+
+    fn decrement_queued(&self) {
+        self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn record_task(&self, ok: bool, latency_us: u64) {
+        self.tasks_total.fetch_add(1, Ordering::Relaxed);
+        if !ok {
+            self.tasks_failed.fetch_add(1, Ordering::Relaxed);
+        }
+        self.last_task_latency_us
+            .store(latency_us, Ordering::Relaxed);
+
+        let total = self.tasks_total.load(Ordering::Relaxed);
+        if !ok || total % 1000 == 0 {
+            let snapshot = self.snapshot();
+            crate::logging::log_fs_worker_pool_metrics(
+                crate::logging::FsWorkerPoolSnapshot {
+                    queue_depth: snapshot.queue_depth,
+                    max_queue_depth: snapshot.max_queue_depth,
+                    tasks_total: snapshot.tasks_total,
+                    tasks_failed: snapshot.tasks_failed,
+                    rejected: snapshot.rejected,
+                    last_task_latency_us: snapshot.last_task_latency_us,
+                },
+                false,
+            );
+        }
+    }
+
+    fn record_rejected(&self) {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        let snapshot = self.snapshot();
+        crate::logging::log_fs_worker_pool_metrics(
+            crate::logging::FsWorkerPoolSnapshot {
+                queue_depth: snapshot.queue_depth,
+                max_queue_depth: snapshot.max_queue_depth,
+                tasks_total: snapshot.tasks_total,
+                tasks_failed: snapshot.tasks_failed,
+                rejected: snapshot.rejected,
+                last_task_latency_us: snapshot.last_task_latency_us,
+            },
+            true,
+        );
+    }
+}
+
+enum FsTask {
+    Read {
+        overlay: Overlay,
+        rel: PathBuf,
+        offset: u64,
+        size: usize,
+        reply: ReplyData,
+    },
+    Write {
+        overlay: Overlay,
+        rel: PathBuf,
+        offset: i64,
+        data: Vec<u8>,
+        reply: ReplyWrite,
+    },
+    Fsync {
+        overlay: Overlay,
+        rel: PathBuf,
+        reply: ReplyEmpty,
+    },
+}
+
+impl FsTask {
+    fn run(self, metrics: &FsWorkerMetricsInner) {
+        let start = Instant::now();
+        let mut ok = true;
+
+        match self {
+            FsTask::Read {
+                overlay,
+                rel,
+                offset,
+                size,
+                reply,
+            } => match overlay.read_range(&rel, offset, size) {
+                Ok(Some(bytes)) => reply.data(&bytes),
+                Ok(None) => {
+                    ok = false;
+                    reply.error(ENOENT);
+                }
+                Err(_) => {
+                    ok = false;
+                    reply.error(EIO);
+                }
+            },
+            FsTask::Write {
+                overlay,
+                rel,
+                offset,
+                data,
+                reply,
+            } => {
+                // Ensure diff copy exists so we write into a real file, then
+                // perform an in-place pwrite without truncating existing data.
+                if let Err(err) = overlay.ensure_copy_up(&rel) {
+                    reply.error(crate::fs::fuse::OverlayFs::err_from_anyhow(err));
+                    return;
+                }
+
+                let path = overlay.diff_root().join(&rel);
+                let file = match OpenOptions::new().read(true).write(true).open(&path) {
+                    Ok(f) => f,
+                    Err(err) => {
+                        reply.error(err.raw_os_error().unwrap_or(EIO));
+                        return;
+                    }
+                };
+
+                let start_off = offset.max(0) as u64;
+                if let Err(err) = file.write_at(&data, start_off) {
+                    reply.error(err.raw_os_error().unwrap_or(EIO));
+                    return;
+                }
+
+                let needed_len = start_off.saturating_add(data.len() as u64);
+                if let Ok(meta) = file.metadata() {
+                    if meta.len() < needed_len {
+                        if let Err(err) = file.set_len(needed_len) {
+                            reply.error(err.raw_os_error().unwrap_or(EIO));
+                            return;
+                        }
+                    }
+                }
+
+                // Mark written blocks as materialized and update cached length
+                // so reads will source data from diff without copy_up.
+                overlay.record_write(&rel, start_off, data.len());
+
+                reply.written(data.len() as u32);
+            }
+            FsTask::Fsync {
+                overlay,
+                rel,
+                reply,
+            } => {
+                let path = {
+                    let diff = overlay.diff_root().join(&rel);
+                    if diff.exists() {
+                        diff
+                    } else {
+                        match overlay.find_layer_path(&rel) {
+                            Some((p, _, _)) => p,
+                            None => {
+                                ok = false;
+                                reply.error(ENOENT);
+                                metrics.record_task(ok, start.elapsed().as_micros() as u64);
+                                return;
+                            }
+                        }
+                    }
+                };
+
+                match File::open(&path) {
+                    Ok(file) => {
+                        if let Err(err) = file.sync_all() {
+                            ok = false;
+                            let code = err.raw_os_error().unwrap_or(EIO);
+                            reply.error(code);
+                        } else {
+                            reply.ok();
+                        }
+                    }
+                    Err(err) => {
+                        ok = false;
+                        let code = err.raw_os_error().unwrap_or(EIO);
+                        reply.error(code);
+                    }
+                }
+            }
+        }
+
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        metrics.record_task(ok, elapsed_us);
+    }
+}
+
+struct FsWorkerPool {
+    tx: Sender<FsTask>,
+    _rx: Receiver<FsTask>,
+    metrics: Arc<FsWorkerMetricsInner>,
+}
+
+impl FsWorkerPool {
+    fn new(overlay: &Overlay) -> Self {
+        let workers = std::env::var("PBKFS_FS_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get().max(2))
+                    .unwrap_or(4)
+            });
+        let queue_capacity = std::env::var("PBKFS_FS_QUEUE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(workers * 32);
+
+        let (tx, rx) = bounded::<FsTask>(queue_capacity);
+        let shared_rx = rx.clone();
+        let metrics = Arc::new(FsWorkerMetricsInner::default());
+
+        for idx in 0..workers {
+            let worker_rx = shared_rx.clone();
+            let metrics = metrics.clone();
+            let overlay_clone = overlay.clone();
+            std::thread::Builder::new()
+                .name(format!("pbkfs-fs-worker-{idx}"))
+                .spawn(move || {
+                    for task in worker_rx {
+                        let _ = &overlay_clone;
+                        FsTask::run(task, &metrics);
+                        metrics.decrement_queued();
+                    }
+                })
+                .expect("failed to spawn fs worker thread");
+        }
+
+        Self {
+            tx,
+            _rx: rx,
+            metrics,
+        }
+    }
+
+    fn submit(&self, task: FsTask) {
+        self.metrics.increment_queued();
+        match self.tx.try_send(task) {
+            Ok(()) => {}
+            Err(TrySendError::Full(task)) => {
+                self.metrics.record_rejected();
+                FsTask::run(task, &self.metrics);
+                self.metrics.decrement_queued();
+            }
+            Err(TrySendError::Disconnected(task)) => {
+                FsTask::run(task, &self.metrics);
+                self.metrics.decrement_queued();
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn metrics(&self) -> FsWorkerMetrics {
+        self.metrics.snapshot()
+    }
+}
+
 pub struct OverlayFs {
     overlay: Overlay,
     paths: Mutex<HashMap<u64, PathBuf>>,  // ino -> rel path
     inodes: Mutex<HashMap<PathBuf, u64>>, // rel path -> ino
     next_ino: Mutex<u64>,
+    worker_pool: FsWorkerPool,
 }
 
 impl OverlayFs {
@@ -43,11 +352,13 @@ impl OverlayFs {
         let mut inodes = HashMap::new();
         paths.insert(1, PathBuf::from(""));
         inodes.insert(PathBuf::from(""), 1);
+        let worker_pool = FsWorkerPool::new(&overlay);
         Self {
             overlay,
             paths: Mutex::new(paths),
             inodes: Mutex::new(inodes),
             next_ino: Mutex::new(2),
+            worker_pool,
         }
     }
 
@@ -455,11 +766,14 @@ impl Filesystem for OverlayFs {
         // strictly require equality with the inode.
 
         let off = if offset < 0 { 0 } else { offset as u64 };
-        match self.overlay.read_range(&rel, off, size as usize) {
-            Ok(Some(bytes)) => reply.data(&bytes),
-            Ok(None) => reply.error(ENOENT),
-            Err(_) => reply.error(EIO),
-        }
+        let task = FsTask::Read {
+            overlay: self.overlay.clone(),
+            rel,
+            offset: off,
+            size: size as usize,
+            reply,
+        };
+        self.worker_pool.submit(task);
     }
 
     fn write(
@@ -489,29 +803,14 @@ impl Filesystem for OverlayFs {
             reply.error(EIO);
             return;
         }
-
-        let mut bytes = match self.overlay.read(&rel) {
-            Ok(Some(buf)) => buf,
-            Ok(None) => Vec::new(),
-            Err(_) => {
-                reply.error(EIO);
-                return;
-            }
+        let task = FsTask::Write {
+            overlay: self.overlay.clone(),
+            rel,
+            offset,
+            data: data.to_vec(),
+            reply,
         };
-
-        let start = offset.max(0) as usize;
-        if bytes.len() < start {
-            bytes.resize(start, 0);
-        }
-        if bytes.len() < start + data.len() {
-            bytes.resize(start + data.len(), 0);
-        }
-        bytes[start..start + data.len()].copy_from_slice(data);
-
-        match self.overlay.write(&rel, &bytes) {
-            Ok(()) => reply.written(data.len() as u32),
-            Err(err) => reply.error(Self::err_from_anyhow(err)),
-        }
+        self.worker_pool.submit(task);
     }
 
     fn readdir(
@@ -981,6 +1280,11 @@ impl Filesystem for OverlayFs {
         }
 
         if let Some(target_size) = size {
+            tracing::debug!(
+                path = %rel.display(),
+                target_size,
+                "setattr_truncate"
+            );
             if let Err(err) = self.ensure_diff_copy(&rel) {
                 reply.error(Self::err_code(err));
                 return;
@@ -1053,32 +1357,12 @@ impl Filesystem for OverlayFs {
             reply.error(ENOENT);
             return;
         }
-
-        let path = {
-            let diff = self.overlay.diff_root().join(&rel);
-            if diff.exists() {
-                diff
-            } else {
-                match self.overlay.find_layer_path(&rel) {
-                    Some((p, _, _)) => p,
-                    None => {
-                        reply.error(ENOENT);
-                        return;
-                    }
-                }
-            }
+        let task = FsTask::Fsync {
+            overlay: self.overlay.clone(),
+            rel,
+            reply,
         };
-
-        match File::open(&path) {
-            Ok(file) => {
-                if let Err(err) = file.sync_all() {
-                    reply.error(Self::err_code(err));
-                    return;
-                }
-                reply.ok();
-            }
-            Err(err) => reply.error(Self::err_code(err)),
-        }
+        self.worker_pool.submit(task);
     }
 
     fn fallocate(

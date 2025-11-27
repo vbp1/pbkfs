@@ -313,13 +313,35 @@ impl Overlay {
         // uses page indexes rather than raw physical sizes to avoid extending
         // relations past their recorded length.
         let mut end_offset = offset.saturating_add(size as u64);
-        if let Some(len) = self.cached_logical_len(rel)? {
-            if offset >= len {
-                return Ok(Some(Vec::new()));
+
+        // First try cached length; if offset appears past EOF, recompute a
+        // fresh logical length from layers/diff before returning EOF to avoid
+        // stale caches cutting off valid data.
+        if let Some(cached_len) = self.cached_logical_len(rel)? {
+            if offset >= cached_len {
+                if let Some(recalc) = self.logical_len(rel)? {
+                    // refresh cache with authoritative length
+                    if let Ok(mut cache) = self.inner.cache.lock() {
+                        let entry = cache.entry(rel.to_path_buf()).or_default();
+                        entry.logical_len = Some(recalc);
+                    }
+
+                    if offset >= recalc {
+                        debug!(
+                            path = %rel.display(),
+                            offset,
+                            logical_len = recalc,
+                            "read_range_logical_eof"
+                        );
+                        return Ok(Some(Vec::new()));
+                    }
+                    end_offset = end_offset.min(recalc);
+                } else {
+                    // Unknown length: proceed without EOF clamp.
+                }
+            } else {
+                end_offset = end_offset.min(cached_len);
             }
-            // Clamp reads that run past EOF so we only materialize existing
-            // logical blocks instead of synthesizing trailing zero pages.
-            end_offset = end_offset.min(len);
         }
 
         if let Some(parent) = diff_path.parent() {
@@ -354,6 +376,12 @@ impl Overlay {
         // Read requested slice directly from diff (sparse holes read as zeroes).
         let meta_len = fs::metadata(&diff_path)?.len();
         if offset >= meta_len {
+            debug!(
+                path = %rel.display(),
+                offset,
+                meta_len,
+                "read_range_meta_eof"
+            );
             return Ok(Some(Vec::new()));
         }
         let max_len = ((meta_len - offset) as usize).min(size);
@@ -431,12 +459,38 @@ impl Overlay {
     /// Compute logical length for PostgreSQL datafiles (tables and indexes)
     /// using page indexes rather than raw compressed file sizes.
     fn datafile_logical_len(&self, rel: &Path) -> Result<Option<u64>> {
+        // If a diff copy exists and already has data (size > 0) or we have
+        // materialized blocks in the cache, treat its length as authoritative
+        // so PostgreSQL-visible truncations are respected. For a brand-new
+        // diff file (size == 0, no materialized blocks yet), fall back to the
+        // backup layers to avoid reporting a tiny size and triggering
+        // short-read errors during the first copy-up.
+        let diff_path = self.inner.diff.join(rel);
+        let diff_len = fs::metadata(&diff_path).map(|m| m.len()).ok();
+        if let Some(len) = diff_len {
+            if len > 0 {
+                return Ok(Some(len));
+            }
+
+            // size == 0; see if we already materialized blocks for this file
+            // in the cache (e.g., after truncate). In that case respect the
+            // diff length even if zero.
+            if let Ok(cache) = self.inner.cache.lock() {
+                if let Some(entry) = cache.get(rel) {
+                    if !entry.materialized.is_empty() {
+                        return Ok(Some(len));
+                    }
+                }
+            }
+
+            // Avoid reporting a logical length of zero; treat as unknown so we
+            // fall back to layer-derived length. This prevents transient
+            // zero-length returns during initial materialization.
+            // Fall through to layer scan.
+        }
+
         let matches = self.matching_layers(rel);
         if matches.is_empty() {
-            // Fall back to diff-only length for brand new relations.
-            let diff_len = fs::metadata(self.inner.diff.join(rel))
-                .map(|m| m.len())
-                .ok();
             return Ok(diff_len);
         }
 
@@ -465,13 +519,13 @@ impl Overlay {
             }
         }
 
-        // Diff may contain user writes; prefer the larger of diff and layers.
-        if let Ok(meta) = fs::metadata(self.inner.diff.join(rel)) {
-            best = best.max(meta.len());
-        }
-
         if best == 0 {
-            Ok(None)
+            // If everything failed, don't return zero; keep diff_len (which
+            // could be None) but map 0 to None to avoid hard EOF at offset 0.
+            match diff_len {
+                Some(0) => Ok(None),
+                other => Ok(other),
+            }
         } else {
             Ok(Some(best))
         }
@@ -499,12 +553,39 @@ impl Overlay {
         if let Ok(mut cache) = self.inner.cache.lock() {
             let entry = cache.entry(rel.to_path_buf()).or_default();
             if entry.materialized.contains(&block_idx) {
-                self.inner
-                    .metrics
-                    .cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!(path = %rel.display(), block = block_idx, "block_cache_hit_materialized");
-                return Ok(());
+                // Guard against stale cache after external truncation or
+                // unexpected diff cleanup: verify the diff file is large
+                // enough to actually contain this block.
+                let expected_len = self.block_offset(block_idx + 1);
+                let diff_len = fs::metadata(self.inner.diff.join(rel))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
+                if diff_len >= expected_len {
+                    self.inner
+                        .metrics
+                        .cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        path = %rel.display(),
+                        block = block_idx,
+                        diff_len,
+                        "block_cache_hit_materialized",
+                    );
+                    return Ok(());
+                }
+
+                // Cached as materialized but backing file is too short.
+                // Drop the cached entry so we re-copy the block below.
+                entry.materialized.remove(&block_idx);
+                entry.sources.remove(&block_idx);
+                debug!(
+                    path = %rel.display(),
+                    block = block_idx,
+                    diff_len,
+                    expected_len,
+                    "block_cache_stale_truncated",
+                );
             }
             if let Some(source) = entry.sources.get(&block_idx).copied() {
                 self.inner
@@ -545,20 +626,11 @@ impl Overlay {
         block_idx: u64,
         start_layer: usize,
     ) -> Result<Option<BlockSource>> {
-        let block_offset = self.block_offset(block_idx);
-        let diff_path = self.inner.diff.join(rel);
         let cache = self.inner.cache.lock().unwrap();
         if let Some(entry) = cache.get(rel) {
             if entry.materialized.contains(&block_idx) {
                 let src = BlockSource::Diff;
                 debug!(path = %rel.display(), block = block_idx, source = ?src, "block_source_cache_materialized");
-                return Ok(Some(src));
-            }
-        } else if let Ok(meta) = fs::metadata(&diff_path) {
-            if meta.len() > block_offset {
-                // Fresh cache but diff already has data (likely reuse path).
-                let src = BlockSource::Diff;
-                debug!(path = %rel.display(), block = block_idx, source = ?src, "block_source_diff_reused");
                 return Ok(Some(src));
             }
         }
@@ -659,6 +731,12 @@ impl Overlay {
             if out.metadata()?.len() < required_len {
                 out.set_len(required_len)?;
             }
+            // Bump cached logical length to reflect the newly materialized
+            // range so subsequent reads don't hit a stale, shorter EOF.
+            if let Ok(mut cache) = self.inner.cache.lock() {
+                let entry = cache.entry(rel.to_path_buf()).or_default();
+                entry.logical_len = Some(required_len);
+            }
             let file_len = out.metadata()?.len();
             debug!(
                 path = %rel.display(),
@@ -698,16 +776,40 @@ impl Overlay {
     /// large sequential reads.
     fn cached_logical_len(&self, rel: &Path) -> Result<Option<u64>> {
         // Fast path: if we already cached a non-empty logical length, use it.
-        if let Ok(cache) = self.inner.cache.lock() {
-            if let Some(entry) = cache.get(rel) {
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            if let Some(entry) = cache.get_mut(rel) {
                 if let Some(len) = entry.logical_len {
+                    // If the on-disk diff grew (e.g., after materializing new
+                    // blocks), prefer the larger length to avoid stale EOFs.
+                    if let Ok(meta) = fs::metadata(self.inner.diff.join(rel)) {
+                        if meta.len() > len {
+                            entry.logical_len = Some(meta.len());
+                            return Ok(Some(meta.len()));
+                        }
+                    }
                     return Ok(Some(len));
+                }
+
+                // Also respect a cached set of materialized blocks: derive
+                // the current logical_len from the highest materialized block
+                // if present, to avoid returning None when we've already
+                // copied data beyond what layers report.
+                if !entry.materialized.is_empty() {
+                    let max_block = *entry.materialized.iter().max().unwrap();
+                    let inferred = self.block_offset(max_block + 1);
+                    entry.logical_len = Some(inferred);
+                    return Ok(Some(inferred));
                 }
             }
         }
 
         // Compute logical length once and remember successful result.
         let len = self.logical_len(rel)?;
+        let len = match len {
+            Some(0) => None, // zero-length is indistinguishable from unknown; avoid caching stale EOF
+            other => other,
+        };
+
         if let Some(actual) = len {
             if let Ok(mut cache) = self.inner.cache.lock() {
                 let entry = cache.entry(rel.to_path_buf()).or_default();
@@ -1161,6 +1263,29 @@ impl Overlay {
     pub(crate) fn invalidate_cache(&self, rel: &Path) {
         if let Ok(mut cache) = self.inner.cache.lock() {
             cache.remove(rel);
+        }
+    }
+
+    /// Record that a write modified the given byte range in the diff file so
+    /// subsequent reads will source blocks from the diff rather than
+    /// re-copying from base layers. Also advances cached logical length.
+    pub(crate) fn record_write(&self, rel: &Path, offset: u64, len: usize) {
+        let block_sz = self.inner.block_size.get() as u64;
+        let start_block = offset / block_sz;
+        let end_block = offset
+            .saturating_add(len as u64)
+            .saturating_sub(1)
+            / block_sz;
+        let logical_end = offset.saturating_add(len as u64);
+
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            let entry = cache.entry(rel.to_path_buf()).or_default();
+            for blk in start_block..=end_block {
+                entry.materialized.insert(blk);
+                // Drop any remembered upstream source: diff now authoritative.
+                entry.sources.remove(&blk);
+            }
+            entry.logical_len = Some(entry.logical_len.unwrap_or(0).max(logical_end));
         }
     }
 
@@ -1645,7 +1770,7 @@ impl Overlay {
     ///   - `<oid>` or `<oid>.<segno>` where oid/segno are decimal, no leading 0.
     ///   - No fork suffixes like `_vm`, `_fsm`, `_init`, `_ptrack`, or CFS
     ///     variants; any non-digit/`.` suffix causes this to return false.
-    fn is_pg_datafile(&self, rel: &Path) -> bool {
+    pub(crate) fn is_pg_datafile(&self, rel: &Path) -> bool {
         let name = match rel.file_name().and_then(|n| n.to_str()) {
             Some(n) => n,
             None => return false,
