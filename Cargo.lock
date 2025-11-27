@@ -95,12 +95,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46c5e41b57b8bba42a04676d81cb89e9ee8e859a1a66f80a5a72e1cb76b34d43"
 
 [[package]]
-name = "bytes"
-version = "1.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
-
-[[package]]
 name = "cc"
 version = "1.2.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,6 +172,21 @@ checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
 ]
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "ctrlc"
@@ -358,17 +367,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mio"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69d83b0086dc8ecf3ce9ae2874b2d1290252e2a30720bea58a5c6639b0092873"
-dependencies = [
- "libc",
- "wasi",
- "windows-sys",
-]
-
-[[package]]
 name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -444,17 +442,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crossbeam-channel",
  "ctrlc",
  "flate2",
  "fuser",
  "libc",
  "lz4_flex",
- "once_cell",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -608,15 +605,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
-name = "signal-hook-registry"
-version = "1.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2a4719bff48cee6b39d12c020eeb490953ad2443b7055bd0b21fca26bd8c28b"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "simd-adler32"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -691,32 +679,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "tokio"
-version = "1.48.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff360e02eab121e0bc37a2d3b4d4dc622e6eda3a8e5253d5435ecf5bd4c68408"
-dependencies = [
- "bytes",
- "libc",
- "mio",
- "pin-project-lite",
- "signal-hook-registry",
- "tokio-macros",
- "windows-sys",
-]
-
-[[package]]
-name = "tokio-macros"
-version = "2.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af407857209536a95c8e56f8231ef2c2e2aff839b22e07a1ffcbc617e9db9fa5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -842,12 +804,6 @@ dependencies = [
  "same-file",
  "winapi-util",
 ]
-
-[[package]]
-name = "wasi"
-version = "0.11.1+wasi-snapshot-preview1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wasip2"
