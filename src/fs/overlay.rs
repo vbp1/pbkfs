@@ -118,6 +118,9 @@ struct BlockCacheEntry {
     // pg_probackup datafiles during sequential reads; `None` still
     // means "not cached or no logical length".
     logical_len: Option<u64>,
+    // Cached on-disk length of the diff file to avoid repeated metadata calls
+    // on hot paths. Invalidated on write/truncate/copy-up.
+    diff_len: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -434,11 +437,7 @@ impl Overlay {
             return self.datafile_logical_len(rel);
         }
 
-        let diff_path = self.inner.diff.join(rel);
-        let mut best: u64 = 0;
-        if let Ok(meta) = fs::metadata(&diff_path) {
-            best = meta.len();
-        }
+        let mut best: u64 = self.cached_diff_len(rel).unwrap_or(0);
 
         for (idx, path) in self.matching_layers(rel) {
             if let Ok(meta) = fs::metadata(&path) {
@@ -465,8 +464,7 @@ impl Overlay {
         // diff file (size == 0, no materialized blocks yet), fall back to the
         // backup layers to avoid reporting a tiny size and triggering
         // short-read errors during the first copy-up.
-        let diff_path = self.inner.diff.join(rel);
-        let diff_len = fs::metadata(&diff_path).map(|m| m.len()).ok();
+        let diff_len = self.cached_diff_len(rel);
         if let Some(len) = diff_len {
             if len > 0 {
                 return Ok(Some(len));
@@ -731,6 +729,7 @@ impl Overlay {
             if out.metadata()?.len() < required_len {
                 out.set_len(required_len)?;
             }
+            self.update_cached_diff_len(rel, required_len);
             // Bump cached logical length to reflect the newly materialized
             // range so subsequent reads don't hit a stale, shorter EOF.
             if let Ok(mut cache) = self.inner.cache.lock() {
@@ -781,10 +780,10 @@ impl Overlay {
                 if let Some(len) = entry.logical_len {
                     // If the on-disk diff grew (e.g., after materializing new
                     // blocks), prefer the larger length to avoid stale EOFs.
-                    if let Ok(meta) = fs::metadata(self.inner.diff.join(rel)) {
-                        if meta.len() > len {
-                            entry.logical_len = Some(meta.len());
-                            return Ok(Some(meta.len()));
+                    if let Some(diff_len) = entry.diff_len {
+                        if diff_len > len {
+                            entry.logical_len = Some(diff_len);
+                            return Ok(Some(diff_len));
                         }
                     }
                     return Ok(Some(len));
@@ -814,6 +813,7 @@ impl Overlay {
             if let Ok(mut cache) = self.inner.cache.lock() {
                 let entry = cache.entry(rel.to_path_buf()).or_default();
                 entry.logical_len = Some(actual);
+                entry.diff_len = Some(entry.diff_len.unwrap_or(0).max(actual));
             }
         }
         Ok(len)
@@ -1036,6 +1036,33 @@ impl Overlay {
 
     pub fn metrics(&self) -> OverlayMetrics {
         self.inner.metrics.snapshot()
+    }
+
+    /// Cached diff length to avoid repeated metadata syscalls on hot paths.
+    fn cached_diff_len(&self, rel: &Path) -> Option<u64> {
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            if let Some(entry) = cache.get_mut(rel) {
+                if let Some(len) = entry.diff_len {
+                    return Some(len);
+                }
+            }
+        }
+
+        let len = fs::metadata(self.inner.diff.join(rel))
+            .map(|m| m.len())
+            .ok()?;
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            let entry = cache.entry(rel.to_path_buf()).or_default();
+            entry.diff_len = Some(len);
+        }
+        Some(len)
+    }
+
+    fn update_cached_diff_len(&self, rel: &Path, len: u64) {
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            let entry = cache.entry(rel.to_path_buf()).or_default();
+            entry.diff_len = Some(entry.diff_len.unwrap_or(0).max(len));
+        }
     }
 
     pub fn compression_algorithm(&self) -> Option<CompressionAlgorithm> {
@@ -1283,6 +1310,7 @@ impl Overlay {
                 entry.sources.remove(&blk);
             }
             entry.logical_len = Some(entry.logical_len.unwrap_or(0).max(logical_end));
+            entry.diff_len = Some(entry.diff_len.unwrap_or(0).max(logical_end));
         }
     }
 

@@ -7,6 +7,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     os::unix::fs::{FileExt, MetadataExt, PermissionsExt},
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -23,6 +24,7 @@ use fuser::{
     Request,
 };
 use libc::{EACCES, EEXIST, EIO, EISDIR, ENOENT, ENOTEMPTY};
+use tracing::{debug, error};
 
 use crate::fs::overlay::Overlay;
 use crate::Result;
@@ -200,6 +202,13 @@ impl FsTask {
 
                 let start_off = offset.max(0) as u64;
                 if let Err(err) = file.write_at(&data, start_off) {
+                    debug!(
+                        error = ?err,
+                        path = %rel.display(),
+                        offset = start_off,
+                        len = data.len(),
+                        "fs_worker_write_at_failed"
+                    );
                     reply.error(err.raw_os_error().unwrap_or(EIO));
                     return;
                 }
@@ -302,8 +311,18 @@ impl FsWorkerPool {
                 .spawn(move || {
                     for task in worker_rx {
                         let _ = &overlay_clone;
-                        FsTask::run(task, &metrics);
+                        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                            FsTask::run(task, &metrics);
+                        }));
                         metrics.decrement_queued();
+                        if let Err(panic) = result {
+                            metrics.record_task(false, 0);
+                            error!(
+                                target = "pbkfs::fs_worker",
+                                ?panic,
+                                "fs_worker_task_panicked"
+                            );
+                        }
                     }
                 })
                 .expect("failed to spawn fs worker thread");
