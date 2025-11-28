@@ -24,6 +24,16 @@ pub struct FsWorkerPoolSnapshot {
     pub last_task_latency_us: u64,
 }
 
+/// Snapshot of overlay/cache/handle state for observability.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OverlayIoSnapshot {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub handle_hits: u64,
+    pub handle_misses: u64,
+    pub handles_open: usize,
+}
+
 /// Initialize global tracing subscriber. Safe to call multiple times; subsequent
 /// calls will no-op.
 pub fn init_logging(format: LogFormat) -> Result<()> {
@@ -74,4 +84,17 @@ pub fn log_fs_worker_pool_metrics(snapshot: FsWorkerPoolSnapshot, level_warn: bo
             "fs_worker_pool_snapshot"
         );
     }
+}
+
+/// Emit overlay handle/cache metrics to aid debugging of hot paths.
+pub fn log_overlay_io_metrics(snapshot: OverlayIoSnapshot) {
+    info!(
+        target = "pbkfs::overlay",
+        cache_hits = snapshot.cache_hits,
+        cache_misses = snapshot.cache_misses,
+        handle_hits = snapshot.handle_hits,
+        handle_misses = snapshot.handle_misses,
+        handles_open = snapshot.handles_open,
+        "overlay_io_metrics"
+    );
 }

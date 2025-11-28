@@ -189,6 +189,97 @@ JSON
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn chmod_on_mounted_path_inval_caches() -> pbkfs::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let store = tempdir()?;
+    let target = tempdir()?;
+    let diff = tempdir()?;
+
+    // Native layout data: single file in backup FULL1.
+    let base_file = native_path(store.path(), "FULL1", std::path::Path::new("data/base.txt"));
+    std::fs::create_dir_all(base_file.parent().unwrap())?;
+    std::fs::write(&base_file, b"native")?;
+
+    // Provide a stub pg_probackup binary via env override to satisfy metadata lookup.
+    let bin_dir = tempdir()?;
+    let script_path = bin_dir.path().join("pg_probackup");
+    std::fs::write(
+        &script_path,
+        r#"#!/bin/bash
+cat <<'JSON'
+[
+  {
+    "instance": "main",
+    "backups": [
+      {
+        "id": "FULL1",
+        "parent-backup-id": null,
+        "backup-mode": "FULL",
+        "status": "OK",
+        "compress-alg": "none",
+        "compress-level": null,
+        "start-time": "2024-01-01 00:00:00+00",
+        "data-bytes": 512,
+        "program-version": "2.6.0"
+      }
+    ]
+  }
+]
+JSON
+"#,
+    )?;
+    let mut perms = std::fs::metadata(&script_path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script_path, perms)?;
+
+    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
+    let _guard = ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    std::env::set_var("PG_PROBACKUP_BIN", &script_path);
+
+    let ctx = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+    })?;
+
+    let mounted_file = target.path().join("data/base.txt");
+    let meta_before = std::fs::metadata(&mounted_file)?;
+    let before_mode = meta_before.permissions().mode() & 0o777;
+
+    // Change mode through the mounted path; cache should be invalidated.
+    let mut new_perms = meta_before.permissions();
+    new_perms.set_mode(0o700);
+    std::fs::set_permissions(&mounted_file, new_perms)?;
+
+    let meta_after = std::fs::metadata(&mounted_file)?;
+    let after_mode = meta_after.permissions().mode() & 0o777;
+
+    assert_ne!(before_mode, after_mode, "mode should change");
+    assert_eq!(0o700, after_mode, "mode should reflect chmod");
+
+    if let Some(handle) = ctx.fuse_handle {
+        handle.unmount();
+    }
+    let _ = std::fs::remove_file(diff.path().join(pbkfs::binding::LOCK_FILE));
+
+    if let Some(bin) = old_bin {
+        std::env::set_var("PG_PROBACKUP_BIN", bin);
+    } else {
+        std::env::remove_var("PG_PROBACKUP_BIN");
+    }
+
+    Ok(())
+}
+
 #[test]
 fn unmount_requires_mnt_path() {
     expect_error(

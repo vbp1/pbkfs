@@ -1,6 +1,11 @@
 #[cfg(target_family = "unix")]
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
-use std::{fs, io::Read, io::Write, path::Path};
+use std::{
+    fs,
+    io::Read,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use flate2::{write::ZlibEncoder, Compression};
 use pbkfs::backup::metadata::{BackupMode, CompressionAlgorithm};
@@ -8,6 +13,40 @@ use pbkfs::fs::overlay::{Layer, Overlay};
 use tempfile::tempdir;
 
 const BLCKSZ: usize = 8192;
+
+/// Simple RAII helper to set and restore env vars inside tests.
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn new(key: &'static str, value: Option<&str>) -> Self {
+        let lock = Self::lock().lock().unwrap();
+        let prev = std::env::var(key).ok();
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        Self { key, prev, _lock: lock }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
 
 #[test]
 fn overlay_reads_base_and_writes_to_diff() -> pbkfs::Result<()> {
@@ -202,6 +241,151 @@ fn incremental_page_backup_reconstructs_full_file() -> pbkfs::Result<()> {
     let diff_path = diff.path().join("data").join(rel);
     let diff_bytes = fs::read(diff_path)?;
     assert_eq!(result, diff_bytes);
+
+    Ok(())
+}
+
+#[test]
+fn page_mode_incremental_without_pagemap_falls_back() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let inc = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("base/16389/1259");
+
+    // Base FULL content: two pages in pg_probackup page-stream format.
+    let base_path = base.path().join("FULL").join("database").join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    let mut base_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&base_path)?;
+    write_incremental_entry(&mut base_file, 0, &vec![b'A'; BLCKSZ])?;
+    write_incremental_entry(&mut base_file, 1, &vec![b'B'; BLCKSZ])?;
+
+    // Incremental PAGE-mode file without pagemap (pg_probackup skips pagemap
+    // for main-fork relations). Contains only block 0.
+    let inc_path = inc.path().join("INC").join("database").join(rel);
+    fs::create_dir_all(inc_path.parent().unwrap())?;
+    let mut inc_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&inc_path)?;
+    let block0 = vec![b'X'; BLCKSZ];
+    write_incremental_entry(&mut inc_file, 0, &block0)?;
+
+    let layers = vec![
+        Layer {
+            root: inc.path().join("INC").join("database"),
+            compression: None,
+            incremental: true,
+            backup_mode: BackupMode::Delta,
+        },
+        Layer {
+            root: base.path().join("FULL").join("database"),
+            compression: None,
+            incremental: false,
+            backup_mode: BackupMode::Full,
+        },
+    ];
+
+    let _env = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    let data = overlay
+        .read_range(rel, 0, BLCKSZ * 2)?
+        .expect("file data");
+
+    assert_eq!(data.len(), BLCKSZ * 2);
+    assert_eq!(&data[..BLCKSZ], &block0[..]);
+    assert_eq!(&data[BLCKSZ..], &vec![b'B'; BLCKSZ][..]);
+
+    // Non-materializing read should not leave a diff copy behind.
+    let diff_path = diff.path().join("data").join(rel);
+    assert!(!diff_path.exists());
+
+    Ok(())
+}
+
+#[test]
+fn page_mode_incremental_respects_full_size_metadata() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let inc = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("base/16389/16402");
+
+    // Base FULL content: three pages in pg_probackup page-stream format.
+    let base_path = base.path().join("FULL").join("database").join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    let mut base_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&base_path)?;
+    write_incremental_entry(&mut base_file, 0, &vec![b'A'; BLCKSZ])?;
+    write_incremental_entry(&mut base_file, 1, &vec![b'B'; BLCKSZ])?;
+    let block2 = vec![b'C'; BLCKSZ];
+    write_incremental_entry(&mut base_file, 2, &block2)?;
+
+    // Incremental DELTA file with only block 0 changed in the page stream.
+    let inc_root = inc.path().join("INC");
+    let inc_path = inc_root.join("database").join(rel);
+    fs::create_dir_all(inc_path.parent().unwrap())?;
+    let mut inc_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&inc_path)?;
+    let block0 = vec![b'X'; BLCKSZ];
+    write_incremental_entry(&mut inc_file, 0, &block0)?;
+
+    // pg_probackup writes backup_content.control next to database/ for the backup root.
+    let bc_path = inc_root.join("backup_content.control");
+    fs::write(
+        &bc_path,
+        format!(
+            "{{\"path\":\"{}\", \"size\":\"{}\", \"mode\":\"33152\", \"is_datafile\":\"1\", \"is_cfs\":\"0\", \"crc\":\"0\", \"compress_alg\":\"none\", \"external_dir_num\":\"0\", \"dbOid\":\"16389\", \"full_size\":\"{}\", \"n_blocks\":\"3\"}}\n",
+            rel.display(),
+            inc_file.metadata()?.len(),
+            BLCKSZ * 3
+        ),
+    )?;
+
+    let layers = vec![
+        Layer {
+            root: inc_root.join("database"),
+            compression: None,
+            incremental: true,
+            backup_mode: BackupMode::Delta,
+        },
+        Layer {
+            root: base.path().join("FULL").join("database"),
+            compression: None,
+            incremental: false,
+            backup_mode: BackupMode::Full,
+        },
+    ];
+
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // Logical length should use metadata (3 blocks) even though the page stream has only block 0.
+    let logical = overlay.logical_len_for(rel)?.expect("logical length");
+    assert_eq!(logical, (BLCKSZ * 3) as u64);
+
+    // Reading block 2 must succeed (falling back to base layer) and return base contents, not EOF.
+    let data = overlay
+        .read_range(rel, (BLCKSZ * 2) as u64, BLCKSZ)?
+        .expect("data for block 2");
+    assert_eq!(data.len(), BLCKSZ);
+    assert_eq!(&data[..], &block2[..]);
+
+    // Non-materializing read should not require a diff copy; if one appears,
+    // it must match the data we just read.
+    let diff_path = diff.path().join("data").join(rel);
+    if diff_path.exists() {
+        let diff_bytes = fs::read(&diff_path)?;
+        assert_eq!(diff_bytes.len(), BLCKSZ * 3);
+        assert_eq!(&diff_bytes[BLCKSZ * 2..], &block2[..]);
+    }
 
     Ok(())
 }
@@ -506,6 +690,151 @@ fn block_reads_respect_pagemap_and_remain_sparse() -> pbkfs::Result<()> {
 }
 
 #[test]
+fn datafile_reads_do_not_materialize_when_policy_disabled() -> pbkfs::Result<()> {
+    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
+
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("base/1/12345");
+    let base_root = base.path().join("FULL/database");
+    fs::create_dir_all(base_root.join(rel.parent().unwrap()))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base_root.join(rel))?;
+    write_incremental_entry(&mut file, 0, &vec![b'A'; BLCKSZ])?;
+    write_incremental_entry(&mut file, 1, &vec![b'B'; BLCKSZ])?;
+
+    let layers = vec![Layer {
+        root: base_root,
+        compression: None,
+        incremental: false,
+        backup_mode: BackupMode::Full,
+    }];
+
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    assert!(
+        !overlay.diff_root().join(rel).exists(),
+        "diff should start empty for datafile"
+    );
+
+    let read = overlay.read_range(rel, 0, BLCKSZ * 2)?.expect("datafile");
+    assert_eq!(read.len(), BLCKSZ * 2);
+
+    let diff_path = overlay.diff_root().join(rel);
+    if diff_path.exists() {
+        let meta = fs::metadata(&diff_path)?;
+        assert_eq!(meta.len(), 0, "materialize_on_read=0 must not copy blocks");
+    }
+
+    let metrics = overlay.metrics();
+    assert_eq!(0, metrics.blocks_copied, "read should avoid copy-up");
+
+    Ok(())
+}
+
+#[test]
+fn datafile_reads_materialize_when_policy_enabled() -> pbkfs::Result<()> {
+    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("1"));
+
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = Path::new("base/1/22222");
+    let base_root = base.path().join("FULL/database");
+    fs::create_dir_all(base_root.join(rel.parent().unwrap()))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base_root.join(rel))?;
+    write_incremental_entry(&mut file, 0, &vec![b'Z'; BLCKSZ])?;
+
+    let layers = vec![Layer {
+        root: base_root,
+        compression: None,
+        incremental: false,
+        backup_mode: BackupMode::Full,
+    }];
+
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    let read = overlay.read_range(rel, 0, BLCKSZ)?.expect("datafile");
+    assert_eq!(read.len(), BLCKSZ);
+
+    let diff_path = overlay.diff_root().join(rel);
+    assert!(diff_path.exists(), "materialize-on-read should create diff copy");
+    assert!(fs::metadata(&diff_path)?.len() >= BLCKSZ as u64);
+
+    let metrics = overlay.metrics();
+    assert!(metrics.blocks_copied >= 1, "materialization should be counted");
+
+    Ok(())
+}
+
+#[test]
+fn write_at_updates_only_requested_range() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = PathBuf::from("tbl");
+    let base_path = base.path().join(&rel);
+    fs::write(&base_path, vec![b'A'; BLCKSZ * 2])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+
+    // Patch the second block without rewriting the first.
+    overlay.write_at(&rel, BLCKSZ as u64, b"XYZ")?;
+
+    let data = overlay.read(&rel)?.expect("patched file");
+    assert_eq!(&data[..BLCKSZ], vec![b'A'; BLCKSZ]);
+    assert_eq!(&data[BLCKSZ..BLCKSZ + 3], b"XYZ");
+    assert!(data[BLCKSZ + 3..BLCKSZ + 8].iter().all(|b| *b == b'A'));
+
+    Ok(())
+}
+
+#[test]
+fn invalidate_cache_removes_cached_entries() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    let rel = PathBuf::from("cache/me");
+    fs::create_dir_all(base.path().join("FULL/database").join(rel.parent().unwrap()))?;
+    fs::write(
+        base.path().join("FULL/database").join(&rel),
+        vec![b'Q'; BLCKSZ],
+    )?;
+
+    let layers = vec![Layer {
+        root: base.path().join("FULL/database"),
+        compression: None,
+        incremental: false,
+        backup_mode: BackupMode::Full,
+    }];
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // Populate cache via a read.
+    let _ = overlay.read_range(&rel, 0, BLCKSZ)?;
+    assert!(overlay
+        .debug_cache_keys()
+        .iter()
+        .any(|p| p == &rel));
+
+    overlay.invalidate_cache(&rel);
+    assert!(
+        !overlay
+            .debug_cache_keys()
+            .iter()
+            .any(|p| p == &rel),
+        "cache entry should be dropped after invalidation"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn mixed_compression_block_decode() -> pbkfs::Result<()> {
     let base = tempdir()?;
     let inc = tempdir()?;
@@ -588,6 +917,8 @@ fn non_default_block_size_supported() -> pbkfs::Result<()> {
 
 #[test]
 fn pg_datafile_range_read_does_not_extend_past_logical_len() -> pbkfs::Result<()> {
+    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("1"));
+
     let base = tempdir()?;
     let diff = tempdir()?;
 
@@ -639,10 +970,13 @@ fn pg_datafile_range_read_does_not_extend_past_logical_len() -> pbkfs::Result<()
     let meta = fs::metadata(&diff_path)?;
     assert_eq!(meta.len(), (BLCKSZ * 4) as u64);
 
-    // Then, read a range starting exactly at logical EOF; this must not
-    // materialize a new zero page or extend the diff-backed file.
-    let beyond = overlay.read_range(rel, (BLCKSZ * 4) as u64, BLCKSZ)?;
-    assert!(matches!(beyond, Some(buf) if buf.is_empty()));
+    // Then, read a range starting exactly at logical EOF; we now serve zeros
+    // (to avoid EIO during WAL replay) but should not extend the diff file.
+    let beyond = overlay
+        .read_range(rel, (BLCKSZ * 4) as u64, BLCKSZ)?
+        .expect("beyond logical len");
+    assert_eq!(beyond.len(), BLCKSZ);
+    assert!(beyond.iter().all(|b| *b == 0));
     let meta_after = fs::metadata(&diff_path)?;
     assert_eq!(meta_after.len(), (BLCKSZ * 4) as u64);
 
@@ -736,4 +1070,93 @@ fn compress_zlib_block(data: &[u8]) -> pbkfs::Result<Vec<u8>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(data)?;
     Ok(encoder.finish()?)
+}
+
+/// Regression test for sparse diff file reads.
+///
+/// When PostgreSQL writes to some blocks of a datafile, the diff file becomes
+/// sparse (only written blocks contain data). Subsequent reads of blocks that
+/// were NOT written to diff must still return data from the backup layer,
+/// not zeros or short reads.
+///
+/// This test simulates the scenario that caused "read only 0 of 8192 bytes"
+/// errors: a datafile with 10 blocks in backup, then a sparse diff file is
+/// created with only blocks 0-1 containing data, then reading block 5 should
+/// return data from backup, not zeros.
+#[test]
+fn sparse_diff_reads_unmaterialized_blocks_from_backup() -> pbkfs::Result<()> {
+    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("1"));
+
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    // Simulate a pg_probackup-style FULL datafile with 10 blocks.
+    let rel = Path::new("base/16389/16402");
+    let data_root = base.path().join("FULL").join("database");
+    let full_path = data_root.join(rel);
+    fs::create_dir_all(full_path.parent().unwrap())?;
+
+    // Build 10 pages with distinct byte patterns (block N has byte 'A'+N).
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&full_path)?;
+    for block in 0u32..10 {
+        let payload = vec![b'A' + (block as u8); BLCKSZ];
+        write_incremental_entry(&mut file, block, &payload)?;
+    }
+
+    // Create backup_content.control with n_blocks=10.
+    let content_path = base.path().join("FULL").join("backup_content.control");
+    fs::write(
+        &content_path,
+        concat!(
+            r#"{"path":"base/16389/16402","size":"-1","mode":"33152","is_datafile":"1","is_cfs":"0","crc":"0","compress_alg":"none","external_dir_num":"0","dbOid":"16389","segno":"0","n_blocks":"10"}"#,
+            "\n"
+        ),
+    )?;
+
+    let layers = vec![Layer {
+        root: data_root.clone(),
+        compression: None,
+        incremental: false,
+        backup_mode: BackupMode::Full,
+    }];
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // Step 1: Create a sparse diff file with extended size but only some data.
+    // This simulates what happens after PostgreSQL writes to a few blocks:
+    // the diff file has the logical size but holes (zeros) in unmaterialized regions.
+    let diff_path = diff.path().join("data").join(rel);
+    fs::create_dir_all(diff_path.parent().unwrap())?;
+    {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&diff_path)?;
+        // Write data only to block 0.
+        file.write_at(&vec![b'X'; BLCKSZ], 0)?;
+        // Extend file to logical size - blocks 1-9 are "holes" (contain zeros).
+        file.set_len((BLCKSZ * 10) as u64)?;
+    }
+
+    // Step 2: Read block 5 which is a "hole" in the sparse diff file.
+    // The bug was that when FUSE used a file handle on the sparse diff file,
+    // read_at() would return zeros instead of data from backup.
+    // With the fix, read_range() correctly reads from backup for unmaterialized blocks.
+    let block5 = overlay.read_range(rel, (BLCKSZ * 5) as u64, BLCKSZ)?.expect("block 5");
+
+    // Block 5 should have byte pattern 'F' (= 'A' + 5) from backup, not zeros.
+    assert_eq!(block5.len(), BLCKSZ, "block 5 should be full BLCKSZ");
+    assert_eq!(block5[0], b'F', "block 5 first byte should be 'F' from backup, not zero");
+    assert!(
+        block5.iter().all(|&b| b == b'F'),
+        "block 5 should be all 'F's from backup, got zeros or wrong data"
+    );
+
+    // Verify that other unmaterialized blocks also read correctly from backup.
+    let block9 = overlay.read_range(rel, (BLCKSZ * 9) as u64, BLCKSZ)?.expect("block 9");
+    assert_eq!(block9[0], b'J', "block 9 first byte should be 'J' from backup");
+
+    Ok(())
 }

@@ -29,6 +29,8 @@ flate2 = "1.0"
 lz4_flex = { version = "0.10", features = ["std"] }
 zstd = "0.13"
 crossbeam-channel = "0.5"
+dashmap = "6.1"
+parking_lot = "0.12"
 
 [dev-dependencies]
 tempfile = "3.10"
