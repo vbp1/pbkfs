@@ -126,14 +126,6 @@ struct BlockCacheEntry {
     // Block indexes per physical path (layer or diff file) to avoid mixing
     // incremental/full variants of the same relation.
     pg_block_index: HashMap<PathBuf, Vec<BlockIndexEntry>>,
-    // Cached logical length for this path. We only cache successful
-    // computations (Some(len)) to avoid repeatedly scanning large
-    // pg_probackup datafiles during sequential reads; `None` still
-    // means "not cached or no logical length".
-    logical_len: Option<u64>,
-    // Cached on-disk length of the diff file to avoid repeated metadata calls
-    // on hot paths. Invalidated on write/truncate/copy-up.
-    diff_len: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -340,13 +332,9 @@ impl Overlay {
         let mut end_offset = offset.saturating_add(size as u64);
         let original_end = end_offset;
 
-        // Always compute logical length for datafiles to avoid stale cached
-        // lengths that can truncate reads after WAL replay.
-        let logical_len = if is_datafile {
-            self.logical_len(rel)?
-        } else {
-            self.cached_logical_len(rel)?
-        };
+        // Always compute fresh logical length to avoid stale cached sizes
+        // that can cause "unexpected data beyond EOF" or short-read errors.
+        let logical_len = self.logical_len(rel)?;
 
         if let Some(len) = logical_len {
             if offset >= len {
@@ -371,12 +359,6 @@ impl Overlay {
                 return Ok(Some(Vec::new()));
             }
             end_offset = end_offset.min(len);
-
-            // refresh cache with authoritative length
-            if let Ok(mut cache) = self.inner.cache.lock() {
-                let entry = cache.entry(rel.to_path_buf()).or_default();
-                entry.logical_len = Some(len);
-            }
         }
 
         if end_offset < original_end {
@@ -536,7 +518,12 @@ impl Overlay {
             return self.datafile_logical_len(rel);
         }
 
-        let mut best: u64 = self.cached_diff_len(rel).unwrap_or(0);
+        // Always read current diff file size from disk, not cache.
+        // Files can be extended via writes, and cached sizes become stale.
+        let diff_len = fs::metadata(self.inner.diff.join(rel))
+            .map(|m| m.len())
+            .ok();
+        let mut best: u64 = diff_len.unwrap_or(0);
 
         for (idx, path) in self.matching_layers(rel) {
             if let Ok(meta) = fs::metadata(&path) {
@@ -563,7 +550,14 @@ impl Overlay {
         // diff file (size == 0, no materialized blocks yet), fall back to the
         // backup layers to avoid reporting a tiny size and triggering
         // short-read errors during the first copy-up.
-        let diff_len = self.cached_diff_len(rel);
+        //
+        // IMPORTANT: Always read current diff file size from disk, not cache.
+        // PostgreSQL can extend files via writes, and cached sizes become stale,
+        // causing "unexpected data beyond EOF" errors when the actual file is
+        // larger than the cached/backup size.
+        let diff_len = fs::metadata(self.inner.diff.join(rel))
+            .map(|m| m.len())
+            .ok();
         let mut best = diff_len.unwrap_or(0);
 
         if best == 0 {
@@ -729,7 +723,6 @@ impl Overlay {
                         .truncate(false)
                         .open(&diff_path)?;
                     file.write_all_at(&zero, self.block_offset(block_idx))?;
-                    self.update_cached_diff_len(rel, self.block_offset(block_idx + 1));
                     if let Ok(mut cache) = self.inner.cache.lock() {
                         let entry = cache.entry(rel.to_path_buf()).or_default();
                         entry.materialized.insert(block_idx);
@@ -780,7 +773,6 @@ impl Overlay {
                             .truncate(false)
                             .open(&diff_path)?;
                         file.write_all_at(&zero, self.block_offset(block_idx))?;
-                        self.update_cached_diff_len(rel, self.block_offset(block_idx + 1));
                         if let Ok(mut cache) = self.inner.cache.lock() {
                             let entry = cache.entry(rel.to_path_buf()).or_default();
                             entry.materialized.insert(block_idx);
@@ -1074,21 +1066,11 @@ impl Overlay {
             // artificially extending to full block size for small files.
             let data_end = offset.saturating_add(data.len() as u64);
 
-            // Computing logical length for PostgreSQL datafiles can be
-            // expensive (it may require scanning pg_probackup page streams).
-            // Cache it per-path so we only pay this cost once per file instead
-            // of once per block during large sequential reads (e.g. `cmp`).
-            let logical_len = self.cached_logical_len(rel)?.unwrap_or(data_end);
+            // Compute fresh logical length to avoid stale sizes.
+            let logical_len = self.logical_len(rel)?.unwrap_or(data_end);
             let required_len = logical_len.max(data_end);
             if out.metadata()?.len() < required_len {
                 out.set_len(required_len)?;
-            }
-            self.update_cached_diff_len(rel, required_len);
-            // Bump cached logical length to reflect the newly materialized
-            // range so subsequent reads don't hit a stale, shorter EOF.
-            if let Ok(mut cache) = self.inner.cache.lock() {
-                let entry = cache.entry(rel.to_path_buf()).or_default();
-                entry.logical_len = Some(required_len);
             }
             let file_len = out.metadata()?.len();
             debug!(
@@ -1121,56 +1103,6 @@ impl Overlay {
         }
 
         Ok(())
-    }
-
-    /// Cached wrapper around `logical_len()` that avoids recomputing logical
-    /// length for the same path, which for PostgreSQL datafiles would
-    /// repeatedly rescan pg_probackup page streams and dominate I/O during
-    /// large sequential reads.
-    fn cached_logical_len(&self, rel: &Path) -> Result<Option<u64>> {
-        // Fast path: if we already cached a non-empty logical length, use it.
-        if let Ok(mut cache) = self.inner.cache.lock() {
-            if let Some(entry) = cache.get_mut(rel) {
-                if let Some(len) = entry.logical_len {
-                    // If the on-disk diff grew (e.g., after materializing new
-                    // blocks), prefer the larger length to avoid stale EOFs.
-                    if let Some(diff_len) = entry.diff_len {
-                        if diff_len > len {
-                            entry.logical_len = Some(diff_len);
-                            return Ok(Some(diff_len));
-                        }
-                    }
-                    return Ok(Some(len));
-                }
-
-                // Also respect a cached set of materialized blocks: derive
-                // the current logical_len from the highest materialized block
-                // if present, to avoid returning None when we've already
-                // copied data beyond what layers report.
-                if !entry.materialized.is_empty() {
-                    let max_block = *entry.materialized.iter().max().unwrap();
-                    let inferred = self.block_offset(max_block + 1);
-                    entry.logical_len = Some(inferred);
-                    return Ok(Some(inferred));
-                }
-            }
-        }
-
-        // Compute logical length once and remember successful result.
-        let len = self.logical_len(rel)?;
-        let len = match len {
-            Some(0) => None, // zero-length is indistinguishable from unknown; avoid caching stale EOF
-            other => other,
-        };
-
-        if let Some(actual) = len {
-            if let Ok(mut cache) = self.inner.cache.lock() {
-                let entry = cache.entry(rel.to_path_buf()).or_default();
-                entry.logical_len = Some(actual);
-                entry.diff_len = Some(entry.diff_len.unwrap_or(0).max(actual));
-            }
-        }
-        Ok(len)
     }
 
     #[allow(dead_code)]
@@ -1431,33 +1363,6 @@ impl Overlay {
         self.inner.materialize_on_read
     }
 
-    /// Cached diff length to avoid repeated metadata syscalls on hot paths.
-    fn cached_diff_len(&self, rel: &Path) -> Option<u64> {
-        if let Ok(mut cache) = self.inner.cache.lock() {
-            if let Some(entry) = cache.get_mut(rel) {
-                if let Some(len) = entry.diff_len {
-                    return Some(len);
-                }
-            }
-        }
-
-        let len = fs::metadata(self.inner.diff.join(rel))
-            .map(|m| m.len())
-            .ok()?;
-        if let Ok(mut cache) = self.inner.cache.lock() {
-            let entry = cache.entry(rel.to_path_buf()).or_default();
-            entry.diff_len = Some(len);
-        }
-        Some(len)
-    }
-
-    fn update_cached_diff_len(&self, rel: &Path, len: u64) {
-        if let Ok(mut cache) = self.inner.cache.lock() {
-            let entry = cache.entry(rel.to_path_buf()).or_default();
-            entry.diff_len = Some(entry.diff_len.unwrap_or(0).max(len));
-        }
-    }
-
     pub fn compression_algorithm(&self) -> Option<CompressionAlgorithm> {
         self.inner.layers.iter().find_map(|l| l.compression)
     }
@@ -1477,14 +1382,11 @@ impl Overlay {
     /// and `pg_probackup restore` see, rather than raw on-disk sizes of backup
     /// files (e.g. pg_probackup page streams with per-page headers).
     pub fn logical_len_for(&self, relative: impl AsRef<Path>) -> Result<Option<u64>> {
-        let rel = relative.as_ref();
-        // For pg_datafile, always recompute to avoid stale cached sizes that
-        // cause "read only 0 of 8192 bytes" errors during PostgreSQL operations.
-        if self.is_pg_datafile(rel) {
-            self.logical_len(rel)
-        } else {
-            self.cached_logical_len(rel)
-        }
+        // Always compute fresh logical length to avoid stale cached sizes.
+        // Caching file sizes is risky: writes can extend files, and the async
+        // worker pool makes cache invalidation difficult. The overhead of
+        // fs::metadata() per getattr is minimal (~1-5μs) compared to correctness.
+        self.logical_len(relative.as_ref())
     }
 
     pub fn top_layer_has_datafile(&self, relative: impl AsRef<Path>) -> bool {
@@ -1741,13 +1643,11 @@ impl Overlay {
 
     /// Record that a write modified the given byte range in the diff file so
     /// subsequent reads will source blocks from the diff rather than
-    /// re-copying from base layers. Also advances cached logical length.
+    /// re-copying from base layers.
     pub(crate) fn record_write(&self, rel: &Path, offset: u64, len: usize) {
         let block_sz = self.inner.block_size.get() as u64;
         let start_block = offset / block_sz;
         let end_block = offset.saturating_add(len as u64).saturating_sub(1) / block_sz;
-        let logical_end = offset.saturating_add(len as u64);
-        let is_datafile = self.is_pg_datafile(rel);
 
         if let Ok(mut cache) = self.inner.cache.lock() {
             let entry = cache.entry(rel.to_path_buf()).or_default();
@@ -1755,17 +1655,6 @@ impl Overlay {
                 entry.materialized.insert(blk);
                 // Drop any remembered upstream source: diff now authoritative.
                 entry.sources.remove(&blk);
-            }
-            // For PostgreSQL datafiles, only grow the cached length (WAL replay
-            // may extend relations incrementally). For regular files (postmaster.pid,
-            // config files, etc.), set the exact length to avoid stale cached lengths
-            // after a write to offset 0 with a smaller size than previous writes.
-            if is_datafile {
-                entry.logical_len = Some(entry.logical_len.unwrap_or(0).max(logical_end));
-                entry.diff_len = Some(entry.diff_len.unwrap_or(0).max(logical_end));
-            } else {
-                entry.logical_len = Some(logical_end);
-                entry.diff_len = Some(logical_end);
             }
         }
     }
