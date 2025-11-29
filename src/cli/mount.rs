@@ -273,10 +273,7 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
 
     let overlay = Overlay::new_with_layers(&store.path, &diff_dir.path, layers)?;
     let layer_roots = overlay.layer_roots();
-    debug!(
-        ?layer_roots,
-        "overlay_layers_order"
-    );
+    debug!(?layer_roots, "overlay_layers_order");
 
     // Persist lock markers before mounting so writes hit the real FS, not the FUSE layer.
     let mut session = MountSession::new(binding.binding_id, &mnt_path);

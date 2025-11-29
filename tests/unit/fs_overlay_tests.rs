@@ -35,7 +35,11 @@ impl EnvGuard {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }
-        Self { key, prev, _lock: lock }
+        Self {
+            key,
+            prev,
+            _lock: lock,
+        }
     }
 }
 
@@ -292,9 +296,7 @@ fn page_mode_incremental_without_pagemap_falls_back() -> pbkfs::Result<()> {
     let _env = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
     let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
 
-    let data = overlay
-        .read_range(rel, 0, BLCKSZ * 2)?
-        .expect("file data");
+    let data = overlay.read_range(rel, 0, BLCKSZ * 2)?.expect("file data");
 
     assert_eq!(data.len(), BLCKSZ * 2);
     assert_eq!(&data[..BLCKSZ], &block0[..]);
@@ -764,11 +766,17 @@ fn datafile_reads_materialize_when_policy_enabled() -> pbkfs::Result<()> {
     assert_eq!(read.len(), BLCKSZ);
 
     let diff_path = overlay.diff_root().join(rel);
-    assert!(diff_path.exists(), "materialize-on-read should create diff copy");
+    assert!(
+        diff_path.exists(),
+        "materialize-on-read should create diff copy"
+    );
     assert!(fs::metadata(&diff_path)?.len() >= BLCKSZ as u64);
 
     let metrics = overlay.metrics();
-    assert!(metrics.blocks_copied >= 1, "materialization should be counted");
+    assert!(
+        metrics.blocks_copied >= 1,
+        "materialization should be counted"
+    );
 
     Ok(())
 }
@@ -801,7 +809,11 @@ fn invalidate_cache_removes_cached_entries() -> pbkfs::Result<()> {
     let diff = tempdir()?;
 
     let rel = PathBuf::from("cache/me");
-    fs::create_dir_all(base.path().join("FULL/database").join(rel.parent().unwrap()))?;
+    fs::create_dir_all(
+        base.path()
+            .join("FULL/database")
+            .join(rel.parent().unwrap()),
+    )?;
     fs::write(
         base.path().join("FULL/database").join(&rel),
         vec![b'Q'; BLCKSZ],
@@ -817,17 +829,11 @@ fn invalidate_cache_removes_cached_entries() -> pbkfs::Result<()> {
 
     // Populate cache via a read.
     let _ = overlay.read_range(&rel, 0, BLCKSZ)?;
-    assert!(overlay
-        .debug_cache_keys()
-        .iter()
-        .any(|p| p == &rel));
+    assert!(overlay.debug_cache_keys().iter().any(|p| p == &rel));
 
     overlay.invalidate_cache(&rel);
     assert!(
-        !overlay
-            .debug_cache_keys()
-            .iter()
-            .any(|p| p == &rel),
+        !overlay.debug_cache_keys().iter().any(|p| p == &rel),
         "cache entry should be dropped after invalidation"
     );
 
@@ -1145,19 +1151,29 @@ fn sparse_diff_reads_unmaterialized_blocks_from_backup() -> pbkfs::Result<()> {
     // The bug was that when FUSE used a file handle on the sparse diff file,
     // read_at() would return zeros instead of data from backup.
     // With the fix, read_range() correctly reads from backup for unmaterialized blocks.
-    let block5 = overlay.read_range(rel, (BLCKSZ * 5) as u64, BLCKSZ)?.expect("block 5");
+    let block5 = overlay
+        .read_range(rel, (BLCKSZ * 5) as u64, BLCKSZ)?
+        .expect("block 5");
 
     // Block 5 should have byte pattern 'F' (= 'A' + 5) from backup, not zeros.
     assert_eq!(block5.len(), BLCKSZ, "block 5 should be full BLCKSZ");
-    assert_eq!(block5[0], b'F', "block 5 first byte should be 'F' from backup, not zero");
+    assert_eq!(
+        block5[0], b'F',
+        "block 5 first byte should be 'F' from backup, not zero"
+    );
     assert!(
         block5.iter().all(|&b| b == b'F'),
         "block 5 should be all 'F's from backup, got zeros or wrong data"
     );
 
     // Verify that other unmaterialized blocks also read correctly from backup.
-    let block9 = overlay.read_range(rel, (BLCKSZ * 9) as u64, BLCKSZ)?.expect("block 9");
-    assert_eq!(block9[0], b'J', "block 9 first byte should be 'J' from backup");
+    let block9 = overlay
+        .read_range(rel, (BLCKSZ * 9) as u64, BLCKSZ)?
+        .expect("block 9");
+    assert_eq!(
+        block9[0], b'J',
+        "block 9 first byte should be 'J' from backup"
+    );
 
     Ok(())
 }

@@ -28,7 +28,11 @@ impl EnvGuard {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }
-        Self { key, prev, _lock: lock }
+        Self {
+            key,
+            prev,
+            _lock: lock,
+        }
     }
 }
 
@@ -141,7 +145,9 @@ fn materialize_policy_keeps_diff_small_for_reads() -> pbkfs::Result<()> {
 
     // Multiple reads should not materialize into diff when policy is disabled.
     for _ in 0..3 {
-        let buf = overlay.read_range(rel, 0, payload.len())?.expect("datafile");
+        let buf = overlay
+            .read_range(rel, 0, payload.len())?
+            .expect("datafile");
         assert_eq!(payload.len(), buf.len());
     }
 

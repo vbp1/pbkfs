@@ -1601,18 +1601,18 @@ impl Filesystem for OverlayFs {
                 return;
             }
             let path = self.overlay.diff_root().join(&rel);
-                    match OpenOptions::new().write(true).open(&path) {
-                        Ok(file) => {
-                            if let Err(err) = file.set_len(target_size) {
-                                reply.error(Self::err_code(err));
-                                return;
-                            }
-                            self.invalidate_path_caches(&rel);
-                        }
-                        Err(err) => {
-                            reply.error(Self::err_code(err));
-                            return;
-                        }
+            match OpenOptions::new().write(true).open(&path) {
+                Ok(file) => {
+                    if let Err(err) = file.set_len(target_size) {
+                        reply.error(Self::err_code(err));
+                        return;
+                    }
+                    self.invalidate_path_caches(&rel);
+                }
+                Err(err) => {
+                    reply.error(Self::err_code(err));
+                    return;
+                }
             }
         }
 

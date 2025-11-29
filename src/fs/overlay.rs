@@ -266,7 +266,9 @@ impl Overlay {
         };
 
         if self.is_pg_datafile(rel) && !self.inner.materialize_on_read {
-            let logical = self.logical_len(rel)?.unwrap_or_else(|| fs::metadata(&base_path).map(|m| m.len()).unwrap_or(0));
+            let logical = self
+                .logical_len(rel)?
+                .unwrap_or_else(|| fs::metadata(&base_path).map(|m| m.len()).unwrap_or(0));
             return self.read_range(rel, 0, logical as usize);
         }
 
@@ -791,7 +793,8 @@ impl Overlay {
         let diff_path = self.inner.diff.join(rel);
         if diff_path.exists() {
             let mut buf = vec![0u8; self.inner.block_size.get()];
-            let read = fs::File::open(&diff_path)?.read_at(&mut buf, self.block_offset(block_idx))?;
+            let read =
+                fs::File::open(&diff_path)?.read_at(&mut buf, self.block_offset(block_idx))?;
             if read < buf.len() {
                 for b in buf.iter_mut().skip(read) {
                     *b = 0;
@@ -890,7 +893,8 @@ impl Overlay {
             BlockSource::Diff => {
                 let mut buf = vec![0u8; block_size];
                 let diff_path = self.inner.diff.join(rel);
-                let read = fs::File::open(&diff_path)?.read_at(&mut buf, self.block_offset(block_idx))?;
+                let read =
+                    fs::File::open(&diff_path)?.read_at(&mut buf, self.block_offset(block_idx))?;
                 if read < buf.len() {
                     for b in buf.iter_mut().skip(read) {
                         *b = 0;
@@ -1604,15 +1608,9 @@ impl Overlay {
                 .map(|s| s == "1")
                 .unwrap_or(false);
 
-            let n_blocks = entry
-                .n_blocks
-                .as_ref()
-                .and_then(|s| s.parse::<u64>().ok());
+            let n_blocks = entry.n_blocks.as_ref().and_then(|s| s.parse::<u64>().ok());
 
-            let full_size = entry
-                .full_size
-                .as_ref()
-                .and_then(|s| s.parse::<u64>().ok());
+            let full_size = entry.full_size.as_ref().and_then(|s| s.parse::<u64>().ok());
 
             let external_dir_num = entry
                 .external_dir_num
