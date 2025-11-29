@@ -27,6 +27,7 @@ use libc::{EACCES, EEXIST, EIO, EISDIR, ENOENT, ENOTEMPTY};
 use tracing::{debug, error};
 
 use crate::fs::overlay::Overlay;
+use crate::fs::pending::PendingOps;
 use crate::Result;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -139,23 +140,38 @@ enum FsTask {
         offset: u64,
         size: usize,
         reply: ReplyData,
+        handle: Option<Arc<File>>,
     },
     Write {
+        ino: u64,
+        seq: u64,
         overlay: Overlay,
         rel: PathBuf,
         offset: i64,
         data: Vec<u8>,
         reply: ReplyWrite,
+        handle: Option<Arc<File>>,
     },
     Fsync {
+        ino: u64,
+        seq: u64,
         overlay: Overlay,
         rel: PathBuf,
         reply: ReplyEmpty,
     },
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct OpenHandle {
+    rel: PathBuf,
+    file: Option<Arc<File>>, // diff or base file handle
+    writable: bool,
+    from_diff: bool,
+}
+
 impl FsTask {
-    fn run(self, metrics: &FsWorkerMetricsInner) {
+    fn run(self, metrics: &FsWorkerMetricsInner, pending_ops: &PendingOps) {
         let start = Instant::now();
         let mut ok = true;
 
@@ -166,37 +182,67 @@ impl FsTask {
                 offset,
                 size,
                 reply,
-            } => match overlay.read_range(&rel, offset, size) {
-                Ok(Some(bytes)) => reply.data(&bytes),
-                Ok(None) => {
-                    ok = false;
-                    reply.error(ENOENT);
+                handle,
+            } => {
+                if let Some(file) = handle {
+                    let mut buf = vec![0u8; size];
+                    match file.read_at(&mut buf, offset) {
+                        Ok(read) => {
+                            buf.truncate(read);
+                            reply.data(&buf);
+                        }
+                        Err(err) => {
+                            ok = false;
+                            reply.error(err.raw_os_error().unwrap_or(EIO));
+                        }
+                    }
+                } else {
+                    match overlay.read_range(&rel, offset, size) {
+                        Ok(Some(bytes)) => reply.data(&bytes),
+                        Ok(None) => {
+                            ok = false;
+                            reply.error(ENOENT);
+                        }
+                        Err(_) => {
+                            ok = false;
+                            reply.error(EIO);
+                        }
+                    }
                 }
-                Err(_) => {
-                    ok = false;
-                    reply.error(EIO);
-                }
-            },
+            }
             FsTask::Write {
+                ino,
+                seq,
                 overlay,
                 rel,
                 offset,
                 data,
                 reply,
+                handle,
             } => {
+                // Wait for all preceding writes to complete (FIFO order)
+                pending_ops.wait_for_preceding(ino, seq);
+
                 // Ensure diff copy exists so we write into a real file, then
                 // perform an in-place pwrite without truncating existing data.
                 if let Err(err) = overlay.ensure_copy_up(&rel) {
                     reply.error(crate::fs::fuse::OverlayFs::err_from_anyhow(err));
+                    pending_ops.decrement(ino, seq);
                     return;
                 }
 
-                let path = overlay.diff_root().join(&rel);
-                let file = match OpenOptions::new().read(true).write(true).open(&path) {
-                    Ok(f) => f,
-                    Err(err) => {
-                        reply.error(err.raw_os_error().unwrap_or(EIO));
-                        return;
+                let file = match handle {
+                    Some(f) => f,
+                    None => {
+                        let path = overlay.diff_root().join(&rel);
+                        match OpenOptions::new().read(true).write(true).open(&path) {
+                            Ok(f) => Arc::new(f),
+                            Err(err) => {
+                                reply.error(err.raw_os_error().unwrap_or(EIO));
+                                pending_ops.decrement(ino, seq);
+                                return;
+                            }
+                        }
                     }
                 };
 
@@ -210,15 +256,25 @@ impl FsTask {
                         "fs_worker_write_at_failed"
                     );
                     reply.error(err.raw_os_error().unwrap_or(EIO));
+                    pending_ops.decrement(ino, seq);
                     return;
                 }
 
+                // For PostgreSQL datafiles, extend if needed (never truncate), as they
+                // may grow via WAL replay and require zero-padding at the end.
+                // For regular files, do NOT set_len - the application manages file size
+                // via O_TRUNC at open or explicit ftruncate. Calling set_len here would
+                // cause corruption when multiple writes are reordered in the worker pool.
                 let needed_len = start_off.saturating_add(data.len() as u64);
-                if let Ok(meta) = file.metadata() {
-                    if meta.len() < needed_len {
-                        if let Err(err) = file.set_len(needed_len) {
-                            reply.error(err.raw_os_error().unwrap_or(EIO));
-                            return;
+                if overlay.is_pg_datafile(&rel) {
+                    if let Ok(meta) = file.metadata() {
+                        let current_len = meta.len();
+                        if current_len < needed_len {
+                            if let Err(err) = file.set_len(needed_len) {
+                                reply.error(err.raw_os_error().unwrap_or(EIO));
+                                pending_ops.decrement(ino, seq);
+                                return;
+                            }
                         }
                     }
                 }
@@ -227,13 +283,20 @@ impl FsTask {
                 // so reads will source data from diff without copy_up.
                 overlay.record_write(&rel, start_off, data.len());
 
+                debug!(path = %rel.display(), ino, seq, "WRITE decrement");
                 reply.written(data.len() as u32);
+                pending_ops.decrement(ino, seq);
             }
             FsTask::Fsync {
+                ino,
+                seq,
                 overlay,
                 rel,
                 reply,
             } => {
+                // Wait for all preceding operations to complete (FIFO order)
+                pending_ops.wait_for_preceding(ino, seq);
+
                 let path = {
                     let diff = overlay.diff_root().join(&rel);
                     if diff.exists() {
@@ -244,6 +307,7 @@ impl FsTask {
                             None => {
                                 ok = false;
                                 reply.error(ENOENT);
+                                pending_ops.decrement(ino, seq);
                                 metrics.record_task(ok, start.elapsed().as_micros() as u64);
                                 return;
                             }
@@ -267,6 +331,7 @@ impl FsTask {
                         reply.error(code);
                     }
                 }
+                pending_ops.decrement(ino, seq);
             }
         }
 
@@ -279,10 +344,11 @@ struct FsWorkerPool {
     tx: Sender<FsTask>,
     _rx: Receiver<FsTask>,
     metrics: Arc<FsWorkerMetricsInner>,
+    pending_ops: Arc<PendingOps>,
 }
 
 impl FsWorkerPool {
-    fn new(overlay: &Overlay) -> Self {
+    fn new(overlay: &Overlay, pending_ops: Arc<PendingOps>) -> Self {
         let workers = std::env::var("PBKFS_FS_WORKERS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -305,6 +371,7 @@ impl FsWorkerPool {
         for idx in 0..workers {
             let worker_rx = shared_rx.clone();
             let metrics = metrics.clone();
+            let pending_ops = pending_ops.clone();
             let overlay_clone = overlay.clone();
             std::thread::Builder::new()
                 .name(format!("pbkfs-fs-worker-{idx}"))
@@ -312,7 +379,7 @@ impl FsWorkerPool {
                     for task in worker_rx {
                         let _ = &overlay_clone;
                         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                            FsTask::run(task, &metrics);
+                            FsTask::run(task, &metrics, &pending_ops);
                         }));
                         metrics.decrement_queued();
                         if let Err(panic) = result {
@@ -332,6 +399,7 @@ impl FsWorkerPool {
             tx,
             _rx: rx,
             metrics,
+            pending_ops,
         }
     }
 
@@ -341,11 +409,11 @@ impl FsWorkerPool {
             Ok(()) => {}
             Err(TrySendError::Full(task)) => {
                 self.metrics.record_rejected();
-                FsTask::run(task, &self.metrics);
+                FsTask::run(task, &self.metrics, &self.pending_ops);
                 self.metrics.decrement_queued();
             }
             Err(TrySendError::Disconnected(task)) => {
-                FsTask::run(task, &self.metrics);
+                FsTask::run(task, &self.metrics, &self.pending_ops);
                 self.metrics.decrement_queued();
             }
         }
@@ -362,6 +430,11 @@ pub struct OverlayFs {
     paths: Mutex<HashMap<u64, PathBuf>>,  // ino -> rel path
     inodes: Mutex<HashMap<PathBuf, u64>>, // rel path -> ino
     next_ino: Mutex<u64>,
+    handles: Mutex<HashMap<u64, OpenHandle>>, // fh -> handle
+    next_fh: AtomicU64,
+    handle_hits: AtomicU64,
+    handle_misses: AtomicU64,
+    pending_ops: Arc<PendingOps>,
     worker_pool: FsWorkerPool,
 }
 
@@ -371,12 +444,18 @@ impl OverlayFs {
         let mut inodes = HashMap::new();
         paths.insert(1, PathBuf::from(""));
         inodes.insert(PathBuf::from(""), 1);
-        let worker_pool = FsWorkerPool::new(&overlay);
+        let pending_ops = Arc::new(PendingOps::new());
+        let worker_pool = FsWorkerPool::new(&overlay, pending_ops.clone());
         Self {
             overlay,
             paths: Mutex::new(paths),
             inodes: Mutex::new(inodes),
             next_ino: Mutex::new(2),
+            handles: Mutex::new(HashMap::new()),
+            next_fh: AtomicU64::new(2),
+            handle_hits: AtomicU64::new(0),
+            handle_misses: AtomicU64::new(0),
+            pending_ops,
             worker_pool,
         }
     }
@@ -405,16 +484,52 @@ impl OverlayFs {
         }
     }
 
+    fn insert_handle(&self, fh: u64, handle: OpenHandle) {
+        self.handles.lock().unwrap().insert(fh, handle);
+    }
+
+    fn remove_handle(&self, fh: u64) {
+        let _ = self.handles.lock().unwrap().remove(&fh);
+    }
+
+    fn take_handle_file(&self, fh: u64) -> Option<OpenHandle> {
+        self.handles.lock().unwrap().get(&fh).cloned()
+    }
+
     fn get_or_insert_ino(&self, rel: &Path) -> u64 {
-        if let Some(id) = self.inodes.lock().unwrap().get(rel).copied() {
+        // Hold inodes lock for entire operation to prevent race condition
+        let mut inodes = self.inodes.lock().unwrap();
+        if let Some(id) = inodes.get(rel).copied() {
             return id;
         }
+        // Not found - allocate new ino while still holding inodes lock
         let mut next = self.next_ino.lock().unwrap();
         let ino = *next;
         *next += 1;
+        drop(next);
         self.paths.lock().unwrap().insert(ino, rel.to_path_buf());
-        self.inodes.lock().unwrap().insert(rel.to_path_buf(), ino);
+        inodes.insert(rel.to_path_buf(), ino);
         ino
+    }
+
+    fn alloc_fh(&self) -> u64 {
+        self.next_fh.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn invalidate_path_caches(&self, rel: &Path) {
+        self.overlay.invalidate_cache(rel);
+    }
+
+    fn log_handle_snapshot(&self) {
+        let overlay_metrics = self.overlay.metrics();
+        let snapshot = crate::logging::OverlayIoSnapshot {
+            cache_hits: overlay_metrics.cache_hits,
+            cache_misses: overlay_metrics.cache_misses,
+            handle_hits: self.handle_hits.load(Ordering::Relaxed),
+            handle_misses: self.handle_misses.load(Ordering::Relaxed),
+            handles_open: self.handles.lock().map(|h| h.len()).unwrap_or(0),
+        };
+        crate::logging::log_overlay_io_metrics(snapshot);
     }
 
     fn child_rel(&self, parent: u64, name: &OsStr) -> Option<PathBuf> {
@@ -634,6 +749,11 @@ impl OverlayFs {
             return None;
         }
 
+        // Attr cache disabled: the minor performance benefit (~1-5μs per stat)
+        // is not worth the correctness risk from stale sizes after writes.
+        // The write() handler invalidates cache BEFORE async worker completes,
+        // creating a race where concurrent getattr can cache stale values.
+
         // `database_map` is never restored into PGDATA by pg_probackup
         // (restore.c skips it), so present it as absent in the mounted view.
         if Self::is_database_map(rel) {
@@ -736,14 +856,23 @@ impl Filesystem for OverlayFs {
         };
     }
 
+    fn forget(&mut self, _req: &Request<'_>, ino: u64, _nlookup: u64) {
+        // Clean up per-inode state when kernel forgets about this inode.
+        // This prevents memory accumulation during long mount sessions.
+        self.pending_ops.remove(ino);
+    }
+
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        // Wait for pending writes to complete before getting attributes
+        self.pending_ops.wait_barrier(ino);
+
         match self.rel_for(ino).and_then(|p| self.stat_path(&p)) {
             Some((attr, _)) => reply.attr(&TTL, &attr),
             None => reply.error(ENOENT),
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let rel = match self.rel_for(ino) {
             Some(r) => r,
             None => {
@@ -755,15 +884,79 @@ impl Filesystem for OverlayFs {
             reply.error(ENOENT);
             return;
         }
-        // Use inode as the file handle so subsequent requests can be validated.
-        reply.opened(ino, 0);
+
+        // Wait for pending writes to complete before opening the file
+        debug!(path = %rel.display(), ino, flags, "OPEN wait_barrier start");
+        let barrier = self.pending_ops.wait_barrier(ino);
+        debug!(path = %rel.display(), ino, barrier, "OPEN wait_barrier done");
+
+        let mut file = None;
+        let mut from_diff = false;
+        let write_intent = (flags & libc::O_ACCMODE) != libc::O_RDONLY
+            || (flags & libc::O_TRUNC) != 0
+            || (flags & libc::O_CREAT) != 0;
+
+        if write_intent {
+            if let Err(err) = self.ensure_diff_copy(&rel) {
+                reply.error(Self::err_code(err));
+                return;
+            }
+            // For pg_datafile, do NOT create a file handle even for write intent.
+            // Reads must go through overlay.read_range() to correctly handle sparse
+            // diff files. Writes will open the diff file on-demand in FsTask::Write.
+            if !self.overlay.is_pg_datafile(&rel) {
+                let path = self.overlay.diff_root().join(&rel);
+                match OpenOptions::new().read(true).write(true).open(&path) {
+                    Ok(f) => {
+                        file = Some(Arc::new(f));
+                        from_diff = true;
+                    }
+                    Err(err) => {
+                        reply.error(Self::err_code(err));
+                        return;
+                    }
+                }
+            }
+        } else {
+            // For pg_datafile, always use overlay.read_range() to correctly handle
+            // sparse diff files and block-level materialization from backup layers.
+            // Direct file handle reads on sparse diff files return 0 bytes for
+            // unmaterialized regions, causing PostgreSQL "read only 0 of 8192 bytes" errors.
+            let is_datafile = self.overlay.is_pg_datafile(&rel);
+            let diff_path = self.overlay.diff_root().join(&rel);
+            if diff_path.exists() && !is_datafile {
+                if let Ok(f) = File::open(&diff_path) {
+                    file = Some(Arc::new(f));
+                    from_diff = true;
+                }
+            } else if let Some((base_path, _, _)) = self.overlay.find_layer_path(&rel) {
+                if !is_datafile {
+                    if let Ok(f) = File::open(&base_path) {
+                        file = Some(Arc::new(f));
+                    }
+                }
+            }
+        }
+
+        let fh = self.alloc_fh();
+        self.insert_handle(
+            fh,
+            OpenHandle {
+                rel: rel.clone(),
+                file,
+                writable: write_intent,
+                from_diff,
+            },
+        );
+
+        reply.opened(fh, 0);
     }
 
     fn read(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
@@ -781,16 +974,28 @@ impl Filesystem for OverlayFs {
             reply.error(ENOENT);
             return;
         }
-        // Kernel echoes back the file handle we returned in `open`; we don't
-        // strictly require equality with the inode.
+
+        // Wait for pending writes to complete before reading
+        self.pending_ops.wait_barrier(ino);
 
         let off = if offset < 0 { 0 } else { offset as u64 };
+        let handle = self.take_handle_file(fh).and_then(|h| h.file.clone());
+        let total = if handle.is_some() {
+            self.handle_hits.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.handle_misses.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        if total % 256 == 0 {
+            self.log_handle_snapshot();
+        }
+
         let task = FsTask::Read {
             overlay: self.overlay.clone(),
             rel,
             offset: off,
             size: size as usize,
             reply,
+            handle,
         };
         self.worker_pool.submit(task);
     }
@@ -818,18 +1023,63 @@ impl Filesystem for OverlayFs {
             reply.error(ENOENT);
             return;
         }
-        if fh != ino {
-            reply.error(EIO);
-            return;
+
+        let mut handle_arc: Option<Arc<File>> = None;
+        {
+            let mut handles = self.handles.lock().unwrap();
+            if let Some(entry) = handles.get_mut(&fh) {
+                if entry.file.is_none() || !entry.from_diff {
+                    if let Err(err) = self.ensure_diff_copy(&rel) {
+                        reply.error(Self::err_code(err));
+                        return;
+                    }
+                    let path = self.overlay.diff_root().join(&rel);
+                    match OpenOptions::new().read(true).write(true).open(&path) {
+                        Ok(f) => {
+                            entry.file = Some(Arc::new(f));
+                            entry.from_diff = true;
+                        }
+                        Err(err) => {
+                            reply.error(Self::err_code(err));
+                            return;
+                        }
+                    }
+                }
+                handle_arc = entry.file.clone();
+            }
         }
+
+        self.invalidate_path_caches(&rel);
+
+        // Get sequence number BEFORE submitting to worker pool
+        let seq = self.pending_ops.increment(ino);
+        debug!(path = %rel.display(), ino, seq, offset, len = data.len(), "WRITE increment");
+
         let task = FsTask::Write {
+            ino,
+            seq,
             overlay: self.overlay.clone(),
             rel,
             offset,
             data: data.to_vec(),
             reply,
+            handle: handle_arc,
         };
         self.worker_pool.submit(task);
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        self.remove_handle(fh);
+        reply.ok();
     }
 
     fn readdir(
@@ -950,7 +1200,7 @@ impl Filesystem for OverlayFs {
         name: &OsStr,
         mode: u32,
         _umask: u32,
-        flags: i32,
+        _flags: i32,
         reply: ReplyCreate,
     ) {
         let rel = match self.child_rel(parent, name) {
@@ -976,9 +1226,22 @@ impl Filesystem for OverlayFs {
         match opts.open(&path) {
             Ok(file) => {
                 let _ = file.set_permissions(PermissionsExt::from_mode(mode & 0o777));
-                let ino = self.get_or_insert_ino(&rel);
+                let _ino = self.get_or_insert_ino(&rel);
                 match self.stat_path(&rel) {
-                    Some((attr, _)) => reply.created(&TTL, &attr, GENERATION, ino, flags as u32),
+                    Some((attr, _)) => {
+                        // Allocate file handle and register it (like open() does)
+                        let fh = self.alloc_fh();
+                        self.insert_handle(
+                            fh,
+                            OpenHandle {
+                                rel: rel.clone(),
+                                file: Some(Arc::new(file)),
+                                writable: true,
+                                from_diff: true,
+                            },
+                        );
+                        reply.created(&TTL, &attr, GENERATION, fh, 0);
+                    }
                     None => reply.error(ENOENT),
                 }
             }
@@ -1091,6 +1354,11 @@ impl Filesystem for OverlayFs {
             return;
         }
 
+        // Wait for pending writes on this file before deleting
+        if let Some(ino) = self.inodes.lock().unwrap().get(&rel).copied() {
+            self.pending_ops.wait_barrier(ino);
+        }
+
         let diff_path = self.overlay.diff_root().join(&rel);
         if diff_path.exists() {
             match fs::symlink_metadata(&diff_path) {
@@ -1118,7 +1386,7 @@ impl Filesystem for OverlayFs {
             }
         }
 
-        self.overlay.invalidate_cache(&rel);
+        self.invalidate_path_caches(&rel);
 
         reply.ok();
     }
@@ -1135,6 +1403,11 @@ impl Filesystem for OverlayFs {
         if self.is_whiteouted(&rel) {
             reply.ok();
             return;
+        }
+
+        // Wait for pending operations on this directory
+        if let Some(ino) = self.inodes.lock().unwrap().get(&rel).copied() {
+            self.pending_ops.wait_barrier(ino);
         }
 
         match self.visible_dir_entries(&rel) {
@@ -1197,6 +1470,22 @@ impl Filesystem for OverlayFs {
             return;
         }
 
+        // Wait for pending writes on source and target before renaming
+        {
+            let inodes = self.inodes.lock().unwrap();
+            if let Some(ino) = inodes.get(&src_rel).copied() {
+                drop(inodes);
+                self.pending_ops.wait_barrier(ino);
+            }
+        }
+        {
+            let inodes = self.inodes.lock().unwrap();
+            if let Some(ino) = inodes.get(&dst_rel).copied() {
+                drop(inodes);
+                self.pending_ops.wait_barrier(ino);
+            }
+        }
+
         if self.stat_path(&src_rel).is_none() {
             reply.error(ENOENT);
             return;
@@ -1255,8 +1544,8 @@ impl Filesystem for OverlayFs {
                         return;
                     }
                 }
-                self.overlay.invalidate_cache(&src_rel);
-                self.overlay.invalidate_cache(&dst_rel);
+                self.invalidate_path_caches(&src_rel);
+                self.invalidate_path_caches(&dst_rel);
                 reply.ok();
             }
             Err(err) => reply.error(Self::err_code(err)),
@@ -1293,6 +1582,9 @@ impl Filesystem for OverlayFs {
             return;
         }
 
+        // Wait for pending writes before modifying attributes
+        self.pending_ops.wait_barrier(ino);
+
         if (size.is_some() || mode.is_some()) && self.stat_path(&rel).is_none() {
             reply.error(ENOENT);
             return;
@@ -1315,7 +1607,7 @@ impl Filesystem for OverlayFs {
                         reply.error(Self::err_code(err));
                         return;
                     }
-                    self.overlay.invalidate_cache(&rel);
+                    self.invalidate_path_caches(&rel);
                 }
                 Err(err) => {
                     reply.error(Self::err_code(err));
@@ -1334,6 +1626,7 @@ impl Filesystem for OverlayFs {
                 reply.error(Self::err_code(err));
                 return;
             }
+            self.invalidate_path_caches(&rel);
         }
 
         match self.stat_path(&rel) {
@@ -1376,7 +1669,13 @@ impl Filesystem for OverlayFs {
             reply.error(ENOENT);
             return;
         }
+
+        // Get sequence number BEFORE submitting to worker pool
+        let seq = self.pending_ops.increment(ino);
+
         let task = FsTask::Fsync {
+            ino,
+            seq,
             overlay: self.overlay.clone(),
             rel,
             reply,

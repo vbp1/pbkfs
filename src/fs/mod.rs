@@ -9,6 +9,7 @@ use crate::{Error, Result};
 
 pub mod fuse;
 pub mod overlay;
+pub mod pending;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountState {

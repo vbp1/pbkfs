@@ -2,10 +2,48 @@
 //! benchmark realistically but to ensure the hot-path helpers respond within a
 //! small, predictable window for small fixtures.
 
-use std::{fs, path::Path, sync::Arc, thread, time::Instant};
+use std::{fs, io::Write, path::Path, sync::Arc, thread, time::Instant};
 
 use pbkfs::fs::overlay::Overlay;
 use tempfile::tempdir;
+
+/// RAII env guard for integration tests to toggle feature flags.
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn new(key: &'static str, value: Option<&str>) -> Self {
+        let lock = Self::lock().lock().unwrap();
+        let prev = std::env::var(key).ok();
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        Self {
+            key,
+            prev,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
 
 #[test]
 fn overlay_read_write_is_fast_enough() -> pbkfs::Result<()> {
@@ -77,6 +115,50 @@ fn lazy_block_reads_leave_diff_sparse_and_track_cache() -> pbkfs::Result<()> {
     assert!(metrics.cache_hits >= 1);
     assert!(metrics.cache_misses >= 1);
     assert_eq!(0, metrics.fallback_used);
+
+    Ok(())
+}
+
+#[test]
+fn materialize_policy_keeps_diff_small_for_reads() -> pbkfs::Result<()> {
+    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
+
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    // PostgreSQL-style relation filename to trigger datafile heuristics.
+    let rel = Path::new("12345");
+    let payload = vec![b'R'; 8192];
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base.path().join(rel))?;
+
+    // Two blocks in pg_probackup per-page format.
+    for block in 0u32..2 {
+        file.write_all(&block.to_le_bytes())?;
+        file.write_all(&(payload.len() as i32).to_le_bytes())?;
+        file.write_all(&payload)?;
+    }
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+
+    // Multiple reads should not materialize into diff when policy is disabled.
+    for _ in 0..3 {
+        let buf = overlay
+            .read_range(rel, 0, payload.len())?
+            .expect("datafile");
+        assert_eq!(payload.len(), buf.len());
+    }
+
+    let diff_path = overlay.diff_root().join(rel);
+    assert!(
+        !diff_path.exists(),
+        "reads should not create a diff copy when materialize_on_read is off"
+    );
+
+    let metrics = overlay.metrics();
+    assert_eq!(0, metrics.blocks_copied);
 
     Ok(())
 }

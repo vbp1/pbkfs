@@ -32,6 +32,13 @@ const MAX_OID_DIGITS: usize = 10;
 // pg_probackup segment numbers are bounded (pgFileSize): up to 5 digits.
 const MAX_SEGMENT_DIGITS: usize = 5;
 
+fn parse_bool_env(var: &str, default: bool) -> bool {
+    match std::env::var(var) {
+        Ok(v) => matches!(v.as_str(), "1" | "true" | "TRUE" | "True"),
+        Err(_) => default,
+    }
+}
+
 #[repr(C)]
 struct BackupPageHeader {
     block: u32,
@@ -43,6 +50,8 @@ struct FileMeta {
     compression: Option<CompressionAlgorithm>,
     is_datafile: bool,
     external_dir_num: u32,
+    n_blocks: Option<u64>,
+    full_size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +63,10 @@ struct BackupContentEntry {
     is_datafile: Option<String>,
     #[serde(rename = "external_dir_num")]
     external_dir_num: Option<String>,
+    #[serde(rename = "n_blocks")]
+    n_blocks: Option<String>,
+    #[serde(rename = "full_size")]
+    full_size: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,14 +126,6 @@ struct BlockCacheEntry {
     // Block indexes per physical path (layer or diff file) to avoid mixing
     // incremental/full variants of the same relation.
     pg_block_index: HashMap<PathBuf, Vec<BlockIndexEntry>>,
-    // Cached logical length for this path. We only cache successful
-    // computations (Some(len)) to avoid repeatedly scanning large
-    // pg_probackup datafiles during sequential reads; `None` still
-    // means "not cached or no logical length".
-    logical_len: Option<u64>,
-    // Cached on-disk length of the diff file to avoid repeated metadata calls
-    // on hot paths. Invalidated on write/truncate/copy-up.
-    diff_len: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,6 +147,7 @@ struct OverlayInner {
     // Per-layer file metadata loaded from pg_probackup's backup_content.control.
     // Keyed by layer root -> relative path -> metadata.
     file_meta: Mutex<HashMap<PathBuf, HashMap<String, FileMeta>>>,
+    materialize_on_read: bool,
 }
 
 impl Overlay {
@@ -242,6 +248,7 @@ impl Overlay {
                 cache: Mutex::new(HashMap::new()),
                 metrics: OverlayMetricsInner::default(),
                 file_meta: Mutex::new(HashMap::new()),
+                materialize_on_read: parse_bool_env("PBKFS_MATERIALIZE_ON_READ", false),
             }),
         })
     }
@@ -257,6 +264,13 @@ impl Overlay {
             Some(v) => v,
             None => return Ok(None),
         };
+
+        if self.is_pg_datafile(rel) && !self.inner.materialize_on_read {
+            let logical = self
+                .logical_len(rel)?
+                .unwrap_or_else(|| fs::metadata(&base_path).map(|m| m.len()).unwrap_or(0));
+            return self.read_range(rel, 0, logical as usize);
+        }
 
         // pg_probackup data files (FULL+incremental) and compressed layers
         // must always be materialized into the diff directory before reads.
@@ -311,40 +325,52 @@ impl Overlay {
             return Ok(None);
         }
 
+        let is_datafile = self.is_pg_datafile(rel);
+
         // Respect logical length for all files (including PostgreSQL datafiles).
         // For heap/index files stored in pg_probackup's per-page format, this
         // uses page indexes rather than raw physical sizes to avoid extending
         // relations past their recorded length.
         let mut end_offset = offset.saturating_add(size as u64);
+        let original_end = end_offset;
 
-        // First try cached length; if offset appears past EOF, recompute a
-        // fresh logical length from layers/diff before returning EOF to avoid
-        // stale caches cutting off valid data.
-        if let Some(cached_len) = self.cached_logical_len(rel)? {
-            if offset >= cached_len {
-                if let Some(recalc) = self.logical_len(rel)? {
-                    // refresh cache with authoritative length
-                    if let Ok(mut cache) = self.inner.cache.lock() {
-                        let entry = cache.entry(rel.to_path_buf()).or_default();
-                        entry.logical_len = Some(recalc);
-                    }
+        // Always compute fresh logical length to avoid stale cached sizes
+        // that can cause "unexpected data beyond EOF" or short-read errors.
+        let logical_len = self.logical_len(rel)?;
 
-                    if offset >= recalc {
-                        debug!(
-                            path = %rel.display(),
-                            offset,
-                            logical_len = recalc,
-                            "read_range_logical_eof"
-                        );
-                        return Ok(Some(Vec::new()));
-                    }
-                    end_offset = end_offset.min(recalc);
-                } else {
-                    // Unknown length: proceed without EOF clamp.
+        if let Some(len) = logical_len {
+            if offset >= len {
+                if is_datafile {
+                    // Serve zeroed blocks beyond logical length instead of EOF to
+                    // let WAL replay extend relations without raising short reads.
+                    debug!(
+                        path = %rel.display(),
+                        offset,
+                        logical_len = len,
+                        size,
+                        "read_range_logical_eof_zero_pgdata"
+                    );
+                    return Ok(Some(vec![0u8; size]));
                 }
-            } else {
-                end_offset = end_offset.min(cached_len);
+                debug!(
+                    path = %rel.display(),
+                    offset,
+                    logical_len = len,
+                    "read_range_logical_eof"
+                );
+                return Ok(Some(Vec::new()));
             }
+            end_offset = end_offset.min(len);
+        }
+
+        if end_offset < original_end {
+            debug!(
+                path = %rel.display(),
+                offset,
+                original_end,
+                clamped_end = end_offset,
+                "read_range_clamped_to_logical_len"
+            );
         }
 
         if let Some(parent) = diff_path.parent() {
@@ -357,6 +383,12 @@ impl Overlay {
 
         if size == 0 {
             return Ok(Some(Vec::new()));
+        }
+
+        let should_materialize = !is_datafile || self.inner.materialize_on_read;
+
+        if !should_materialize {
+            return self.read_range_nonmaterializing(rel, offset, end_offset, size, &layers);
         }
 
         let start_block = offset / block_size;
@@ -405,6 +437,57 @@ impl Overlay {
         Ok(Some(buf))
     }
 
+    fn read_range_nonmaterializing(
+        &self,
+        rel: &Path,
+        offset: u64,
+        end_offset: u64,
+        size: usize,
+        _layers: &[(usize, PathBuf)],
+    ) -> Result<Option<Vec<u8>>> {
+        let diff_path = self.inner.diff.join(rel);
+        let diff_preexisting = diff_path.exists();
+
+        let block_size = self.inner.block_size.get() as u64;
+        let start_block = offset / block_size;
+        let end_block = end_offset.saturating_sub(1) / block_size;
+
+        if end_offset <= offset {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut out = vec![0u8; (end_offset - offset) as usize];
+
+        for block in start_block..=end_block {
+            let data = self.read_block_data(rel, block)?;
+            let block_start = self.block_offset(block);
+            let copy_start = offset.max(block_start);
+            let copy_end = (block_start + self.inner.block_size.get() as u64).min(end_offset);
+            let dst_start = (copy_start - offset) as usize;
+            let dst_end = (copy_end - offset) as usize;
+            let src_start = (copy_start - block_start) as usize;
+            let src_end = src_start + (dst_end - dst_start);
+            out[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
+        }
+
+        // Trim to requested size (end_offset might have been clamped to logical length).
+        if out.len() > size {
+            out.truncate(size);
+        }
+
+        // Guarantee no diff file is left behind purely due to reads when
+        // materialize_on_read is disabled. If a file existed beforehand (e.g.,
+        // due to writes), we leave it untouched.
+        if !diff_preexisting && diff_path.exists() {
+            // Best-effort cleanup: remove file if it was created during a
+            // non-materializing read. If the path somehow ended up as a
+            // directory, remove_dir will clean it up as well.
+            let _ = fs::remove_file(&diff_path).or_else(|_| fs::remove_dir(&diff_path));
+        }
+
+        Ok(Some(out))
+    }
+
     fn logical_len(&self, rel: &Path) -> Result<Option<u64>> {
         // For PostgreSQL transaction/status files we should not combine lengths
         // from multiple backups: use the diff file if present, otherwise the
@@ -437,7 +520,12 @@ impl Overlay {
             return self.datafile_logical_len(rel);
         }
 
-        let mut best: u64 = self.cached_diff_len(rel).unwrap_or(0);
+        // Always read current diff file size from disk, not cache.
+        // Files can be extended via writes, and cached sizes become stale.
+        let diff_len = fs::metadata(self.inner.diff.join(rel))
+            .map(|m| m.len())
+            .ok();
+        let mut best: u64 = diff_len.unwrap_or(0);
 
         for (idx, path) in self.matching_layers(rel) {
             if let Ok(meta) = fs::metadata(&path) {
@@ -464,50 +552,74 @@ impl Overlay {
         // diff file (size == 0, no materialized blocks yet), fall back to the
         // backup layers to avoid reporting a tiny size and triggering
         // short-read errors during the first copy-up.
-        let diff_len = self.cached_diff_len(rel);
-        if let Some(len) = diff_len {
-            if len > 0 {
-                return Ok(Some(len));
-            }
+        //
+        // IMPORTANT: Always read current diff file size from disk, not cache.
+        // PostgreSQL can extend files via writes, and cached sizes become stale,
+        // causing "unexpected data beyond EOF" errors when the actual file is
+        // larger than the cached/backup size.
+        let diff_len = fs::metadata(self.inner.diff.join(rel))
+            .map(|m| m.len())
+            .ok();
+        let mut best = diff_len.unwrap_or(0);
 
-            // size == 0; see if we already materialized blocks for this file
-            // in the cache (e.g., after truncate). In that case respect the
-            // diff length even if zero.
+        if best == 0 {
+            // size == 0; if blocks were already materialized (e.g., after truncate),
+            // respect that as the diff length.
             if let Ok(cache) = self.inner.cache.lock() {
                 if let Some(entry) = cache.get(rel) {
-                    if !entry.materialized.is_empty() {
-                        return Ok(Some(len));
+                    if let Some(max_blk) = entry.materialized.iter().max() {
+                        let inferred = self.block_offset(max_blk + 1);
+                        best = best.max(inferred);
                     }
                 }
             }
-
-            // Avoid reporting a logical length of zero; treat as unknown so we
-            // fall back to layer-derived length. This prevents transient
-            // zero-length returns during initial materialization.
-            // Fall through to layer scan.
         }
 
         let matches = self.matching_layers(rel);
         if matches.is_empty() {
-            return Ok(diff_len);
+            return Ok(if best == 0 { None } else { Some(best) });
         }
-
-        let mut best = 0u64;
 
         for (idx, path) in matches {
             let layer = &self.inner.layers[idx];
 
             // For per-page stored files (all pg_probackup main-fork datafiles),
             // inspect BackupPageHeader stream to find highest block.
-            let logical = match self.pg_block_index(rel, &path) {
+            let stream_len = match self.pg_block_index(rel, &path) {
                 Ok(index) if !index.is_empty() => index
                     .iter()
                     .map(|e| self.block_offset(e.block as u64 + 1))
                     .max(),
-                _ => fs::metadata(&path).ok().map(|m| m.len()),
+                _ => None,
+            };
+
+            // Use pg_probackup metadata (n_blocks/full_size) when available to
+            // avoid truncating to the limited set of changed pages present in
+            // an incremental page stream.
+            let meta_len = self
+                .file_meta_len(layer, rel)
+                .map(|len| self.block_offset(len));
+
+            let logical = match (stream_len, meta_len) {
+                (Some(s), Some(m)) => Some(s.max(m)),
+                (Some(s), None) => Some(s),
+                (None, Some(m)) => Some(m),
+                (None, None) => fs::metadata(&path).ok().map(|m| m.len()),
             };
 
             if let Some(len) = logical {
+                if let (Some(m), Some(s)) = (meta_len, stream_len) {
+                    if m > s {
+                        debug!(
+                            path = %rel.display(),
+                            layer = idx,
+                            meta_blocks = m / self.inner.block_size.get() as u64,
+                            stream_blocks = s / self.inner.block_size.get() as u64,
+                            "datafile_logical_len_from_metadata"
+                        );
+                    }
+                }
+
                 best = best.max(len);
                 // If we hit a full (non-incremental) layer, that's the base;
                 // later incrementals cannot extend logical length beyond it.
@@ -518,12 +630,7 @@ impl Overlay {
         }
 
         if best == 0 {
-            // If everything failed, don't return zero; keep diff_len (which
-            // could be None) but map 0 to None to avoid hard EOF at offset 0.
-            match diff_len {
-                Some(0) => Ok(None),
-                other => Ok(other),
-            }
+            Ok(None)
         } else {
             Ok(Some(best))
         }
@@ -603,15 +710,217 @@ impl Overlay {
 
         let source = match self.locate_block_source(rel, block_idx)? {
             Some(s) => s,
-            None => return Err(io::Error::from(io::ErrorKind::NotFound).into()),
+            None => {
+                if self.is_pg_datafile(rel) {
+                    // No layer provides this block; treat as zero page to avoid EIO.
+                    let zero = vec![0u8; self.inner.block_size.get()];
+                    let diff_path = self.inner.diff.join(rel);
+                    if let Some(parent) = diff_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let file = fs::OpenOptions::new()
+                        .create(true)
+                        .read(true)
+                        .write(true)
+                        .truncate(false)
+                        .open(&diff_path)?;
+                    file.write_all_at(&zero, self.block_offset(block_idx))?;
+                    if let Ok(mut cache) = self.inner.cache.lock() {
+                        let entry = cache.entry(rel.to_path_buf()).or_default();
+                        entry.materialized.insert(block_idx);
+                    }
+                    return Ok(());
+                }
+                return Err(io::Error::from(io::ErrorKind::NotFound).into());
+            }
         };
+        let mut source = source;
 
-        if let Ok(mut cache) = self.inner.cache.lock() {
-            let entry = cache.entry(rel.to_path_buf()).or_default();
-            entry.sources.insert(block_idx, source);
+        loop {
+            if let Ok(mut cache) = self.inner.cache.lock() {
+                let entry = cache.entry(rel.to_path_buf()).or_default();
+                entry.sources.insert(block_idx, source);
+            }
+
+            match self.copy_block(rel, block_idx, source) {
+                Ok(()) => return Ok(()),
+                Err(err) if self.should_retry_missing_block(rel, source, &err) => {
+                    debug!(
+                        path = %rel.display(),
+                        block = block_idx,
+                        source = ?source,
+                        error = ?err,
+                        "block_copy_missing_retry"
+                    );
+                    if let Some(next) = self.fallback_block_source(rel, block_idx, source)? {
+                        if let Ok(mut cache) = self.inner.cache.lock() {
+                            if let Some(entry) = cache.get_mut(rel) {
+                                entry.sources.remove(&block_idx);
+                            }
+                        }
+                        source = next;
+                        continue;
+                    }
+                    // No fallback available; for datafiles, materialize zeroes to avoid EIO.
+                    if self.is_pg_datafile(rel) {
+                        let zero = vec![0u8; self.inner.block_size.get()];
+                        let diff_path = self.inner.diff.join(rel);
+                        if let Some(parent) = diff_path.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        let file = fs::OpenOptions::new()
+                            .create(true)
+                            .read(true)
+                            .write(true)
+                            .truncate(false)
+                            .open(&diff_path)?;
+                        file.write_all_at(&zero, self.block_offset(block_idx))?;
+                        if let Ok(mut cache) = self.inner.cache.lock() {
+                            let entry = cache.entry(rel.to_path_buf()).or_default();
+                            entry.materialized.insert(block_idx);
+                        }
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn read_block_data(&self, rel: &Path, block_idx: u64) -> Result<Vec<u8>> {
+        // Prefer diff if already materialized.
+        let diff_path = self.inner.diff.join(rel);
+        if diff_path.exists() {
+            let mut buf = vec![0u8; self.inner.block_size.get()];
+            let read =
+                fs::File::open(&diff_path)?.read_at(&mut buf, self.block_offset(block_idx))?;
+            if read < buf.len() {
+                for b in buf.iter_mut().skip(read) {
+                    *b = 0;
+                }
+            }
+            return Ok(buf);
         }
 
-        self.copy_block(rel, block_idx, source)
+        // Cache lookup for known sources.
+        let mut source: Option<BlockSource> = None;
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            if let Some(entry) = cache.get_mut(rel) {
+                if let Some(src) = entry.sources.get(&block_idx).copied() {
+                    self.inner
+                        .metrics
+                        .cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    source = Some(src);
+                } else {
+                    self.inner
+                        .metrics
+                        .cache_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        if source.is_none() {
+            source = self.locate_block_source(rel, block_idx)?;
+        }
+
+        let mut source = match source {
+            Some(s) => s,
+            None => {
+                if self.is_pg_datafile(rel) {
+                    return Ok(vec![0u8; self.inner.block_size.get()]);
+                }
+                return Err(io::Error::from(io::ErrorKind::NotFound).into());
+            }
+        };
+
+        loop {
+            match self.read_block_from_source(rel, block_idx, source) {
+                Ok(data) => {
+                    if let Ok(mut cache) = self.inner.cache.lock() {
+                        cache
+                            .entry(rel.to_path_buf())
+                            .or_default()
+                            .sources
+                            .insert(block_idx, source);
+                    }
+                    return Ok(data);
+                }
+                Err(err) if self.should_retry_missing_block(rel, source, &err) => {
+                    debug!(
+                        path = %rel.display(),
+                        block = block_idx,
+                        source = ?source,
+                        error = ?err,
+                        "block_read_missing_retry"
+                    );
+                    if let Some(next_source) = self.fallback_block_source(rel, block_idx, source)? {
+                        if let Ok(mut cache) = self.inner.cache.lock() {
+                            if let Some(entry) = cache.get_mut(rel) {
+                                entry.sources.remove(&block_idx);
+                            }
+                        }
+                        source = next_source;
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(err) => {
+                    debug!(
+                        path = %rel.display(),
+                        block = block_idx,
+                        source = ?source,
+                        error = ?err,
+                        "block_read_error"
+                    );
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    fn read_block_from_source(
+        &self,
+        rel: &Path,
+        block_idx: u64,
+        source: BlockSource,
+    ) -> Result<Vec<u8>> {
+        let block_size = self.inner.block_size.get();
+
+        match source {
+            BlockSource::Diff => {
+                let mut buf = vec![0u8; block_size];
+                let diff_path = self.inner.diff.join(rel);
+                let read =
+                    fs::File::open(&diff_path)?.read_at(&mut buf, self.block_offset(block_idx))?;
+                if read < buf.len() {
+                    for b in buf.iter_mut().skip(read) {
+                        *b = 0;
+                    }
+                }
+                Ok(buf)
+            }
+            BlockSource::Zero => Ok(vec![0u8; block_size]),
+            BlockSource::Layer { idx } => {
+                let layer = &self.inner.layers[idx];
+                let path = layer.root.join(rel);
+                let file_algo = self.file_compression_for_layer(idx, rel);
+                let data = if layer.incremental {
+                    let has_pagemap = path.with_extension("pagemap").exists();
+                    if has_pagemap || self.is_pg_datafile(rel) {
+                        self.read_pg_data_block(rel, &path, file_algo, block_idx)?
+                    } else {
+                        self.read_full_block(rel, &path, layer, file_algo, block_idx)?
+                    }
+                } else {
+                    self.read_full_block(rel, &path, layer, file_algo, block_idx)?
+                };
+
+                data.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound).into())
+            }
+        }
     }
 
     fn locate_block_source(&self, rel: &Path, block_idx: u64) -> Result<Option<BlockSource>> {
@@ -637,11 +946,13 @@ impl Overlay {
         for (idx, layer) in self.inner.layers.iter().enumerate().skip(start_layer) {
             let path = layer.root.join(rel);
             if !path.exists() {
+                debug!(path = %rel.display(), layer = idx, candidate = %path.display(), "block_source_layer_missing");
                 continue;
             }
             if layer.incremental {
                 if let Some(pagemap) = self.load_pagemap(&path)? {
                     if !pagemap.contains(&(block_idx as u32)) {
+                        debug!(path = %rel.display(), block = block_idx, layer = idx, "block_source_layer_pagemap_skip");
                         continue;
                     }
                 }
@@ -661,7 +972,46 @@ impl Overlay {
             return Ok(Some(src));
         }
 
+        debug!(path = %rel.display(), block = block_idx, start_layer, "block_source_not_found");
         Ok(None)
+    }
+
+    fn should_retry_missing_block(
+        &self,
+        rel: &Path,
+        source: BlockSource,
+        err: &anyhow::Error,
+    ) -> bool {
+        let not_found = err
+            .downcast_ref::<io::Error>()
+            .map(|e| e.kind() == io::ErrorKind::NotFound)
+            .unwrap_or(false);
+        if !not_found {
+            return false;
+        }
+
+        match source {
+            BlockSource::Layer { idx } => {
+                // For PostgreSQL datafiles in incremental layers, missing blocks
+                // mean "unchanged". Always retry against older layers instead of
+                // surfacing EIO.
+                let layer = &self.inner.layers[idx];
+                self.is_pg_datafile(rel) && layer.incremental
+            }
+            _ => false,
+        }
+    }
+
+    fn fallback_block_source(
+        &self,
+        rel: &Path,
+        block_idx: u64,
+        source: BlockSource,
+    ) -> Result<Option<BlockSource>> {
+        match source {
+            BlockSource::Layer { idx } => self.locate_block_source_from(rel, block_idx, idx + 1),
+            _ => Ok(None),
+        }
     }
 
     fn copy_block(&self, rel: &Path, block_idx: u64, source: BlockSource) -> Result<()> {
@@ -720,21 +1070,11 @@ impl Overlay {
             // artificially extending to full block size for small files.
             let data_end = offset.saturating_add(data.len() as u64);
 
-            // Computing logical length for PostgreSQL datafiles can be
-            // expensive (it may require scanning pg_probackup page streams).
-            // Cache it per-path so we only pay this cost once per file instead
-            // of once per block during large sequential reads (e.g. `cmp`).
-            let logical_len = self.cached_logical_len(rel)?.unwrap_or(data_end);
+            // Compute fresh logical length to avoid stale sizes.
+            let logical_len = self.logical_len(rel)?.unwrap_or(data_end);
             let required_len = logical_len.max(data_end);
             if out.metadata()?.len() < required_len {
                 out.set_len(required_len)?;
-            }
-            self.update_cached_diff_len(rel, required_len);
-            // Bump cached logical length to reflect the newly materialized
-            // range so subsequent reads don't hit a stale, shorter EOF.
-            if let Ok(mut cache) = self.inner.cache.lock() {
-                let entry = cache.entry(rel.to_path_buf()).or_default();
-                entry.logical_len = Some(required_len);
             }
             let file_len = out.metadata()?.len();
             debug!(
@@ -767,56 +1107,6 @@ impl Overlay {
         }
 
         Ok(())
-    }
-
-    /// Cached wrapper around `logical_len()` that avoids recomputing logical
-    /// length for the same path, which for PostgreSQL datafiles would
-    /// repeatedly rescan pg_probackup page streams and dominate I/O during
-    /// large sequential reads.
-    fn cached_logical_len(&self, rel: &Path) -> Result<Option<u64>> {
-        // Fast path: if we already cached a non-empty logical length, use it.
-        if let Ok(mut cache) = self.inner.cache.lock() {
-            if let Some(entry) = cache.get_mut(rel) {
-                if let Some(len) = entry.logical_len {
-                    // If the on-disk diff grew (e.g., after materializing new
-                    // blocks), prefer the larger length to avoid stale EOFs.
-                    if let Some(diff_len) = entry.diff_len {
-                        if diff_len > len {
-                            entry.logical_len = Some(diff_len);
-                            return Ok(Some(diff_len));
-                        }
-                    }
-                    return Ok(Some(len));
-                }
-
-                // Also respect a cached set of materialized blocks: derive
-                // the current logical_len from the highest materialized block
-                // if present, to avoid returning None when we've already
-                // copied data beyond what layers report.
-                if !entry.materialized.is_empty() {
-                    let max_block = *entry.materialized.iter().max().unwrap();
-                    let inferred = self.block_offset(max_block + 1);
-                    entry.logical_len = Some(inferred);
-                    return Ok(Some(inferred));
-                }
-            }
-        }
-
-        // Compute logical length once and remember successful result.
-        let len = self.logical_len(rel)?;
-        let len = match len {
-            Some(0) => None, // zero-length is indistinguishable from unknown; avoid caching stale EOF
-            other => other,
-        };
-
-        if let Some(actual) = len {
-            if let Ok(mut cache) = self.inner.cache.lock() {
-                let entry = cache.entry(rel.to_path_buf()).or_default();
-                entry.logical_len = Some(actual);
-                entry.diff_len = Some(entry.diff_len.unwrap_or(0).max(actual));
-            }
-        }
-        Ok(len)
     }
 
     #[allow(dead_code)]
@@ -1003,6 +1293,32 @@ impl Overlay {
         Ok(())
     }
 
+    /// Partial write helper used by FUSE to avoid re-reading entire files.
+    /// Ensures the diff copy exists, then writes the provided slice at
+    /// `offset` without truncating the file.
+    pub fn write_at(&self, relative: impl AsRef<Path>, offset: u64, data: &[u8]) -> Result<()> {
+        let rel = relative.as_ref();
+        self.ensure_copy_up(rel)?;
+
+        let path = self.inner.diff.join(rel);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+
+        file.write_all_at(data, offset)?;
+
+        let needed_len = offset.saturating_add(data.len() as u64);
+        if file.metadata()?.len() < needed_len {
+            file.set_len(needed_len)?;
+        }
+
+        self.record_write(rel, offset, data.len());
+        Ok(())
+    }
+
     pub fn list_diff_paths(&self) -> Result<Vec<PathBuf>> {
         let mut paths = Vec::new();
         for entry in WalkDir::new(&self.inner.diff)
@@ -1038,31 +1354,17 @@ impl Overlay {
         self.inner.metrics.snapshot()
     }
 
-    /// Cached diff length to avoid repeated metadata syscalls on hot paths.
-    fn cached_diff_len(&self, rel: &Path) -> Option<u64> {
-        if let Ok(mut cache) = self.inner.cache.lock() {
-            if let Some(entry) = cache.get_mut(rel) {
-                if let Some(len) = entry.diff_len {
-                    return Some(len);
-                }
-            }
-        }
-
-        let len = fs::metadata(self.inner.diff.join(rel))
-            .map(|m| m.len())
-            .ok()?;
-        if let Ok(mut cache) = self.inner.cache.lock() {
-            let entry = cache.entry(rel.to_path_buf()).or_default();
-            entry.diff_len = Some(len);
-        }
-        Some(len)
+    /// Debug helper to inspect cached overlay entries.
+    pub fn debug_cache_keys(&self) -> Vec<PathBuf> {
+        self.inner
+            .cache
+            .lock()
+            .map(|c| c.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
-    fn update_cached_diff_len(&self, rel: &Path, len: u64) {
-        if let Ok(mut cache) = self.inner.cache.lock() {
-            let entry = cache.entry(rel.to_path_buf()).or_default();
-            entry.diff_len = Some(entry.diff_len.unwrap_or(0).max(len));
-        }
+    pub fn materialize_on_read(&self) -> bool {
+        self.inner.materialize_on_read
     }
 
     pub fn compression_algorithm(&self) -> Option<CompressionAlgorithm> {
@@ -1084,8 +1386,11 @@ impl Overlay {
     /// and `pg_probackup restore` see, rather than raw on-disk sizes of backup
     /// files (e.g. pg_probackup page streams with per-page headers).
     pub fn logical_len_for(&self, relative: impl AsRef<Path>) -> Result<Option<u64>> {
-        let rel = relative.as_ref();
-        self.cached_logical_len(rel)
+        // Always compute fresh logical length to avoid stale cached sizes.
+        // Caching file sizes is risky: writes can extend files, and the async
+        // worker pool makes cache invalidation difficult. The overhead of
+        // fs::metadata() per getattr is minimal (~1-5μs) compared to correctness.
+        self.logical_len(relative.as_ref())
     }
 
     pub fn top_layer_has_datafile(&self, relative: impl AsRef<Path>) -> bool {
@@ -1230,6 +1535,41 @@ impl Overlay {
         layer_comp
     }
 
+    /// Return the declared length (in blocks) for a datafile as recorded in
+    /// pg_probackup's backup_content.control for the given layer, if present.
+    /// Falls back to full_size when n_blocks is absent.
+    fn file_meta_len(&self, layer: &Layer, rel: &Path) -> Option<u64> {
+        if !self.is_pg_datafile(rel) {
+            return None;
+        }
+
+        let root = layer.root.clone();
+        let rel_key = rel.to_string_lossy().to_string();
+
+        let mut cache = self.inner.file_meta.lock().ok()?;
+        let layer_map = if let Some(m) = cache.get(&root) {
+            m
+        } else {
+            let map = Self::load_backup_content_for_root(&root);
+            cache.insert(root.clone(), map);
+            cache.get(&root).unwrap()
+        };
+
+        let meta = layer_map.get(&rel_key)?;
+        if let Some(n) = meta.n_blocks {
+            return Some(n);
+        }
+
+        if let Some(full) = meta.full_size {
+            let bs = self.inner.block_size.get() as u64;
+            // Round up to full blocks to avoid truncating when full_size is not
+            // an exact multiple of block size (should be exact for datafiles).
+            return Some((full + bs - 1) / bs);
+        }
+
+        None
+    }
+
     fn load_backup_content_for_root(root: &Path) -> HashMap<String, FileMeta> {
         let mut result = HashMap::new();
         let parent = match root.parent() {
@@ -1268,6 +1608,10 @@ impl Overlay {
                 .map(|s| s == "1")
                 .unwrap_or(false);
 
+            let n_blocks = entry.n_blocks.as_ref().and_then(|s| s.parse::<u64>().ok());
+
+            let full_size = entry.full_size.as_ref().and_then(|s| s.parse::<u64>().ok());
+
             let external_dir_num = entry
                 .external_dir_num
                 .as_ref()
@@ -1280,6 +1624,8 @@ impl Overlay {
                     compression: alg,
                     is_datafile,
                     external_dir_num,
+                    n_blocks,
+                    full_size,
                 },
             );
         }
@@ -1287,7 +1633,7 @@ impl Overlay {
         result
     }
 
-    pub(crate) fn invalidate_cache(&self, rel: &Path) {
+    pub fn invalidate_cache(&self, rel: &Path) {
         if let Ok(mut cache) = self.inner.cache.lock() {
             cache.remove(rel);
         }
@@ -1295,12 +1641,11 @@ impl Overlay {
 
     /// Record that a write modified the given byte range in the diff file so
     /// subsequent reads will source blocks from the diff rather than
-    /// re-copying from base layers. Also advances cached logical length.
+    /// re-copying from base layers.
     pub(crate) fn record_write(&self, rel: &Path, offset: u64, len: usize) {
         let block_sz = self.inner.block_size.get() as u64;
         let start_block = offset / block_sz;
         let end_block = offset.saturating_add(len as u64).saturating_sub(1) / block_sz;
-        let logical_end = offset.saturating_add(len as u64);
 
         if let Ok(mut cache) = self.inner.cache.lock() {
             let entry = cache.entry(rel.to_path_buf()).or_default();
@@ -1309,8 +1654,6 @@ impl Overlay {
                 // Drop any remembered upstream source: diff now authoritative.
                 entry.sources.remove(&blk);
             }
-            entry.logical_len = Some(entry.logical_len.unwrap_or(0).max(logical_end));
-            entry.diff_len = Some(entry.diff_len.unwrap_or(0).max(logical_end));
         }
     }
 
@@ -1514,8 +1857,21 @@ impl Overlay {
         let base_pos = matches
             .iter()
             .position(|(idx, _)| !self.inner.layers[*idx].incremental);
-        let base_pos = base_pos.ok_or_else(|| Error::MissingBackup(rel.display().to_string()))?;
-        let (base_idx, base_path) = matches.remove(base_pos);
+
+        let (base_idx, base_path) = if let Some(pos) = base_pos {
+            // Found a FULL backup - use it as the base.
+            matches.remove(pos)
+        } else {
+            // No FULL backup found. Use the oldest incremental layer as the base.
+            // For new files created after the last FULL backup, pg_probackup stores
+            // the entire file in the first incremental backup where it appears
+            // (with use_pagemap=false, all pages are backed up).
+            if matches.is_empty() {
+                return Err(Error::MissingBackup(rel.display().to_string()).into());
+            }
+            // After reverse(), the oldest backup is at the end of the vector.
+            matches.remove(matches.len() - 1)
+        };
 
         self.copy_base(
             &base_path,
