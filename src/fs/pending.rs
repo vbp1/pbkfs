@@ -218,9 +218,8 @@ mod tests {
         // READ arrives and waits
         let ops_for_read = ops.clone();
         let read_handle = thread::spawn(move || {
-            let barrier = ops_for_read.wait_barrier(ino);
             // Return when we woke up
-            barrier
+            ops_for_read.wait_barrier(ino)
         });
 
         thread::sleep(Duration::from_millis(30));

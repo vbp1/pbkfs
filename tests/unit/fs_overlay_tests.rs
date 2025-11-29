@@ -1132,6 +1132,7 @@ fn sparse_diff_reads_unmaterialized_blocks_from_backup() -> pbkfs::Result<()> {
     {
         let file = fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(&diff_path)?;
         // Write data only to block 0.
