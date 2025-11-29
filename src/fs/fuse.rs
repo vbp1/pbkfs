@@ -856,6 +856,12 @@ impl Filesystem for OverlayFs {
         };
     }
 
+    fn forget(&mut self, _req: &Request<'_>, ino: u64, _nlookup: u64) {
+        // Clean up per-inode state when kernel forgets about this inode.
+        // This prevents memory accumulation during long mount sessions.
+        self.pending_ops.remove(ino);
+    }
+
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         // Wait for pending writes to complete before getting attributes
         self.pending_ops.wait_barrier(ino);

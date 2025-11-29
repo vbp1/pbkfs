@@ -126,9 +126,14 @@ impl PendingOps {
     }
 
     /// Cleanup inode entry when inode is forgotten.
-    #[allow(dead_code)]
     pub fn remove(&self, ino: u64) {
         self.inodes.remove(&ino);
+    }
+
+    /// Returns the number of tracked inodes (for testing/metrics).
+    #[cfg(test)]
+    pub fn inode_count(&self) -> usize {
+        self.inodes.len()
     }
 }
 
@@ -293,5 +298,64 @@ mod tests {
 
         assert!(ops.has_pending(2));
         ops.decrement(2, seq2);
+    }
+
+    #[test]
+    fn test_remove_cleans_up_memory() {
+        let ops = PendingOps::new();
+
+        // Initially empty
+        assert_eq!(ops.inode_count(), 0);
+
+        // Create entries for multiple inodes
+        let seq1 = ops.increment(100);
+        let seq2 = ops.increment(200);
+        let seq3 = ops.increment(300);
+        assert_eq!(ops.inode_count(), 3);
+
+        // Complete all operations
+        ops.decrement(100, seq1);
+        ops.decrement(200, seq2);
+        ops.decrement(300, seq3);
+
+        // Entries still exist (just empty in_flight sets)
+        assert_eq!(ops.inode_count(), 3);
+        assert!(!ops.has_pending(100));
+        assert!(!ops.has_pending(200));
+        assert!(!ops.has_pending(300));
+
+        // Remove one inode - simulates forget()
+        ops.remove(100);
+        assert_eq!(ops.inode_count(), 2);
+
+        // Remove remaining inodes
+        ops.remove(200);
+        ops.remove(300);
+        assert_eq!(ops.inode_count(), 0);
+
+        // Removing non-existent inode is a no-op
+        ops.remove(999);
+        assert_eq!(ops.inode_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_with_pending_operations() {
+        let ops = PendingOps::new();
+
+        // Start operation but don't complete it
+        let _seq = ops.increment(42);
+        assert!(ops.has_pending(42));
+        assert_eq!(ops.inode_count(), 1);
+
+        // Remove while operation is pending (edge case - shouldn't happen
+        // in practice since forget is called after all handles are closed)
+        ops.remove(42);
+        assert_eq!(ops.inode_count(), 0);
+
+        // Subsequent operations on removed inode create fresh state
+        let seq2 = ops.increment(42);
+        assert_eq!(ops.inode_count(), 1);
+        assert_eq!(seq2, 1); // Sequence restarted from 1
+        ops.decrement(42, seq2);
     }
 }
