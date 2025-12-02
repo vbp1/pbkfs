@@ -116,8 +116,8 @@ impl PendingOps {
         }
     }
 
-    /// Check if there are pending operations (non-blocking).
-    #[allow(dead_code)]
+    /// Check if there are pending operations (for testing).
+    #[cfg(test)]
     pub fn has_pending(&self, ino: u64) -> bool {
         self.inodes
             .get(&ino)

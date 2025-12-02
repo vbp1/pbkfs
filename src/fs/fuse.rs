@@ -166,7 +166,6 @@ enum FsTask {
 struct OpenHandle {
     rel: PathBuf,
     file: Option<Arc<File>>, // diff or base file handle
-    writable: bool,
     from_diff: bool,
 }
 
@@ -944,7 +943,6 @@ impl Filesystem for OverlayFs {
             OpenHandle {
                 rel: rel.clone(),
                 file,
-                writable: write_intent,
                 from_diff,
             },
         );
@@ -1236,7 +1234,6 @@ impl Filesystem for OverlayFs {
                             OpenHandle {
                                 rel: rel.clone(),
                                 file: Some(Arc::new(file)),
-                                writable: true,
                                 from_diff: true,
                             },
                         );
