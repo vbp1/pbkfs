@@ -28,6 +28,8 @@ pub enum Error {
     DiffDirNotWritable(String),
     #[error("unsupported pg_probackup version: {0}")]
     UnsupportedPgProbackupVersion(String),
+    #[error("unsupported PostgreSQL version: {version} (supported: {min}-{max})")]
+    UnsupportedPostgresVersion { version: String, min: u16, max: u16 },
     #[error("invalid backup store layout: {0}")]
     InvalidStoreLayout(String),
     #[error("pg_probackup binary not found: {0}")]

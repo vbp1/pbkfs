@@ -52,6 +52,7 @@ fn meta_with_status(
         compression,
         size_bytes: 1024,
         checksum_state: ChecksumState::Verified,
+        server_version: None,
     }
 }
 
