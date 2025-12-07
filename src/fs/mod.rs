@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
 
+pub mod delta;
 pub mod fuse;
 pub mod overlay;
 pub mod pending;

@@ -44,6 +44,10 @@ name = "unit_fs_overlay_tests"
 path = "tests/unit/fs_overlay_tests.rs"
 
 [[test]]
+name = "unit_delta_tests"
+path = "tests/unit/delta_tests.rs"
+
+[[test]]
 name = "unit_chain_resolution_tests"
 path = "tests/unit/chain_resolution_tests.rs"
 
@@ -66,3 +70,7 @@ path = "tests/integration/cleanup_tests.rs"
 [[test]]
 name = "integration_mount_perf_tests"
 path = "tests/integration/mount_perf_tests.rs"
+
+[[test]]
+name = "integration_delta_recovery_tests"
+path = "tests/integration/delta_recovery_tests.rs"

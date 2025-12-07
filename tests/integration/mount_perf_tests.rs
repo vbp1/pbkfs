@@ -11,18 +11,12 @@ use tempfile::tempdir;
 struct EnvGuard {
     key: &'static str,
     prev: Option<String>,
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _lock: parking_lot::ReentrantMutexGuard<'static, ()>,
 }
 
 impl EnvGuard {
-    fn lock() -> &'static std::sync::Mutex<()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     fn new(key: &'static str, value: Option<&str>) -> Self {
-        let lock = Self::lock().lock().unwrap();
+        let lock = pbkfs::env_lock().lock();
         let prev = std::env::var(key).ok();
         match value {
             Some(v) => std::env::set_var(key, v),
@@ -275,6 +269,47 @@ fn concurrent_reads_and_writes_remain_correct() -> pbkfs::Result<()> {
         .read(Path::new("data/write.bin"))?
         .expect("write.bin should exist");
     assert_eq!(final_bytes.len(), 64 * 1024);
+
+    Ok(())
+}
+
+#[test]
+fn delta_storage_keeps_patch_files_small() -> pbkfs::Result<()> {
+    use std::path::Path;
+
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/1/16402"); // recognized as datafile
+
+    fs::create_dir_all(base.path().join("base/1"))?;
+    fs::write(base.path().join(rel), vec![0u8; 8192])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+
+    // Small hint-bit style change produces a PATCH slot, not a FULL page.
+    let mut page = vec![0u8; 8192];
+    page[10] = 1;
+    overlay.write_at(rel, 0, &page)?;
+
+    let (patch_path, full_path) = overlay.delta_paths(rel);
+    assert!(patch_path.exists(), "patch file should be created");
+    assert!(
+        full_path.exists(),
+        "full file header should be present even without FULL pages"
+    );
+
+    let patch_len = std::fs::metadata(&patch_path)?.len();
+    assert!(
+        patch_len <= 1024,
+        "patch file should stay small (got {} bytes)",
+        patch_len
+    );
+
+    let full_len = std::fs::metadata(&full_path)?.len();
+    assert!(
+        full_len <= 4096,
+        "full file should only contain header when no FULL pages are written (len={full_len})"
+    );
 
     Ok(())
 }

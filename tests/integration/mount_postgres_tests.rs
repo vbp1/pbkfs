@@ -7,11 +7,45 @@
 
 use std::{fs, path::Path, thread, time::Duration};
 
+use parking_lot::ReentrantMutexGuard;
+
 use pbkfs::{
     binding::BindingRecord, binding::BindingState, binding::LockMarker, cli::mount::MountArgs,
     cli::unmount,
 };
 use tempfile::tempdir;
+
+/// RAII env guard serialized by pbkfs::env_lock to avoid cross-test races.
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+    _lock: ReentrantMutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn new(key: &'static str, value: Option<&str>) -> Self {
+        let lock = pbkfs::env_lock().lock();
+        let prev = std::env::var(key).ok();
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        Self {
+            key,
+            prev,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
 
 fn native_path(store: &Path, backup_id: &str, relative: &Path) -> std::path::PathBuf {
     store
@@ -79,23 +113,16 @@ fn mounts_backup_and_preserves_store_immutability() -> pbkfs::Result<()> {
     // Force BackupStore::load_from_pg_probackup() to use JSON metadata
     // instead of invoking a real pg_probackup binary that may be present
     // in the environment.
-    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
-    let ctx = {
-        std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
-        pbkfs::cli::mount::mount(MountArgs {
-            pbk_store: Some(store.path().to_path_buf()),
-            mnt_path: Some(target.path().to_path_buf()),
-            diff_dir: Some(diff.path().to_path_buf()),
-            instance: Some("main".into()),
-            backup_id: Some("FULL1".into()),
-            force: false,
-        })?
-    };
-    if let Some(bin) = old_bin {
-        std::env::set_var("PG_PROBACKUP_BIN", bin);
-    } else {
-        std::env::remove_var("PG_PROBACKUP_BIN");
-    }
+    let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
+    let ctx = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+        perf_unsafe: false,
+    })?;
 
     // Reads come from base
     let contents = ctx
@@ -150,23 +177,16 @@ fn mount_decompresses_compressed_backup_files() -> pbkfs::Result<()> {
 
     write_metadata(store.path(), true, Some(("zlib", Some(6))));
 
-    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
-    let ctx = {
-        std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
-        pbkfs::cli::mount::mount(MountArgs {
-            pbk_store: Some(store.path().to_path_buf()),
-            mnt_path: Some(target.path().to_path_buf()),
-            diff_dir: Some(diff.path().to_path_buf()),
-            instance: Some("main".into()),
-            backup_id: Some("FULL1".into()),
-            force: false,
-        })?
-    };
-    if let Some(bin) = old_bin {
-        std::env::set_var("PG_PROBACKUP_BIN", bin);
-    } else {
-        std::env::remove_var("PG_PROBACKUP_BIN");
-    }
+    let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
+    let ctx = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+        perf_unsafe: false,
+    })?;
 
     let contents = ctx
         .overlay
@@ -201,8 +221,7 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
     fs::write(&base_file, b"from-store")?;
     write_metadata(store.path(), false, None);
 
-    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
-    std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
+    let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
 
     let initial = match pbkfs::cli::mount::mount(MountArgs {
         pbk_store: Some(store.path().to_path_buf()),
@@ -211,6 +230,7 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
         instance: Some("main".into()),
         backup_id: Some("FULL1".into()),
         force: false,
+        perf_unsafe: false,
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -249,6 +269,7 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
         instance: None,
         backup_id: None,
         force: false,
+        perf_unsafe: false,
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -272,12 +293,6 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
             return Err(err);
         }
     };
-
-    if let Some(bin) = old_bin {
-        std::env::set_var("PG_PROBACKUP_BIN", bin);
-    } else {
-        std::env::remove_var("PG_PROBACKUP_BIN");
-    }
 
     let reread = remount
         .overlay
@@ -328,8 +343,7 @@ fn remount_rejects_binding_mismatch() {
     fs::write(&base_file, b"from-store").unwrap();
     write_metadata(store.path(), false, None);
 
-    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
-    std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
+    let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
 
     let initial = pbkfs::cli::mount::mount(MountArgs {
         pbk_store: Some(store.path().to_path_buf()),
@@ -338,6 +352,7 @@ fn remount_rejects_binding_mismatch() {
         instance: Some("main".into()),
         backup_id: Some("FULL1".into()),
         force: false,
+        perf_unsafe: false,
     })
     .unwrap();
 
@@ -359,6 +374,7 @@ fn remount_rejects_binding_mismatch() {
         instance: Some("other".into()),
         backup_id: Some("FULL1".into()),
         force: false,
+        perf_unsafe: false,
     })
     .expect_err("binding mismatch should fail");
 
@@ -366,12 +382,6 @@ fn remount_rejects_binding_mismatch() {
         .downcast_ref::<pbkfs::Error>()
         .expect("should be pbkfs::Error");
     assert!(matches!(actual, pbkfs::Error::BindingViolation { .. }));
-
-    if let Some(bin) = old_bin {
-        std::env::set_var("PG_PROBACKUP_BIN", bin);
-    } else {
-        std::env::remove_var("PG_PROBACKUP_BIN");
-    }
 }
 
 #[test]
@@ -385,8 +395,7 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
     fs::write(&base_file, b"from-store")?;
     write_metadata(store.path(), false, None);
 
-    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
-    std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
+    let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
 
     let initial = match pbkfs::cli::mount::mount(MountArgs {
         pbk_store: Some(store.path().to_path_buf()),
@@ -395,6 +404,7 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
         instance: Some("main".into()),
         backup_id: Some("FULL1".into()),
         force: false,
+        perf_unsafe: false,
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -439,6 +449,7 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
         instance: None,
         backup_id: None,
         force: false,
+        perf_unsafe: false,
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -449,12 +460,6 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
             return Err(err);
         }
     };
-
-    if let Some(bin) = old_bin {
-        std::env::set_var("PG_PROBACKUP_BIN", bin);
-    } else {
-        std::env::remove_var("PG_PROBACKUP_BIN");
-    }
 
     let binding_after =
         match BindingRecord::load_from_diff(&pbkfs::binding::DiffDir::new(diff.path())?) {
@@ -484,6 +489,103 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
     Ok(())
 }
 
+#[test]
+fn perf_unsafe_creates_and_clears_dirty_marker() -> pbkfs::Result<()> {
+    let store = tempdir()?;
+    let target = tempdir()?;
+    let diff = tempdir()?;
+
+    let base_file = native_path(store.path(), "FULL1", Path::new("data/base.txt"));
+    fs::create_dir_all(base_file.parent().unwrap())?;
+    fs::write(&base_file, b"from-store")?;
+    write_metadata(store.path(), false, None);
+
+    let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
+    let ctx = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+        perf_unsafe: true,
+    })?;
+
+    let marker = diff.path().join(pbkfs::fs::overlay::DIRTY_MARKER);
+    assert!(
+        marker.exists(),
+        "perf-unsafe mount must create dirty marker"
+    );
+
+    ctx.overlay
+        .write(Path::new("data/base.txt"), b"from-diff-updated")?;
+
+    ctx.flush_dirty()?;
+
+    unmount::execute(unmount::UnmountArgs {
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+    })?;
+
+    assert!(
+        !marker.exists(),
+        "graceful unmount should remove perf-unsafe marker"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn perf_unsafe_marker_requires_force_after_crash() -> pbkfs::Result<()> {
+    let store = tempdir()?;
+    let target = tempdir()?;
+    let diff = tempdir()?;
+
+    let base_file = native_path(store.path(), "FULL1", Path::new("data/base.txt"));
+    fs::create_dir_all(base_file.parent().unwrap())?;
+    fs::write(&base_file, b"from-store")?;
+    write_metadata(store.path(), false, None);
+
+    let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
+
+    let marker = diff.path().join(pbkfs::fs::overlay::DIRTY_MARKER);
+    fs::write(&marker, "leftover")?;
+
+    let err = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+        perf_unsafe: false,
+    })
+    .expect_err("mount should reject existing dirty marker");
+
+    match err.downcast::<pbkfs::Error>() {
+        Ok(pbkfs::Error::PerfUnsafeDirtyMarker { .. }) => {}
+        other => panic!("unexpected error for dirty marker: {other:?}"),
+    }
+
+    let ctx = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: true,
+        perf_unsafe: true,
+    })?;
+
+    ctx.flush_dirty()?;
+    unmount::execute(unmount::UnmountArgs {
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+    })?;
+
+    Ok(())
+}
+
 /// Ignored by default: requires a real pg_probackup catalog and FUSE.
 #[test]
 #[ignore]
@@ -506,6 +608,7 @@ fn mounts_native_pg_probackup_catalog_when_available() -> pbkfs::Result<()> {
         instance: Some(instance),
         backup_id: Some(backup_id),
         force: false,
+        perf_unsafe: false,
     })?;
 
     if let Some(handle) = ctx.fuse_handle {

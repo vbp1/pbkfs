@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+use parking_lot::ReentrantMutex;
+use std::sync::OnceLock;
+
 pub mod backup;
 pub mod binding;
 pub mod cli;
@@ -7,6 +10,14 @@ pub mod fs;
 pub mod logging;
 
 pub type Result<T> = anyhow::Result<T>;
+
+/// Global reentrant lock to serialize reads/writes of pbkfs-related env vars.
+/// Reentrancy prevents deadlocks when a caller that already holds the lock
+/// invokes helpers that also consult env vars.
+pub fn env_lock() -> &'static ReentrantMutex<()> {
+    static LOCK: OnceLock<ReentrantMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(ReentrantMutex::default)
+}
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -73,6 +84,16 @@ pub enum Error {
     NotMounted(String),
     #[error("diff directory already in use by pid {0}")]
     BindingInUse(i32),
+    #[error("perf-unsafe marker present at {path}; previous mount did not shut down cleanly. Re-run with --force if you accept potential data loss.")]
+    PerfUnsafeDirtyMarker { path: String },
+    #[error("corrupted patch payload: {reason}")]
+    CorruptedPatch { reason: String },
+    #[error("invalid patch file: {reason}")]
+    InvalidPatchFile { reason: String },
+    #[error("invalid full file: {reason}")]
+    InvalidFullFile { reason: String },
+    #[error("patch payload too large: {len} > {max}")]
+    PatchTooLarge { len: usize, max: usize },
 }
 
 /// Entry point for the library, called by the CLI thin wrapper.

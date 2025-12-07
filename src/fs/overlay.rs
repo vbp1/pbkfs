@@ -2,10 +2,14 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsString,
     fs, io,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     num::NonZeroUsize,
-    os::unix::fs::{symlink, FileExt},
+    os::unix::{
+        fs::{symlink, FileExt},
+        io::AsRawFd,
+    },
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -17,8 +21,15 @@ use std::{
 
 use crate::{
     backup::metadata::{BackupMode, CompressionAlgorithm},
+    env_lock,
+    fs::delta::{
+        apply_patch, compute_delta, hash_path, open_full, open_patch, punch_full_hole,
+        read_full_page, read_patch_slot, write_empty_slot, write_full_page, write_full_ref_slot,
+        write_patch_slot, DeltaDiff, DeltaIndex, SlotKind, PAGE_SIZE,
+    },
     Error, Result,
 };
+use parking_lot::RwLock;
 use serde::Deserialize;
 use tracing::{debug, warn};
 use walkdir::WalkDir;
@@ -31,8 +42,12 @@ const PAGE_TRUNCATED: i32 = -2;
 const MAX_OID_DIGITS: usize = 10;
 // pg_probackup segment numbers are bounded (pgFileSize): up to 5 digits.
 const MAX_SEGMENT_DIGITS: usize = 5;
+pub const DIRTY_MARKER: &str = ".pbkfs-dirty";
 
 fn parse_bool_env(var: &str, default: bool) -> bool {
+    // Tests mutate PBKFS_* env vars concurrently; serialize reads so each test
+    // observes a consistent snapshot.
+    let _guard = env_lock().lock();
     match std::env::var(var) {
         Ok(v) => matches!(v.as_str(), "1" | "true" | "TRUE" | "True"),
         Err(_) => default,
@@ -96,6 +111,14 @@ pub struct OverlayMetrics {
     pub fallback_used: u64,
     pub blocks_copied: u64,
     pub bytes_copied: u64,
+    pub delta_patch_count: u64,
+    pub delta_full_count: u64,
+    pub delta_patch_bytes: u64,
+    pub delta_patch_avg_size: u64,
+    pub delta_bitmaps_loaded: u64,
+    pub delta_bitmaps_total_bytes: u64,
+    pub delta_punch_holes: u64,
+    pub delta_punch_hole_failures: u64,
 }
 
 #[derive(Default, Debug)]
@@ -105,6 +128,13 @@ struct OverlayMetricsInner {
     fallback_used: AtomicU64,
     blocks_copied: AtomicU64,
     bytes_copied: AtomicU64,
+    delta_patch_count: AtomicU64,
+    delta_full_count: AtomicU64,
+    delta_patch_bytes: AtomicU64,
+    delta_bitmaps_loaded: AtomicU64,
+    delta_bitmaps_total_bytes: AtomicU64,
+    delta_punch_holes: AtomicU64,
+    delta_punch_hole_failures: AtomicU64,
 }
 
 impl OverlayMetricsInner {
@@ -115,6 +145,21 @@ impl OverlayMetricsInner {
             fallback_used: self.fallback_used.load(Ordering::Relaxed),
             blocks_copied: self.blocks_copied.load(Ordering::Relaxed),
             bytes_copied: self.bytes_copied.load(Ordering::Relaxed),
+            delta_patch_count: self.delta_patch_count.load(Ordering::Relaxed),
+            delta_full_count: self.delta_full_count.load(Ordering::Relaxed),
+            delta_patch_bytes: self.delta_patch_bytes.load(Ordering::Relaxed),
+            delta_patch_avg_size: {
+                let count = self.delta_patch_count.load(Ordering::Relaxed);
+                if count == 0 {
+                    0
+                } else {
+                    self.delta_patch_bytes.load(Ordering::Relaxed) / count
+                }
+            },
+            delta_bitmaps_loaded: self.delta_bitmaps_loaded.load(Ordering::Relaxed),
+            delta_bitmaps_total_bytes: self.delta_bitmaps_total_bytes.load(Ordering::Relaxed),
+            delta_punch_holes: self.delta_punch_holes.load(Ordering::Relaxed),
+            delta_punch_hole_failures: self.delta_punch_hole_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -135,9 +180,13 @@ struct BlockIndexEntry {
     compressed_size: i32,
 }
 
+type DeltaFileLockMap = HashMap<u64, Arc<RwLock<()>>>;
+type DeltaBlockLockMap = HashMap<(u64, u64), Arc<RwLock<()>>>;
+
 #[derive(Debug)]
 struct OverlayInner {
     base: PathBuf,
+    /// Root for diff contents (`<diff_dir>/data`).
     diff: PathBuf,
     layers: Vec<Layer>, // newest -> oldest
     block_size: NonZeroUsize,
@@ -148,6 +197,12 @@ struct OverlayInner {
     // Keyed by layer root -> relative path -> metadata.
     file_meta: Mutex<HashMap<PathBuf, HashMap<String, FileMeta>>>,
     materialize_on_read: bool,
+    perf_unsafe: bool,
+    dirty_paths: Mutex<HashSet<PathBuf>>,
+    dirty_marker: PathBuf,
+    delta_index: DeltaIndex,
+    delta_file_locks: RwLock<DeltaFileLockMap>,
+    delta_block_locks: RwLock<DeltaBlockLockMap>,
 }
 
 impl Overlay {
@@ -238,7 +293,7 @@ impl Overlay {
             fs::create_dir_all(&data_path)?;
         }
 
-        Ok(Self {
+        let overlay = Self {
             inner: Arc::new(OverlayInner {
                 base: base_path,
                 diff: data_path,
@@ -249,8 +304,101 @@ impl Overlay {
                 metrics: OverlayMetricsInner::default(),
                 file_meta: Mutex::new(HashMap::new()),
                 materialize_on_read: parse_bool_env("PBKFS_MATERIALIZE_ON_READ", false),
+                perf_unsafe: parse_bool_env("PBKFS_PERF_UNSAFE", false),
+                dirty_paths: Mutex::new(HashSet::new()),
+                dirty_marker: diff_root.join(DIRTY_MARKER),
+                delta_index: DeltaIndex::new(),
+                delta_file_locks: RwLock::new(HashMap::new()),
+                delta_block_locks: RwLock::new(HashMap::new()),
             }),
-        })
+        };
+
+        if overlay.inner.perf_unsafe {
+            // Touch perf-unsafe marker so remounts can detect unclean shutdowns.
+            fs::write(&overlay.inner.dirty_marker, b"")?;
+        }
+
+        Ok(overlay)
+    }
+
+    fn file_lock(&self, rel: &Path) -> Arc<RwLock<()>> {
+        let key = hash_path(rel);
+        if let Some(lock) = self.inner.delta_file_locks.read().get(&key) {
+            return Arc::clone(lock);
+        }
+        let mut write = self.inner.delta_file_locks.write();
+        write
+            .entry(key)
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
+    fn block_lock(&self, rel: &Path, block: u64) -> Arc<RwLock<()>> {
+        let key = (hash_path(rel), block);
+        if let Some(lock) = self.inner.delta_block_locks.read().get(&key) {
+            return Arc::clone(lock);
+        }
+        let mut write = self.inner.delta_block_locks.write();
+        write
+            .entry(key)
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
+    fn cleanup_block_lock(&self, rel: &Path, block: u64, lock: &Arc<RwLock<()>>) {
+        if Arc::strong_count(lock) > 1 {
+            return;
+        }
+        let key = (hash_path(rel), block);
+        let mut map = self.inner.delta_block_locks.write();
+        if let Some(existing) = map.get(&key) {
+            if Arc::strong_count(existing) == 1 {
+                map.remove(&key);
+            }
+        }
+    }
+
+    fn cleanup_file_lock(&self, rel: &Path, lock: &Arc<RwLock<()>>) {
+        if Arc::strong_count(lock) > 1 {
+            return;
+        }
+        let key = hash_path(rel);
+        let mut map = self.inner.delta_file_locks.write();
+        if let Some(existing) = map.get(&key) {
+            if Arc::strong_count(existing) == 1 {
+                map.remove(&key);
+            }
+        }
+    }
+
+    fn clear_block_locks_for(&self, rel: &Path) {
+        let key = hash_path(rel);
+        let mut map = self.inner.delta_block_locks.write();
+        map.retain(|(k, _), _| *k != key);
+    }
+
+    fn move_block_locks(&self, src: &Path, dst: &Path) {
+        let src_key = hash_path(src);
+        let dst_key = hash_path(dst);
+        let mut map = self.inner.delta_block_locks.write();
+        let entries: Vec<_> = map
+            .iter()
+            .filter(|((k, _), _)| *k == src_key)
+            .map(|(k, v)| (*k, Arc::clone(v)))
+            .collect();
+        for ((_, block), lock) in entries {
+            map.insert((dst_key, block), lock);
+        }
+        map.retain(|(k, _), _| *k != src_key);
+    }
+
+    fn move_file_lock(&self, src: &Path, dst: &Path) {
+        let src_key = hash_path(src);
+        let dst_key = hash_path(dst);
+        let mut map = self.inner.delta_file_locks.write();
+        if let Some(lock) = map.remove(&src_key) {
+            map.insert(dst_key, lock);
+        }
     }
 
     pub fn read(&self, relative: impl AsRef<Path>) -> Result<Option<Vec<u8>>> {
@@ -557,10 +705,15 @@ impl Overlay {
         // PostgreSQL can extend files via writes, and cached sizes become stale,
         // causing "unexpected data beyond EOF" errors when the actual file is
         // larger than the cached/backup size.
-        let diff_len = fs::metadata(self.inner.diff.join(rel))
-            .map(|m| m.len())
-            .ok();
-        let mut best = diff_len.unwrap_or(0);
+        let diff_path = self.inner.diff.join(rel);
+        let diff_len = fs::metadata(&diff_path).map(|m| m.len()).ok();
+        let patch_exists = self.delta_paths(rel).0.exists();
+        if let Some(len) = diff_len {
+            if len > 0 || patch_exists {
+                return Ok(Some(len));
+            }
+        }
+        let mut best = 0u64;
 
         if best == 0 {
             // size == 0; if blocks were already materialized (e.g., after truncate),
@@ -789,18 +942,60 @@ impl Overlay {
     }
 
     fn read_block_data(&self, rel: &Path, block_idx: u64) -> Result<Vec<u8>> {
+        // Delta-based diff for PostgreSQL datafiles.
+        if self.is_pg_datafile(rel) {
+            if let Some(delta) = self.read_datafile_delta(rel, block_idx)? {
+                return Ok(delta);
+            }
+        }
+
         // Prefer diff if already materialized.
         let diff_path = self.inner.diff.join(rel);
         if diff_path.exists() {
-            let mut buf = vec![0u8; self.inner.block_size.get()];
-            let read =
-                fs::File::open(&diff_path)?.read_at(&mut buf, self.block_offset(block_idx))?;
-            if read < buf.len() {
-                for b in buf.iter_mut().skip(read) {
-                    *b = 0;
+            if self.is_pg_datafile(rel) {
+                if let Ok(meta) = fs::metadata(&diff_path) {
+                    if meta.len() == 0 {
+                        return Ok(vec![0u8; self.inner.block_size.get()]);
+                    }
                 }
             }
-            return Ok(buf);
+            let file = fs::OpenOptions::new().read(true).open(&diff_path)?;
+            let offset = self.block_offset(block_idx);
+
+            let is_hole = if self.is_pg_datafile(rel) {
+                match self.is_sparse_hole(&file, offset) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!(
+                            path = %rel.display(),
+                            block = block_idx,
+                            error = ?e,
+                            "sparse_probe_failed"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
+            if self.is_pg_datafile(rel) && is_hole {
+                return Ok(vec![0u8; self.inner.block_size.get()]);
+            }
+
+            if !is_hole {
+                let mut buf = vec![0u8; self.inner.block_size.get()];
+                let read = file.read_at(&mut buf, offset)?;
+                if read == 0 {
+                    return Ok(vec![0u8; self.inner.block_size.get()]);
+                }
+                if read < buf.len() {
+                    for b in buf.iter_mut().skip(read) {
+                        *b = 0;
+                    }
+                }
+                return Ok(buf);
+            }
         }
 
         // Cache lookup for known sources.
@@ -918,7 +1113,16 @@ impl Overlay {
                     self.read_full_block(rel, &path, layer, file_algo, block_idx)?
                 };
 
-                data.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound).into())
+                if let Some(d) = data {
+                    Ok(d)
+                } else if self.is_pg_datafile(rel) {
+                    if let Some(next) = self.locate_block_source_from(rel, block_idx, idx + 1)? {
+                        return self.read_block_from_source(rel, block_idx, next);
+                    }
+                    Ok(vec![0u8; self.inner.block_size.get()])
+                } else {
+                    Err(io::Error::from(io::ErrorKind::NotFound).into())
+                }
             }
         }
     }
@@ -1025,7 +1229,7 @@ impl Overlay {
                 let layer = &self.inner.layers[idx];
                 let path = layer.root.join(rel);
                 let file_algo = self.file_compression_for_layer(idx, rel);
-                let data = if layer.incremental {
+                let mut data = if layer.incremental {
                     let has_pagemap = path.with_extension("pagemap").exists();
                     if has_pagemap || self.is_pg_datafile(rel) {
                         // Incremental page-mode files use per-page BackupPageHeader records.
@@ -1045,6 +1249,8 @@ impl Overlay {
                             entry.sources.insert(block_idx, next);
                         }
                         return self.copy_block(rel, block_idx, next);
+                    } else if self.is_pg_datafile(rel) {
+                        data = Some(vec![0u8; self.inner.block_size.get()]);
                     }
                 }
 
@@ -1129,7 +1335,37 @@ impl Overlay {
         }
 
         if self.is_pg_datafile(rel) {
-            return self.read_pg_data_block(rel, base_path, compression, block_idx);
+            match self.read_pg_data_block(rel, base_path, compression, block_idx) {
+                Ok(Some(page)) => return Ok(Some(page)),
+                Ok(None) => return Ok(None),
+                Err(err) => {
+                    let format_err = err
+                        .downcast_ref::<Error>()
+                        .map(|e| matches!(e, Error::InvalidIncrementalPageSize { .. }))
+                        .unwrap_or(false)
+                        || err
+                            .downcast_ref::<io::Error>()
+                            .map(|e| {
+                                matches!(
+                                    e.kind(),
+                                    io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                                )
+                            })
+                            .unwrap_or(false);
+
+                    if !format_err {
+                        return Err(err);
+                    }
+
+                    debug!(
+                        path = %rel.display(),
+                        block = block_idx,
+                        "pg_page_stream_fallback_plain"
+                    );
+                }
+            }
+
+            return self.read_plain_block(base_path, block_idx);
         }
 
         // Compressed non-data files (both FULL and incremental) are stored as
@@ -1179,6 +1415,29 @@ impl Overlay {
         Ok(Some(buf))
     }
 
+    fn is_sparse_hole(&self, file: &fs::File, offset: u64) -> io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            // SEEK_DATA returns the next data offset >= current. If it is
+            // beyond the requested offset (or ENXIO), the region is a hole.
+            let res = unsafe { libc::lseek64(file.as_raw_fd(), offset as i64, libc::SEEK_DATA) };
+            if res == -1 {
+                let err = io::Error::last_os_error();
+                return match err.raw_os_error() {
+                    Some(libc::ENXIO) => Ok(true),
+                    Some(libc::ENOSYS) | Some(libc::EINVAL) => Ok(false),
+                    _ => Err(err),
+                };
+            }
+            Ok(res as u64 > offset)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (file, offset);
+            Ok(false)
+        }
+    }
+
     fn read_pg_data_block(
         &self,
         rel: &Path,
@@ -1213,6 +1472,21 @@ impl Overlay {
         Ok(Some(page))
     }
 
+    fn read_plain_block(&self, path: &Path, block_idx: u64) -> Result<Option<Vec<u8>>> {
+        let mut buf = vec![0u8; self.inner.block_size.get()];
+        let file = fs::File::open(path)?;
+        let read = file.read_at(&mut buf, self.block_offset(block_idx))?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if read < buf.len() {
+            for b in buf.iter_mut().skip(read) {
+                *b = 0;
+            }
+        }
+        Ok(Some(buf))
+    }
+
     fn block_offset(&self, block_idx: u64) -> u64 {
         block_idx * self.inner.block_size.get() as u64
     }
@@ -1233,6 +1507,15 @@ impl Overlay {
     /// `offset` without truncating the file.
     pub fn write_at(&self, relative: impl AsRef<Path>, offset: u64, data: &[u8]) -> Result<()> {
         let rel = relative.as_ref();
+        let block_size = self.inner.block_size.get() as u64;
+
+        if self.is_pg_datafile(rel)
+            && offset % block_size == 0
+            && (data.len() as u64) % block_size == 0
+        {
+            return self.write_datafile_delta(rel, offset, data);
+        }
+
         self.ensure_copy_up(rel)?;
 
         let path = self.inner.diff.join(rel);
@@ -1250,7 +1533,121 @@ impl Overlay {
             file.set_len(needed_len)?;
         }
 
+        self.mark_dirty_path(path);
         self.record_write(rel, offset, data.len());
+        Ok(())
+    }
+
+    fn write_datafile_delta(&self, rel: &Path, offset: u64, data: &[u8]) -> Result<()> {
+        let (patch_path, full_path) = self.delta_paths(rel);
+        if let Some(parent) = patch_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let block_size = self.inner.block_size.get() as u64;
+        let file_lock = self.file_lock(rel);
+        let _file_guard = file_lock.read();
+        let patch_file = open_patch(&patch_path)?;
+        let full_file = open_full(&full_path)?;
+        let bitmap = self.inner.delta_index.get_or_create_empty(&patch_path);
+
+        for (i, chunk) in data.chunks(self.inner.block_size.get()).enumerate() {
+            let block_no = offset / block_size + i as u64;
+            let block_lock = self.block_lock(rel, block_no);
+            {
+                let _guard = block_lock.write();
+
+                let base = self.read_base_block(rel, block_no)?;
+                let mut new_page = base;
+                new_page[..chunk.len()].copy_from_slice(chunk);
+
+                let delta = compute_delta(&base, &new_page);
+                let old_kind = bitmap.get(block_no);
+                match delta {
+                    DeltaDiff::Empty => {
+                        if old_kind != 0 {
+                            write_empty_slot(&patch_file, block_no)?;
+                            self.mark_dirty_path(patch_path.clone());
+                            if old_kind == 0b01 {
+                                self.inner
+                                    .metrics
+                                    .delta_punch_holes
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if let Err(err) = punch_full_hole(&full_file, block_no) {
+                                    self.inner
+                                        .metrics
+                                        .delta_punch_hole_failures
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    warn!(
+                                        path = %rel.display(),
+                                        block = block_no,
+                                        error = ?err,
+                                        "delta_punch_hole_failed"
+                                    );
+                                }
+                                self.mark_dirty_path(full_path.clone());
+                            }
+                            bitmap.set(block_no, 0);
+                        }
+                    }
+                    DeltaDiff::Patch { .. } => {
+                        let payload = delta.to_patch_bytes().unwrap();
+                        write_patch_slot(&patch_file, block_no, &payload)?;
+                        self.mark_dirty_path(patch_path.clone());
+                        if old_kind == 0b01 {
+                            self.inner
+                                .metrics
+                                .delta_punch_holes
+                                .fetch_add(1, Ordering::Relaxed);
+                            if let Err(err) = punch_full_hole(&full_file, block_no) {
+                                self.inner
+                                    .metrics
+                                    .delta_punch_hole_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                                warn!(
+                                    path = %rel.display(),
+                                    block = block_no,
+                                    error = ?err,
+                                    "delta_punch_hole_failed"
+                                );
+                            }
+                            self.mark_dirty_path(full_path.clone());
+                        }
+                        bitmap.set(block_no, 0b10);
+                        self.inner
+                            .metrics
+                            .delta_patch_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.inner
+                            .metrics
+                            .delta_patch_bytes
+                            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    }
+                    DeltaDiff::Full(page) => {
+                        write_full_page(&full_file, block_no, page.as_ref())?;
+                        write_full_ref_slot(&patch_file, block_no)?;
+                        self.mark_dirty_path(full_path.clone());
+                        self.mark_dirty_path(patch_path.clone());
+                        bitmap.set(block_no, 0b01);
+                        self.inner
+                            .metrics
+                            .delta_full_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            self.cleanup_block_lock(rel, block_no, &block_lock);
+
+            // Avoid treating datafile blocks as fully materialized diff entries.
+            self.record_write(rel, block_no * block_size, self.inner.block_size.get());
+        }
+
+        self.cleanup_file_lock(rel, &file_lock);
+
         Ok(())
     }
 
@@ -1289,6 +1686,342 @@ impl Overlay {
         self.inner.metrics.snapshot()
     }
 
+    pub fn perf_unsafe(&self) -> bool {
+        self.inner.perf_unsafe
+    }
+
+    pub fn dirty_marker_path(&self) -> PathBuf {
+        self.inner.dirty_marker.clone()
+    }
+
+    fn mark_dirty_path(&self, path: PathBuf) {
+        if !self.inner.perf_unsafe {
+            return;
+        }
+        if let Ok(mut guard) = self.inner.dirty_paths.lock() {
+            guard.insert(path);
+        }
+    }
+
+    fn mark_dirty_for_rel(&self, rel: &Path) {
+        if !self.inner.perf_unsafe {
+            return;
+        }
+        // Always track the diff path for the relation.
+        self.mark_dirty_path(self.inner.diff.join(rel));
+        if self.is_pg_datafile(rel) {
+            let (patch, full) = self.delta_paths(rel);
+            self.mark_dirty_path(patch);
+            self.mark_dirty_path(full);
+        }
+    }
+
+    fn clear_dirty_for_rel(&self, rel: &Path) {
+        if let Ok(mut guard) = self.inner.dirty_paths.lock() {
+            guard.remove(&self.inner.diff.join(rel));
+            let (patch, full) = self.delta_paths(rel);
+            guard.remove(&patch);
+            guard.remove(&full);
+        }
+    }
+
+    fn rename_dirty_entries(&self, src: &Path, dst: &Path) {
+        if let Ok(mut guard) = self.inner.dirty_paths.lock() {
+            let src_diff = self.inner.diff.join(src);
+            let dst_diff = self.inner.diff.join(dst);
+            if guard.remove(&src_diff) {
+                guard.insert(dst_diff);
+            }
+
+            let (src_patch, src_full) = self.delta_paths(src);
+            let (dst_patch, dst_full) = self.delta_paths(dst);
+            if guard.remove(&src_patch) {
+                guard.insert(dst_patch);
+            }
+            if guard.remove(&src_full) {
+                guard.insert(dst_full);
+            }
+        }
+    }
+
+    pub fn fsync_path(&self, rel: &Path, datasync: bool) -> Result<()> {
+        if self.inner.perf_unsafe {
+            self.mark_dirty_for_rel(rel);
+            return Ok(());
+        }
+
+        if self.is_pg_datafile(rel) {
+            return self.fsync_pg_datafile(rel, datasync);
+        }
+
+        let path = {
+            let diff_path = self.inner.diff.join(rel);
+            if diff_path.exists() {
+                Some(diff_path)
+            } else {
+                self.find_layer_path(rel).map(|(p, _, _)| p)
+            }
+        };
+
+        let Some(target) = path else {
+            return Err(Error::NotMounted(rel.display().to_string()).into());
+        };
+
+        let file = fs::File::open(&target)?;
+        if datasync {
+            file.sync_data()?;
+        } else {
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn fsync_pg_datafile(&self, rel: &Path, datasync: bool) -> Result<()> {
+        let (patch_path, full_path) = self.delta_paths(rel);
+        let mut synced = false;
+
+        if patch_path.exists() {
+            let f = fs::File::open(&patch_path)?;
+            if datasync {
+                f.sync_data()?;
+            } else {
+                f.sync_all()?;
+            }
+            synced = true;
+        }
+
+        if full_path.exists() {
+            let f = fs::File::open(&full_path)?;
+            if datasync {
+                f.sync_data()?;
+            } else {
+                f.sync_all()?;
+            }
+            synced = true;
+        }
+
+        let diff_path = self.inner.diff.join(rel);
+        if diff_path.exists() {
+            let f = fs::File::open(&diff_path)?;
+            if datasync {
+                f.sync_data()?;
+            } else {
+                f.sync_all()?;
+            }
+            synced = true;
+        }
+
+        if !synced {
+            // Nothing to sync: datafile untouched.
+        }
+        Ok(())
+    }
+
+    /// Flush all dirty paths recorded in perf-unsafe mode and remove the
+    /// `.pbkfs-dirty` marker. No-op when the mode is disabled.
+    pub fn flush_dirty(&self, datasync: bool) -> Result<()> {
+        if !self.inner.perf_unsafe {
+            return Ok(());
+        }
+
+        let paths: Vec<PathBuf> = {
+            let mut guard = self.inner.dirty_paths.lock().unwrap();
+            guard.drain().collect()
+        };
+
+        for path in paths {
+            if !path.exists() {
+                continue;
+            }
+            let file = fs::File::open(&path)?;
+            if datasync {
+                file.sync_data()?;
+            } else {
+                file.sync_all()?;
+            }
+        }
+
+        if self.inner.dirty_marker.exists() {
+            let _ = fs::remove_file(&self.inner.dirty_marker);
+        }
+
+        Ok(())
+    }
+
+    /// Truncate PostgreSQL datafile delta artifacts to `size` bytes.
+    /// - size == 0: removes `.patch`/`.full` and diff copy, clears bitmap cache.
+    /// - shrink: clears slots >= new length and punches corresponding full pages.
+    /// - extend: leaves delta sparse; future reads will serve zeros/base pages.
+    pub fn truncate_pg_datafile(&self, rel: &Path, size: u64) -> Result<()> {
+        let block_size = self.inner.block_size.get() as u64;
+        let (patch_path, full_path) = self.delta_paths(rel);
+        let diff_path = self.inner.diff.join(rel);
+
+        let file_lock = self.file_lock(rel);
+        let _file_guard = file_lock.write();
+        self.mark_dirty_for_rel(rel);
+
+        if let Some(parent) = diff_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let diff_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&diff_path)?;
+        diff_file.set_len(size)?;
+
+        if size == 0 {
+            // Shadow base relation with an empty diff file so subsequent reads
+            // see a zero-length relation instead of the base backup contents.
+            if !diff_path.exists() {
+                let _ = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&diff_path);
+            }
+            let _ = fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&diff_path);
+            let _ = diff_file.set_len(block_size); // keep first block addressable as zeros
+            let _ = fs::remove_file(&patch_path);
+            let _ = fs::remove_file(&full_path);
+            self.inner.delta_index.invalidate(&patch_path);
+            self.clear_block_locks_for(rel);
+            self.clear_dirty_for_rel(rel);
+            self.cleanup_file_lock(rel, &file_lock);
+            return Ok(());
+        }
+
+        let new_blocks = (size + block_size - 1) / block_size;
+        const FULL_HDR: u64 = 4096;
+
+        let bitmap = self.inner.delta_index.get_or_create_empty(&patch_path);
+
+        if patch_path.exists() {
+            let patch_file = open_patch(&patch_path)?;
+            let meta = patch_file.metadata()?;
+            let total_slots = meta
+                .len()
+                .saturating_sub(crate::fs::delta::PATCH_SLOT_SIZE as u64)
+                / crate::fs::delta::PATCH_SLOT_SIZE as u64;
+            for blk in new_blocks..=total_slots {
+                let _ = write_empty_slot(&patch_file, blk);
+                bitmap.set(blk, 0);
+            }
+        }
+
+        if full_path.exists() {
+            let full_file = open_full(&full_path)?;
+            let meta = full_file.metadata()?;
+            let total_blocks = meta.len().saturating_sub(FULL_HDR) / PAGE_SIZE as u64;
+            for blk in new_blocks..=total_blocks {
+                let _ = punch_full_hole(&full_file, blk);
+                bitmap.set(blk, 0);
+            }
+            let expected_len = FULL_HDR + new_blocks * PAGE_SIZE as u64;
+            let _ = full_file.set_len(expected_len);
+        }
+
+        if let Some(parent) = patch_path.parent() {
+            if !patch_path.exists() && !full_path.exists() {
+                // Ensure directory exists when we had no prior delta; extension path.
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        self.inner.delta_index.invalidate(&patch_path);
+        self.clear_block_locks_for(rel);
+        self.cleanup_file_lock(rel, &file_lock);
+        Ok(())
+    }
+
+    /// Rename PostgreSQL datafile, moving associated delta artifacts and locks.
+    pub fn rename_pg_datafile(&self, src: &Path, dst: &Path) -> Result<()> {
+        if src == dst {
+            return Ok(());
+        }
+
+        let (first, second) = if src < dst { (src, dst) } else { (dst, src) };
+        let lock_first = self.file_lock(first);
+        let lock_second = self.file_lock(second);
+        let _g1 = lock_first.write();
+        let _g2 = lock_second.write();
+
+        let (src_patch, src_full) = self.delta_paths(src);
+        let (dst_patch, dst_full) = self.delta_paths(dst);
+        let src_diff = self.inner.diff.join(src);
+        let dst_diff = self.inner.diff.join(dst);
+
+        if let Some(parent) = dst_diff.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = dst_patch.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Remove existing destination artifacts to allow rename overwrite.
+        let _ = fs::remove_file(&dst_patch);
+        let _ = fs::remove_file(&dst_full);
+        if dst_diff.exists() {
+            let meta = fs::symlink_metadata(&dst_diff)?;
+            if meta.is_dir() {
+                fs::remove_dir_all(&dst_diff)?;
+            } else {
+                fs::remove_file(&dst_diff)?;
+            }
+        }
+
+        if src_diff.exists() {
+            fs::rename(&src_diff, &dst_diff)?;
+        }
+        if src_patch.exists() {
+            fs::rename(&src_patch, &dst_patch)?;
+        }
+        if src_full.exists() {
+            fs::rename(&src_full, &dst_full)?;
+        }
+
+        self.inner.delta_index.invalidate(&src_patch);
+        self.inner.delta_index.invalidate(&dst_patch);
+        self.clear_block_locks_for(dst);
+        self.move_block_locks(src, dst);
+        self.move_file_lock(src, dst);
+        self.rename_dirty_entries(src, dst);
+        self.cleanup_file_lock(src, &lock_first);
+        self.cleanup_file_lock(dst, &lock_second);
+
+        Ok(())
+    }
+
+    /// Remove PostgreSQL datafile and associated delta artifacts.
+    pub fn unlink_pg_datafile(&self, rel: &Path) -> Result<()> {
+        let (patch_path, full_path) = self.delta_paths(rel);
+        let diff_path = self.inner.diff.join(rel);
+
+        let file_lock = self.file_lock(rel);
+        let _guard = file_lock.write();
+
+        if diff_path.exists() {
+            fs::remove_file(&diff_path)?;
+        }
+        if patch_path.exists() {
+            fs::remove_file(&patch_path)?;
+        }
+        if full_path.exists() {
+            fs::remove_file(&full_path)?;
+        }
+
+        self.inner.delta_index.invalidate(&patch_path);
+        self.clear_block_locks_for(rel);
+        self.clear_dirty_for_rel(rel);
+        self.cleanup_file_lock(rel, &file_lock);
+        Ok(())
+    }
+
     /// Debug helper to inspect cached overlay entries.
     pub fn debug_cache_keys(&self) -> Vec<PathBuf> {
         self.inner
@@ -1304,6 +2037,152 @@ impl Overlay {
 
     pub fn compression_algorithm(&self) -> Option<CompressionAlgorithm> {
         self.inner.layers.iter().find_map(|l| l.compression)
+    }
+
+    /// Read datafile block using delta storage if present.
+    fn read_datafile_delta(&self, rel: &Path, block_idx: u64) -> Result<Option<Vec<u8>>> {
+        let (patch_path, full_path) = self.delta_paths(rel);
+        if !patch_path.exists() && !full_path.exists() {
+            return Ok(None);
+        }
+        let file_lock = self.file_lock(rel);
+        let block_lock = self.block_lock(rel, block_idx);
+
+        let outcome = {
+            let _file_guard = file_lock.read();
+            let _block_guard = block_lock.read();
+
+            let cached = self.inner.delta_index.is_cached(&patch_path);
+            let bitmap = self.inner.delta_index.get_or_load_bitmap(&patch_path)?;
+            if !cached {
+                self.inner
+                    .metrics
+                    .delta_bitmaps_loaded
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .metrics
+                    .delta_bitmaps_total_bytes
+                    .fetch_add(bitmap.len_bytes() as u64, Ordering::Relaxed);
+            }
+
+            let direct: Option<Result<Option<Vec<u8>>>> = match bitmap.get(block_idx) {
+                0b00 => Some(Ok(None)),
+                0b11 => Some(Err(Error::InvalidPatchFile {
+                    reason: "reserved bitmap bits 11 encountered".into(),
+                }
+                .into())),
+                0b01 => {
+                    let full = open_full(&full_path)?;
+                    let page = read_full_page(&full, block_idx)?;
+                    Some(Ok(Some(page.to_vec())))
+                }
+                0b10 => None,
+                _ => None,
+            };
+
+            if let Some(result) = direct {
+                result
+            } else {
+                let patch_file = open_patch(&patch_path)?;
+                let (kind, payload) = read_patch_slot(&patch_file, block_idx)?;
+                match kind {
+                    SlotKind::Patch => {
+                        let base = self.read_base_block(rel, block_idx)?;
+                        let patched = apply_patch(&base, &payload)?;
+                        Ok(Some(patched.to_vec()))
+                    }
+                    SlotKind::FullRef => Err(Error::InvalidPatchFile {
+                        reason: "bitmap/slot kind mismatch (expected PATCH)".into(),
+                    }
+                    .into()),
+                    SlotKind::Empty => Ok(None),
+                }
+            }
+        }?;
+
+        self.cleanup_block_lock(rel, block_idx, &block_lock);
+        self.cleanup_file_lock(rel, &file_lock);
+
+        Ok(outcome)
+    }
+
+    /// Read a base page from pbk_store layers ignoring any diff or delta
+    /// materialization. Used by delta writes to compute deltas relative to the
+    /// original backup contents.
+    fn read_base_block(&self, rel: &Path, block_idx: u64) -> Result<[u8; PAGE_SIZE]> {
+        for (idx, layer) in self.inner.layers.iter().enumerate() {
+            let path = layer.root.join(rel);
+            if !path.exists() {
+                continue;
+            }
+
+            if layer.incremental {
+                if let Some(pagemap) = self.load_pagemap(&path)? {
+                    if !pagemap.contains(&(block_idx as u32)) {
+                        continue;
+                    }
+                }
+                if let Some(data) = self.read_pg_data_block(
+                    rel,
+                    &path,
+                    self.file_compression_for_layer(idx, rel),
+                    block_idx,
+                )? {
+                    return Ok(self.pad_block(&data));
+                }
+                continue;
+            }
+
+            if let Some(data) = self.read_full_block(
+                rel,
+                &path,
+                layer,
+                self.file_compression_for_layer(idx, rel),
+                block_idx,
+            )? {
+                return Ok(self.pad_block(&data));
+            }
+        }
+
+        if self.is_pg_datafile(rel) {
+            return Ok([0u8; PAGE_SIZE]);
+        }
+
+        Err(io::Error::from(io::ErrorKind::NotFound).into())
+    }
+
+    fn pad_block(&self, data: &[u8]) -> [u8; PAGE_SIZE] {
+        let mut out = [0u8; PAGE_SIZE];
+        let copy_len = data.len().min(PAGE_SIZE);
+        out[..copy_len].copy_from_slice(&data[..copy_len]);
+        out
+    }
+
+    pub fn delta_paths(&self, rel: &Path) -> (PathBuf, PathBuf) {
+        let diff = self.inner.diff.join(rel);
+        let ext = diff.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+        let mut patch = diff.clone();
+        let mut patch_ext = OsString::new();
+        if ext.is_empty() {
+            patch_ext.push("patch");
+        } else {
+            patch_ext.push(ext);
+            patch_ext.push(".patch");
+        }
+        patch.set_extension(patch_ext);
+
+        let mut full = diff.clone();
+        let mut full_ext = OsString::new();
+        if ext.is_empty() {
+            full_ext.push("full");
+        } else {
+            full_ext.push(ext);
+            full_ext.push(".full");
+        }
+        full.set_extension(full_ext);
+
+        (patch, full)
     }
 
     pub fn layer_roots(&self) -> Vec<(PathBuf, Option<CompressionAlgorithm>)> {
@@ -1578,6 +2457,15 @@ impl Overlay {
     /// subsequent reads will source blocks from the diff rather than
     /// re-copying from base layers.
     pub(crate) fn record_write(&self, rel: &Path, offset: u64, len: usize) {
+        if self.is_pg_datafile(rel) {
+            // Delta-backed datafiles should always re-evaluate block sources
+            // instead of treating diff paths as fully materialized copies.
+            if let Ok(mut cache) = self.inner.cache.lock() {
+                cache.remove(rel);
+            }
+            return;
+        }
+
         let block_sz = self.inner.block_size.get() as u64;
         let start_block = offset / block_sz;
         let end_block = offset.saturating_add(len as u64).saturating_sub(1) / block_sz;
@@ -2078,69 +2966,104 @@ impl Overlay {
         Ok(Some(blocks))
     }
 
-    /// Heuristic to detect PostgreSQL main-fork relation files that pg_probackup
-    /// stores using per-page BackupPageHeader records.
+    /// Detect PostgreSQL relation files (main + forks + segments).
     ///
-    /// Mirrors pg_probackup's `set_forkname` logic for `is_datafile`, but only
-    /// for the filename component:
-    ///   - `<oid>` or `<oid>.<segno>` where oid/segno are decimal, no leading 0.
-    ///   - No fork suffixes like `_vm`, `_fsm`, `_init`, `_ptrack`, or CFS
-    ///     variants; any non-digit/`.` suffix causes this to return false.
-    pub(crate) fn is_pg_datafile(&self, rel: &Path) -> bool {
-        let name = match rel.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => return false,
+    /// Primary source of truth is pg_probackup's backup_content.control for the
+    /// newest layer: if an entry exists, honour its `is_datafile` flag so that
+    /// forks that pg_probackup stores as whole files (e.g. *_fsm/_vm) are not
+    /// misinterpreted as per-page streams. When metadata is absent we fall back
+    /// to the path-based heuristic below.
+    ///
+    /// Accepts:
+    ///   - base/<dboid>/<relfilenode>[.seg][_(vm|fsm|init)]
+    ///   - global/<relfilenode>[...]
+    ///   - pg_tblspc/<spcoid>/PG_*/<dboid>/<relfilenode>[...]
+    ///     Rejects `_ptrack` and any non-digit/unsupported fork names.
+    pub fn is_pg_datafile(&self, rel: &Path) -> bool {
+        // Validate directory layout.
+        let comps_owned: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let mut comps: Vec<&str> = comps_owned.iter().map(|s| s.as_str()).collect();
+        if comps.is_empty() {
+            return false;
+        }
+        let fname = comps.pop().unwrap();
+        let ok_dir = match comps.as_slice() {
+            [] => true, // Allow bare relfilenode paths used in tests/fixtures.
+            ["base", _db] => true,
+            ["base", ..] => true,
+            ["global"] | ["global", ..] => true,
+            ["pg_tblspc", _tbl, ver, _db] | ["pg_tblspc", _tbl, ver, _db, ..]
+                if ver.starts_with("PG_") =>
+            {
+                true
+            }
+            _ => false,
         };
-
-        let mut chars = name.chars().peekable();
-        let first = match chars.next() {
-            Some(c) if c.is_ascii_digit() => c,
-            _ => return false,
-        };
-        if first == '0' {
+        if !ok_dir {
             return false;
         }
 
-        // Parse OID digits, enforcing an upper bound similar to pg_probackup.
-        let mut oid_digits = 1usize;
-        while let Some(&c) = chars.peek() {
-            if c.is_ascii_digit() {
-                oid_digits += 1;
-                if oid_digits > MAX_OID_DIGITS {
-                    return false;
-                }
-                chars.next();
-            } else {
-                break;
+        // Optional segment suffix ".<segno>"
+        let (stem, seg) = if let Some((left, right)) = fname.rsplit_once('.') {
+            if right.is_empty() || right.starts_with('0') || right.len() > MAX_SEGMENT_DIGITS {
+                return false;
+            }
+            if !right.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            (left, Some(right))
+        } else {
+            (fname, None)
+        };
+
+        // Optional fork suffix "_vm"/"_fsm"/"_init"
+        let (oid_part, fork) = if let Some((left, right)) = stem.split_once('_') {
+            (left, Some(right))
+        } else {
+            (stem, None)
+        };
+
+        // Validate relfilenode
+        if oid_part.is_empty() || oid_part.starts_with('0') || oid_part.len() > MAX_OID_DIGITS {
+            return false;
+        }
+        if !oid_part.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+
+        if let Some(f) = fork {
+            match f {
+                "vm" | "fsm" | "init" => {}
+                _ => return false, // includes _ptrack and unknown forks
             }
         }
 
-        match chars.next() {
-            None => true, // pure "<oid>"
-            Some('.') => {
-                // Optional ".<segno>" with 1..5 digits, no leading zero.
-                let mut seg_digits = 0usize;
-                let mut first_seg: Option<char> = None;
-                for c in chars {
-                    if !c.is_ascii_digit() {
-                        return false;
-                    }
-                    if seg_digits == 0 {
-                        first_seg = Some(c);
-                        if c == '0' {
-                            return false;
-                        }
-                    }
-                    seg_digits += 1;
-                    if seg_digits > MAX_SEGMENT_DIGITS {
-                        return false;
-                    }
-                }
-                seg_digits > 0 && first_seg.is_some()
+        if let Some(segno) = seg {
+            if !segno.chars().all(|c| c.is_ascii_digit()) {
+                return false;
             }
-            // Any other suffix (e.g. "_vm", "_fsm", ".cfm") marks it as non-datafile.
-            Some(_) => false,
         }
+
+        // If we have metadata for the newest layer, prefer that over the
+        // heuristic. This fixes cases where pg_probackup marks forks like
+        // *_fsm/_vm as regular files (is_datafile = 0) while the pathname alone
+        // would otherwise be treated as a relation fork.
+        if let Some(top_layer) = self.inner.layers.first() {
+            if let Ok(mut cache) = self.inner.file_meta.lock() {
+                let layer_map = cache.entry(top_layer.root.clone()).or_insert_with(|| {
+                    Self::load_backup_content_for_root(&top_layer.root)
+                });
+                let key = rel.to_string_lossy().to_string();
+                if let Some(meta) = layer_map.get(&key) {
+                    return meta.is_datafile && meta.external_dir_num == 0;
+                }
+            }
+        }
+
+        true
     }
 
     /// Materialize a pg_probackup-style FULL data file into a plain PostgreSQL
