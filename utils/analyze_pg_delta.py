@@ -30,15 +30,19 @@ PATCH_SLOT_SIZE = 512
 PATCH_HEADER_SIZE = 512
 FULL_HEADER_SIZE = 4096
 PATCH_PAYLOAD_MAX = PATCH_SLOT_SIZE - 8  # matches delta.rs
+PATCH_VERSION = 2
+SLOT_FLAG_V2 = 0x01
 
 
 @dataclass
 class PageDelta:
     block: int
     diff_bytes: int
-    patch_len: int
+    patch_len_v1: int
     segments: int
     kind: int  # 0 = empty, 1 = PATCH, 2 = FULLREF
+    flags: int
+    encoded_len_v2: int
 
 
 def read_page(f, block: int) -> bytes:
@@ -52,6 +56,7 @@ def read_page(f, block: int) -> bytes:
 def reconstruct_page(
     base: bytes,
     kind: int,
+    flags: int,
     payload: bytes,
     full_f,
     block: int,
@@ -60,20 +65,32 @@ def reconstruct_page(
     page = bytearray(base)
 
     if kind == 1:  # PATCH slot
+        if flags & SLOT_FLAG_V2 == 0:
+            raise ValueError("patch slot missing v2 flag")
         cursor = 0
-        while cursor + 4 <= len(payload):
-            off = struct.unpack_from("<H", payload, cursor)[0]
-            length = struct.unpack_from("<H", payload, cursor + 2)[0]
-            cursor += 4
-            data_end = cursor + length
-            if data_end > len(payload):
-                break
-            start = int(off)
-            end = start + int(length)
-            if end > PAGE_SIZE:
-                break
-            page[start:end] = payload[cursor:data_end]
-            cursor = data_end
+        pos = -1
+        while cursor < len(payload):
+            if cursor >= len(payload):
+                raise ValueError("unexpected end of payload")
+            first = payload[cursor]
+            cursor += 1
+            if first == 255:
+                if cursor + 1 >= len(payload):
+                    raise ValueError("truncated long delta")
+                delta = struct.unpack_from("<H", payload, cursor)[0]
+                cursor += 2
+            else:
+                delta = first
+
+            if cursor >= len(payload):
+                raise ValueError("missing value byte")
+            value = payload[cursor]
+            cursor += 1
+
+            pos = pos + 1 + delta
+            if pos < 0 or pos >= PAGE_SIZE:
+                raise ValueError("delta would write outside page bounds")
+            page[pos] = value
 
     elif kind == 2 and full_f is not None:  # FULLREF
         off = FULL_HEADER_SIZE + block * PAGE_SIZE
@@ -88,10 +105,10 @@ def reconstruct_page(
     return bytes(page)
 
 
-def diff_stats(base: bytes, new_page: bytes) -> Tuple[int, int, int]:
+def diff_stats(base: bytes, new_page: bytes) -> Tuple[int, int, int, int]:
     diff_bytes = sum(1 for i in range(PAGE_SIZE) if base[i] != new_page[i])
 
-    patch_len = 0
+    patch_len_v1 = 0
     segments = 0
     i = 0
     while i < PAGE_SIZE:
@@ -103,27 +120,43 @@ def diff_stats(base: bytes, new_page: bytes) -> Tuple[int, int, int]:
             i += 1
         seg_len = i - start
         segments += 1
-        patch_len += 4 + seg_len
+        patch_len_v1 += 4 + seg_len
 
-    return diff_bytes, patch_len, segments
+    encoded_len_v2 = 0
+    prev = -1
+    for idx, (b, n) in enumerate(zip(base, new_page)):
+        if b == n:
+            continue
+        delta = idx - prev - 1
+        if delta < 0:
+            raise ValueError("negative delta during v2 encode")
+        if delta < 255:
+            encoded_len_v2 += 1
+        else:
+            encoded_len_v2 += 3
+        encoded_len_v2 += 1  # value byte
+        prev = idx
+
+    return diff_bytes, patch_len_v1, segments, encoded_len_v2
 
 
-def load_slot(patch_f, patch_size: int, block: int) -> Tuple[int, bytes]:
+def load_slot(patch_f, patch_size: int, block: int) -> Tuple[int, int, bytes]:
     off = PATCH_HEADER_SIZE + block * PATCH_SLOT_SIZE
     if off >= patch_size:
-        return 0, b""
+        return 0, 0, b""
     patch_f.seek(off)
     hdr = patch_f.read(8)
     if not hdr:
-        return 0, b""
+        return 0, 0, b""
     kind = hdr[0]
+    flags = hdr[1]
     payload_len = struct.unpack_from("<H", hdr, 2)[0]
     if kind in (1, 2) and payload_len > 0:
         payload_off = off + 8
         patch_f.seek(payload_off)
         payload = patch_f.read(payload_len)
-        return kind, payload
-    return kind, b""
+        return kind, flags, payload
+    return kind, flags, b""
 
 
 def percentile(values: List[int], p: int) -> int:
@@ -146,63 +179,88 @@ def analyze(base_path: Path, patch_path: Path, full_path: Path) -> None:
         patch_size = patch_path.stat().st_size if patch_f else 0
         full_size = full_path.stat().st_size if full_f else 0
 
+        if patch_f:
+            patch_f.seek(0)
+            header = patch_f.read(PATCH_HEADER_SIZE)
+            if len(header) < PATCH_HEADER_SIZE or header[:8] != b"PBKPATCH":
+                raise SystemExit("unsupported/corrupted patch: bad magic/header")
+            version = struct.unpack_from("<H", header, 8)[0]
+            if version != PATCH_VERSION:
+                raise SystemExit(f"unsupported patch version {version} (expected {PATCH_VERSION})")
+
         deltas: List[PageDelta] = []
 
         for block in range(n_blocks):
             base_page = read_page(base_f, block)
 
-            kind, payload = (0, b"")
+            kind, flags, payload = (0, 0, b"")
             if patch_f:
-                kind, payload = load_slot(patch_f, patch_size, block)
+                kind, flags, payload = load_slot(patch_f, patch_size, block)
 
-            new_page = reconstruct_page(base_page, kind, payload, full_f, block, full_size)
-            diff_bytes, patch_len, segments = diff_stats(base_page, new_page)
+            new_page = reconstruct_page(base_page, kind, flags, payload, full_f, block, full_size)
+            diff_bytes, patch_len_v1, segments, encoded_len_v2 = diff_stats(base_page, new_page)
 
             if diff_bytes > 0:
-                deltas.append(PageDelta(block, diff_bytes, patch_len, segments, kind))
+                deltas.append(
+                    PageDelta(block, diff_bytes, patch_len_v1, segments, kind, flags, encoded_len_v2)
+                )
 
         # Invariant check: FULL slots must have patch_len > PATCH_PAYLOAD_MAX.
         violations = [
-            d for d in deltas if d.kind == 2 and d.patch_len <= PATCH_PAYLOAD_MAX
+            d for d in deltas if d.kind == 2 and d.patch_len_v1 <= PATCH_PAYLOAD_MAX
+        ]
+        full_would_fit_v2 = [
+            d for d in deltas if d.kind == 2 and d.encoded_len_v2 <= PATCH_PAYLOAD_MAX
         ]
 
         print(f"Base file:   {base_path} ({base_size} bytes, {n_blocks} blocks)")
         print(f"Patch file:  {patch_path} ({patch_size} bytes)")
         print(f"Full file:   {full_path} ({full_size} bytes)")
         print(f"Blocks with diff: {len(deltas)}")
-        print(f"FULL slots with patch_len <= {PATCH_PAYLOAD_MAX}: {len(violations)}")
+        print(f"FULL slots with patch_len_v1 <= {PATCH_PAYLOAD_MAX}: {len(violations)}")
+        print(
+            f"FULL slots where v2 would fit (encoded_len_v2 <= {PATCH_PAYLOAD_MAX}): {len(full_would_fit_v2)}"
+        )
         if violations:
             print("First violations:")
             for v in violations[:10]:
                 print(
                     f"  block={v.block} diff_bytes={v.diff_bytes} "
-                    f"patch_len={v.patch_len} segments={v.segments}"
+                    f"patch_len_v1={v.patch_len_v1} segments={v.segments}"
                 )
 
         if deltas:
             diff_vals = [d.diff_bytes for d in deltas]
-            patch_vals = [d.patch_len for d in deltas]
+            patch_vals_v1 = [d.patch_len_v1 for d in deltas]
+            encoded_vals_v2 = [d.encoded_len_v2 for d in deltas]
 
             print("\nPercentiles for diff_bytes:")
             for p in (70, 80, 90, 95):
                 print(f"  p{p}: {percentile(diff_vals, p)}")
 
-            print("\nPercentiles for patch_len:")
+            print("\nPercentiles for patch_len_v1:")
             for p in (70, 80, 90, 95):
-                print(f"  p{p}: {percentile(patch_vals, p)}")
+                print(f"  p{p}: {percentile(patch_vals_v1, p)}")
+
+            print("\nPercentiles for encoded_len_v2:")
+            for p in (70, 80, 90, 95):
+                print(f"  p{p}: {percentile(encoded_vals_v2, p)}")
 
             full_only = [d for d in deltas if d.kind == 2]
             if full_only:
                 full_diff = [d.diff_bytes for d in full_only]
-                full_patch = [d.patch_len for d in full_only]
+                full_patch = [d.patch_len_v1 for d in full_only]
                 full_segs = [d.segments for d in full_only]
+                full_v2 = [d.encoded_len_v2 for d in full_only]
                 print("\nFULL-only pages:")
                 for p in (70, 80, 90, 95):
                     print(f"  diff_bytes p{p}: {percentile(full_diff, p)}")
                 for p in (70, 80, 90, 95):
-                    print(f"  patch_len p{p}: {percentile(full_patch, p)}")
+                    print(f"  patch_len_v1 p{p}: {percentile(full_patch, p)}")
                 for p in (70, 80, 90, 95):
                     print(f"  segments p{p}: {percentile(full_segs, p)}")
+                for p in (70, 80, 90, 95):
+                    print(f"  encoded_len_v2 p{p}: {percentile(full_v2, p)}")
 
 
 def main() -> None:
@@ -224,4 +282,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

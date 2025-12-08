@@ -207,11 +207,12 @@ fn delta_read_applies_patch() -> pbkfs::Result<()> {
     fs::create_dir_all(patch_path.parent().unwrap())?;
     create_patch(&patch_path)?;
     let patch_file = pbkfs::fs::delta::open_patch(&patch_path)?;
-    // payload: offset=0, len=1, data=5
-    write_patch_slot(&patch_file, 0, &[0, 0, 1, 0, 5u8])?;
-    let (kind, payload) = pbkfs::fs::delta::read_patch_slot(&patch_file, 0)?;
+    // v2 payload: delta=0, value=5
+    write_patch_slot(&patch_file, 0, &[0, 5u8])?;
+    let (kind, flags, payload) = pbkfs::fs::delta::read_patch_slot(&patch_file, 0)?;
     assert!(matches!(kind, pbkfs::fs::delta::SlotKind::Patch));
-    assert_eq!(payload, vec![0, 0, 1, 0, 5u8]);
+    assert_ne!(flags & pbkfs::fs::delta::SLOT_FLAG_V2, 0);
+    assert_eq!(payload, vec![0, 5u8]);
 
     let page = overlay
         .read_range(rel, 0, BLCKSZ)?
@@ -320,13 +321,14 @@ fn delta_segments_are_isolated() -> pbkfs::Result<()> {
     fs::create_dir_all(patch_seg.parent().unwrap())?;
     create_patch(&patch_seg)?;
     let f = pbkfs::fs::delta::open_patch(&patch_seg)?;
-    // payload: offset=0, len=1, data=0xAA
-    write_patch_slot(&f, 0, &[0, 0, 1, 0, 0xAA])?;
+    // v2 payload: delta=0, value=0xAA
+    write_patch_slot(&f, 0, &[0, 0xAA])?;
     let bm = pbkfs::fs::delta::load_bitmap_from_patch(&patch_seg)?;
     assert_eq!(bm.get(0), 0b10);
-    let (k, payload) = pbkfs::fs::delta::read_patch_slot(&f, 0)?;
+    let (k, flags, payload) = pbkfs::fs::delta::read_patch_slot(&f, 0)?;
     assert!(matches!(k, pbkfs::fs::delta::SlotKind::Patch));
-    assert_eq!(payload, vec![0, 0, 1, 0, 0xAA]);
+    assert_ne!(flags & pbkfs::fs::delta::SLOT_FLAG_V2, 0);
+    assert_eq!(payload, vec![0, 0xAA]);
 
     // Reading base segment should not see changes.
     let page0 = overlay
@@ -1352,6 +1354,51 @@ fn pg_datafile_range_read_does_not_extend_past_logical_len() -> pbkfs::Result<()
     assert!(beyond.iter().all(|b| *b == 0));
     let meta_after = fs::metadata(&diff_path)?;
     assert_eq!(meta_after.len(), (BLCKSZ * 4) as u64);
+
+    Ok(())
+}
+
+#[test]
+fn pg_datafile_delta_extends_logical_len() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    // Build a single FULL datafile with one block.
+    let rel = Path::new("base/1/2662");
+    let data_root = base.path().join("FULL").join("database");
+    fs::create_dir_all(data_root.join(rel.parent().unwrap()))?;
+    let mut full_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_root.join(rel))?;
+    write_incremental_entry(&mut full_file, 0, &vec![b'A'; BLCKSZ])?;
+
+    // Minimal backup_content.control entry marking the relation as a datafile
+    // with one block in the restored backup.
+    let content_path = base.path().join("FULL").join("backup_content.control");
+    fs::write(
+        &content_path,
+        concat!(
+            r#"{"path":"base/1/2662","size":"-1","mode":"33152","is_datafile":"1","is_cfs":"0","crc":"0","compress_alg":"none","external_dir_num":"0","dbOid":"1","segno":"0","n_blocks":"1"}"#,
+            "\n"
+        ),
+    )?;
+
+    let layers = vec![Layer {
+        root: data_root.clone(),
+        compression: None,
+        incremental: false,
+        backup_mode: BackupMode::Full,
+    }];
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // Write a new block far beyond the base length via delta storage.
+    let block_idx: u64 = 5;
+    overlay.write_at(rel, block_idx * BLCKSZ as u64, &vec![b'Z'; BLCKSZ])?;
+
+    // Logical length must include the newly written block (6 blocks total).
+    let logical = overlay.logical_len_for(rel)?.expect("logical len");
+    assert_eq!(logical, (block_idx + 1) * BLCKSZ as u64);
 
     Ok(())
 }

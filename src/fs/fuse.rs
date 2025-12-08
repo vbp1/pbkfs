@@ -182,7 +182,21 @@ impl FsTask {
                 reply,
                 handle,
             } => {
-                if let Some(file) = handle {
+                // For PostgreSQL datafiles, always route through overlay.read_range()
+                // to honor logical lengths, sparse holes, and delta storage.
+                if overlay.is_pg_datafile(&rel) {
+                    match overlay.read_range(&rel, offset, size) {
+                        Ok(Some(bytes)) => reply.data(&bytes),
+                        Ok(None) => {
+                            ok = false;
+                            reply.error(ENOENT);
+                        }
+                        Err(_) => {
+                            ok = false;
+                            reply.error(EIO);
+                        }
+                    }
+                } else if let Some(file) = handle {
                     let mut buf = vec![0u8; size];
                     match file.read_at(&mut buf, offset) {
                         Ok(read) => {
@@ -458,6 +472,7 @@ impl OverlayFs {
             delta_patch_count: overlay_metrics.delta_patch_count,
             delta_full_count: overlay_metrics.delta_full_count,
             delta_patch_avg_size: overlay_metrics.delta_patch_avg_size,
+            delta_patch_max_size: overlay_metrics.delta_patch_max_size,
             delta_bitmaps_loaded: overlay_metrics.delta_bitmaps_loaded,
             delta_bitmaps_total_bytes: overlay_metrics.delta_bitmaps_total_bytes,
             delta_punch_holes: overlay_metrics.delta_punch_holes,

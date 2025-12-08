@@ -9,10 +9,10 @@ use std::os::unix::fs::FileExt;
 
 use parking_lot::ReentrantMutexGuard;
 use pbkfs::fs::delta::{
-    apply_patch, compute_delta, create_full, create_patch, open_full, open_patch, punch_full_hole,
-    read_full_page, read_patch_slot, write_empty_slot, write_full_page, write_full_ref_slot,
-    write_patch_slot, BlockBitmap, DeltaDiff, DeltaIndex, SlotKind, PAGE_SIZE, PATCH_PAYLOAD_MAX,
-    PATCH_SLOT_SIZE,
+    apply_patch_v2, compute_delta, create_full, create_patch, encode_delta_v2, open_full,
+    open_patch, punch_full_hole, read_full_page, read_patch_slot, write_empty_slot,
+    write_full_page, write_full_ref_slot, write_patch_slot, BlockBitmap, DeltaDiff, DeltaIndex,
+    SlotKind, PAGE_SIZE, PATCH_PAYLOAD_MAX, PATCH_SLOT_SIZE, SLOT_FLAG_V2,
 };
 use pbkfs::fs::overlay::Overlay;
 use pbkfs::Error;
@@ -77,14 +77,84 @@ fn small_patch_round_trip() {
 
     let diff = compute_delta(&base, &modified);
     let bytes = match diff {
-        DeltaDiff::Patch { .. } => diff.to_patch_bytes().unwrap(),
+        DeltaDiff::PatchV2 { .. } => diff.to_patch_bytes().unwrap(),
         other => panic!("expected patch delta, got {:?}", other),
     };
 
-    assert_eq!(bytes.len(), 10); // two segments: (4 + 1) * 2
+    // v2 encodes each changed byte as (delta,value); first delta=100 (short),
+    // second delta=399 (long) → 1+1 + 3+1 = 6 bytes.
+    assert_eq!(bytes.len(), 6);
 
-    let rebuilt = apply_patch(&base, &bytes).expect("patch should apply");
+    let rebuilt = apply_patch_v2(&base, &bytes).expect("patch should apply");
     assert_eq!(rebuilt, modified);
+}
+
+#[test]
+fn v2_round_trip_single_offsets() {
+    for offset in [0usize, 100, 300, PAGE_SIZE - 1] {
+        let base = filled_page(0);
+        let mut modified = base;
+        modified[offset] = 0xAB;
+
+        let payload = encode_delta_v2(&base, &modified).expect("encode");
+        let expected = if offset > 254 { 4 } else { 2 };
+        assert_eq!(
+            payload.len(),
+            expected,
+            "single change at {offset} should encode to {expected} bytes"
+        );
+
+        let rebuilt = apply_patch_v2(&base, &payload).expect("apply");
+        assert_eq!(rebuilt, modified, "offset {offset}");
+    }
+}
+
+#[test]
+fn v2_round_trip_scattered_small_deltas() {
+    let base = filled_page(0);
+    let mut modified = base;
+    modified[10] = 0xAA;
+    modified[20] = 0xBB;
+    modified[23] = 0xCC;
+
+    let payload = encode_delta_v2(&base, &modified).expect("encode");
+    // deltas: 10,9,2 -> all short → 6 bytes total
+    assert_eq!(payload.len(), 6);
+
+    let rebuilt = apply_patch_v2(&base, &payload).expect("apply");
+    assert_eq!(rebuilt, modified);
+}
+
+#[test]
+fn v2_round_trip_with_long_delta() {
+    let base = filled_page(0);
+    let mut modified = base;
+    modified[0] = 1;
+    modified[260] = 2; // delta >= 255 (259)
+    modified[261] = 3;
+
+    let payload = encode_delta_v2(&base, &modified).expect("encode");
+    // layout: [0,1] [0xFF,3,1,2] [0,3] -> 2 + 4 + 2 = 8 bytes
+    assert_eq!(payload.len(), 8);
+
+    let rebuilt = apply_patch_v2(&base, &payload).expect("apply");
+    assert_eq!(rebuilt, modified);
+}
+
+#[test]
+fn v2_decoding_rejects_out_of_range_pos() {
+    let base = filled_page(0);
+    // Start at -1; delta=PAGE_SIZE lands exactly at PAGE_SIZE (invalid).
+    let mut payload = Vec::new();
+    payload.push(255);
+    payload.extend_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
+    payload.push(0x11);
+
+    let err = apply_patch_v2(&base, &payload).expect_err("should reject oob pos");
+    match err.downcast::<Error>() {
+        Ok(Error::CorruptedPatch { .. }) => {}
+        other => panic!("unexpected error: {:?}", other),
+    }
 }
 
 #[test]
@@ -98,15 +168,12 @@ fn large_delta_falls_back_to_full() {
 }
 
 #[test]
-fn patch_rejects_out_of_bounds_segment() {
+fn patch_rejects_out_of_bounds_position() {
     let base = filled_page(0);
-    // offset 8191 + len 2 overruns a single 8KiB page.
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(8191u16).to_le_bytes());
-    payload.extend_from_slice(&(2u16).to_le_bytes());
-    payload.extend_from_slice(&[1u8, 2u8]);
+    // delta that lands at position 8192 (just past end).
+    let payload = vec![255u8, 0u8, 32u8, 0xAA]; // delta = 8192 (0x2000), value=0xAA
 
-    let err = apply_patch(&base, &payload).expect_err("should detect overflow");
+    let err = apply_patch_v2(&base, &payload).expect_err("should detect overflow");
     match err.downcast::<Error>() {
         Ok(Error::CorruptedPatch { .. }) => {}
         other => panic!("unexpected error: {:?}", other),
@@ -116,7 +183,35 @@ fn patch_rejects_out_of_bounds_segment() {
 #[test]
 fn patch_rejects_empty_payload() {
     let base = filled_page(0);
-    let err = apply_patch(&base, &[]).expect_err("empty payload must fail");
+    let err = apply_patch_v2(&base, &[]).expect_err("empty payload must fail");
+    match err.downcast::<Error>() {
+        Ok(Error::CorruptedPatch { .. }) => {}
+        other => panic!("unexpected error: {:?}", other),
+    }
+}
+
+#[test]
+fn v2_decoding_rejects_truncated_delta_code() {
+    let base = filled_page(0);
+    // Payload ends with lone 0xFF (long delta prefix).
+    let payload = vec![0, 1, 255];
+    let err = apply_patch_v2(&base, &payload).expect_err("truncated delta_code");
+    match err.downcast::<Error>() {
+        Ok(Error::CorruptedPatch { .. }) => {}
+        other => panic!("unexpected error: {:?}", other),
+    }
+
+    // Payload ends with 0xFF, lo byte only.
+    let payload = vec![0, 1, 255, 1];
+    let err = apply_patch_v2(&base, &payload).expect_err("truncated long delta");
+    match err.downcast::<Error>() {
+        Ok(Error::CorruptedPatch { .. }) => {}
+        other => panic!("unexpected error: {:?}", other),
+    }
+
+    // Payload ends after delta_code but before value.
+    let payload = vec![0x02];
+    let err = apply_patch_v2(&base, &payload).expect_err("missing value");
     match err.downcast::<Error>() {
         Ok(Error::CorruptedPatch { .. }) => {}
         other => panic!("unexpected error: {:?}", other),
@@ -132,14 +227,83 @@ fn patch_file_round_trip() {
 
     let payload = vec![1u8; 20];
     write_patch_slot(&f, 3, &payload).unwrap();
-    let (kind, data) = read_patch_slot(&f, 3).unwrap();
+    let (kind, flags, data) = read_patch_slot(&f, 3).unwrap();
     assert_eq!(kind, SlotKind::Patch);
+    assert_eq!(flags & SLOT_FLAG_V2, SLOT_FLAG_V2);
     assert_eq!(data, payload);
 
     // Unwritten slot should be EMPTY.
-    let (kind, data) = read_patch_slot(&f, 10).unwrap();
+    let (kind, _flags, data) = read_patch_slot(&f, 10).unwrap();
     assert_eq!(kind, SlotKind::Empty);
     assert!(data.is_empty());
+}
+
+#[test]
+fn patch_slot_sets_v2_flag() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("file.patch");
+    create_patch(&path).unwrap();
+    let f = open_patch(&path).unwrap();
+
+    write_patch_slot(&f, 0, &[1, 2, 3]).unwrap();
+    let (_kind, flags, _data) = read_patch_slot(&f, 0).unwrap();
+    assert_eq!(flags & SLOT_FLAG_V2, SLOT_FLAG_V2);
+    assert_eq!(flags & !SLOT_FLAG_V2, 0, "no other flags defined yet");
+}
+
+#[test]
+fn compute_delta_reports_encoded_length() {
+    let base = filled_page(0);
+    let mut modified = base;
+    // Changes at 0, 4, 8 (short deltas) and 300 (long delta).
+    modified[0] = 1;
+    modified[4] = 2;
+    modified[8] = 3;
+    modified[300] = 4;
+
+    let payload = encode_delta_v2(&base, &modified).expect("encode");
+    let diff = compute_delta(&base, &modified);
+    let len = diff.serialized_len();
+
+    assert_eq!(len, payload.len());
+    assert!(matches!(diff, DeltaDiff::PatchV2 { .. }));
+}
+
+#[test]
+fn compute_delta_boundary_at_payload_limit() {
+    let base = filled_page(0);
+    let mut modified = base;
+    // 250 contiguous bytes → 250 short deltas (500 bytes)
+    for b in modified.iter_mut().take(250) {
+        *b = 1;
+    }
+    // One additional change far away to force long delta (+2 bytes overhead).
+    modified[600] = 2;
+
+    let diff = compute_delta(&base, &modified);
+    let len = diff.serialized_len();
+    assert_eq!(len, PATCH_PAYLOAD_MAX);
+    assert!(matches!(diff, DeltaDiff::PatchV2 { .. }));
+
+    // Adding one more change should exceed the budget and become FULL.
+    let mut modified_full = modified;
+    modified_full[601] = 3;
+    let diff_full = compute_delta(&base, &modified_full);
+    assert!(matches!(diff_full, DeltaDiff::Full(_)));
+}
+
+#[test]
+fn encoded_length_accounts_for_long_deltas() {
+    let base = filled_page(0);
+    let mut modified = base;
+    // Two long deltas separated by wide gaps plus one short.
+    modified[0] = 1; // first delta
+    modified[400] = 2; // long (399)
+    modified[800] = 3; // long (399)
+
+    let payload = encode_delta_v2(&base, &modified).expect("encode");
+    // K=3, long=2 → 2*K + 2*long = 10 bytes.
+    assert_eq!(payload.len(), 10);
 }
 
 #[test]
@@ -444,7 +608,7 @@ fn identical_page_clears_existing_patch_slot() -> PbResult<()> {
     write_empty_slot(&patch_file, 0)?;
     let _ = punch_full_hole(&full_file, 0);
 
-    let (cleared_kind, cleared_payload) = read_patch_slot(&patch_file, 0)?;
+    let (cleared_kind, _flags, cleared_payload) = read_patch_slot(&patch_file, 0)?;
     assert_eq!(cleared_kind, SlotKind::Empty);
     assert!(cleared_payload.is_empty());
 
@@ -470,7 +634,7 @@ fn concurrent_read_and_read_succeeds() {
         handles.push(thread::spawn(move || {
             b.wait();
             let f = open_patch(&path).unwrap();
-            let (kind, payload) = read_patch_slot(&f, 1).unwrap();
+            let (kind, _flags, payload) = read_patch_slot(&f, 1).unwrap();
             assert_eq!(kind, SlotKind::Patch);
             assert_eq!(payload, vec![1, 2, 3]);
         }));
@@ -496,7 +660,7 @@ fn concurrent_read_and_write_observes_consistent_payload() {
         thread::spawn(move || {
             b.wait();
             let f = open_patch(&path_clone).unwrap();
-            let (kind, payload) = read_patch_slot(&f, 2).unwrap();
+            let (kind, _flags, payload) = read_patch_slot(&f, 2).unwrap();
             assert_eq!(kind, SlotKind::Patch);
             assert!(payload == vec![7] || payload == vec![9]);
         })
@@ -548,7 +712,7 @@ fn concurrent_write_last_writer_wins() {
     writer2.join().unwrap();
 
     let f = open_patch(&patch_path).unwrap();
-    let (kind, payload) = read_patch_slot(&f, 4).unwrap();
+    let (kind, _flags, payload) = read_patch_slot(&f, 4).unwrap();
     assert_eq!(kind, SlotKind::Patch);
     assert_eq!(payload, vec![2, 3]);
 }
@@ -562,15 +726,15 @@ fn patch_slot_write_does_not_touch_neighbors() {
 
     write_patch_slot(&f, 1, &[9, 8, 7]).unwrap();
 
-    let (k0, p0) = read_patch_slot(&f, 0).unwrap();
+    let (k0, _f0, p0) = read_patch_slot(&f, 0).unwrap();
     assert_eq!(k0, SlotKind::Empty);
     assert!(p0.is_empty());
 
-    let (k1, p1) = read_patch_slot(&f, 1).unwrap();
+    let (k1, _f1, p1) = read_patch_slot(&f, 1).unwrap();
     assert_eq!(k1, SlotKind::Patch);
     assert_eq!(p1, vec![9, 8, 7]);
 
-    let (k2, p2) = read_patch_slot(&f, 2).unwrap();
+    let (k2, _f2, p2) = read_patch_slot(&f, 2).unwrap();
     assert_eq!(k2, SlotKind::Empty);
     assert!(p2.is_empty());
 }

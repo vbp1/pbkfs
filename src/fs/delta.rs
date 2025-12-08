@@ -25,10 +25,12 @@ pub const PATCH_SLOT_SIZE: usize = 512;
 /// Maximum payload bytes that fit into a single slot.
 pub const PATCH_PAYLOAD_MAX: usize = PATCH_SLOT_SIZE - 8; // minus kind/flags/payload_len/reserved
 const PATCH_MAGIC: &[u8; 8] = b"PBKPATCH";
-const PATCH_VERSION: u16 = 1;
+const PATCH_VERSION: u16 = 2;
 const FULL_MAGIC: &[u8; 8] = b"PBKFULL\0";
 const FULL_VERSION: u16 = 1;
-const FULL_HEADER_SIZE: u64 = 4096;
+pub const FULL_HEADER_SIZE: u64 = 4096;
+/// Slot flag indicating the v2 byte-stream encoding.
+pub const SLOT_FLAG_V2: u8 = 0x01;
 
 /// Slot kind, stored in the on-disk `.patch` header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,25 +40,11 @@ pub enum SlotKind {
     FullRef = 2,
 }
 
-/// In-memory PATCH segment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PatchSegment {
-    pub offset: u16,
-    pub len: u16,
-    pub data: Vec<u8>,
-}
-
-impl PatchSegment {
-    fn serialized_len(&self) -> usize {
-        4 + self.data.len()
-    }
-}
-
 /// Result of comparing two pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeltaDiff {
     Empty,
-    Patch { segments: Vec<PatchSegment> },
+    PatchV2 { payload: Vec<u8> },
     Full(Box<[u8; PAGE_SIZE]>),
 }
 
@@ -65,7 +53,7 @@ impl DeltaDiff {
     pub fn serialized_len(&self) -> usize {
         match self {
             DeltaDiff::Empty => 0,
-            DeltaDiff::Patch { segments } => segments.iter().map(|s| s.serialized_len()).sum(),
+            DeltaDiff::PatchV2 { payload } => payload.len(),
             DeltaDiff::Full(_) => PAGE_SIZE,
         }
     }
@@ -73,15 +61,7 @@ impl DeltaDiff {
     /// Serialize patch segments into an on-disk payload.
     pub fn to_patch_bytes(&self) -> Option<Vec<u8>> {
         match self {
-            DeltaDiff::Patch { segments } => {
-                let mut out = Vec::new();
-                for seg in segments {
-                    out.extend_from_slice(&seg.offset.to_le_bytes());
-                    out.extend_from_slice(&seg.len.to_le_bytes());
-                    out.extend_from_slice(&seg.data);
-                }
-                Some(out)
-            }
+            DeltaDiff::PatchV2 { payload } => Some(payload.clone()),
             _ => None,
         }
     }
@@ -95,46 +75,69 @@ impl DeltaDiff {
     }
 }
 
-/// Compute a delta between `base` and `new_page`.
+/// Encode differences between `base` and `new_page` using the v2 byte-stream format.
+pub fn encode_delta_v2(base: &[u8; PAGE_SIZE], new_page: &[u8; PAGE_SIZE]) -> Result<Vec<u8>> {
+    if base == new_page {
+        return Ok(Vec::new());
+    }
+
+    let mut payload = Vec::new();
+    let mut prev: isize = -1;
+
+    for (idx, (&before, &after)) in base.iter().zip(new_page.iter()).enumerate() {
+        if before == after {
+            continue;
+        }
+        let delta = idx as isize - prev - 1;
+        if delta < 0 {
+            return Err(Error::CorruptedPatch {
+                reason: "negative delta encountered during encoding".into(),
+            }
+            .into());
+        }
+        let delta_u16: u16 = delta.try_into().map_err(|_| Error::CorruptedPatch {
+            reason: "delta exceeds u16 during encoding".into(),
+        })?;
+
+        if delta_u16 < 255 {
+            payload.push(delta_u16 as u8);
+        } else {
+            payload.push(255);
+            payload.extend_from_slice(&delta_u16.to_le_bytes());
+        }
+        payload.push(after);
+        prev = idx as isize;
+    }
+
+    Ok(payload)
+}
+
+/// Compute a delta between `base` and `new_page` using the v2 encoding.
 ///
 /// Returns:
 /// - `DeltaDiff::Empty` when pages are identical,
-/// - `DeltaDiff::Patch` when changes fit into a single PATCH slot,
+/// - `DeltaDiff::PatchV2` when changes fit into a single PATCH slot,
 /// - `DeltaDiff::Full` when the patch would exceed the slot budget.
 pub fn compute_delta(base: &[u8; PAGE_SIZE], new_page: &[u8; PAGE_SIZE]) -> DeltaDiff {
     if base == new_page {
         return DeltaDiff::Empty;
     }
 
-    let mut segments = Vec::new();
-    let mut idx = 0usize;
-
-    while idx < PAGE_SIZE {
-        if base[idx] == new_page[idx] {
-            idx += 1;
-            continue;
+    let payload = match encode_delta_v2(base, new_page) {
+        Ok(p) => p,
+        Err(_) => {
+            let mut full = [0u8; PAGE_SIZE];
+            full.copy_from_slice(new_page);
+            return DeltaDiff::Full(Box::new(full));
         }
+    };
 
-        let start = idx;
-        while idx < PAGE_SIZE && base[idx] != new_page[idx] {
-            idx += 1;
-        }
-        let len = idx - start;
-
-        segments.push(PatchSegment {
-            offset: start as u16,
-            len: len as u16,
-            data: new_page[start..start + len].to_vec(),
-        });
-    }
-
-    let patch_len: usize = segments.iter().map(|s| s.serialized_len()).sum();
-    if patch_len == 0 {
+    if payload.is_empty() {
         return DeltaDiff::Empty;
     }
 
-    if patch_len <= PATCH_PAYLOAD_MAX {
-        DeltaDiff::Patch { segments }
+    if payload.len() <= PATCH_PAYLOAD_MAX {
+        DeltaDiff::PatchV2 { payload }
     } else {
         let mut full = [0u8; PAGE_SIZE];
         full.copy_from_slice(new_page);
@@ -142,8 +145,8 @@ pub fn compute_delta(base: &[u8; PAGE_SIZE], new_page: &[u8; PAGE_SIZE]) -> Delt
     }
 }
 
-/// Apply a PATCH payload to `base`, returning the reconstructed page.
-pub fn apply_patch(base: &[u8; PAGE_SIZE], patch_bytes: &[u8]) -> Result<[u8; PAGE_SIZE]> {
+/// Apply a v2 PATCH payload to `base`, returning the reconstructed page.
+pub fn apply_patch_v2(base: &[u8; PAGE_SIZE], patch_bytes: &[u8]) -> Result<[u8; PAGE_SIZE]> {
     if patch_bytes.is_empty() {
         return Err(Error::CorruptedPatch {
             reason: "empty patch payload".into(),
@@ -153,48 +156,52 @@ pub fn apply_patch(base: &[u8; PAGE_SIZE], patch_bytes: &[u8]) -> Result<[u8; PA
 
     let mut out = *base;
     let mut cursor = 0usize;
+    let mut pos: isize = -1;
 
     while cursor < patch_bytes.len() {
-        if cursor + 4 > patch_bytes.len() {
+        let first = patch_bytes[cursor];
+        cursor += 1;
+        let delta: u16 = if first == 255 {
+            if cursor + 1 >= patch_bytes.len() {
+                return Err(Error::CorruptedPatch {
+                    reason: "truncated long delta".into(),
+                }
+                .into());
+            }
+            let lo = patch_bytes[cursor];
+            let hi = patch_bytes[cursor + 1];
+            cursor += 2;
+            u16::from_le_bytes([lo, hi])
+        } else {
+            first as u16
+        };
+
+        if cursor >= patch_bytes.len() {
             return Err(Error::CorruptedPatch {
-                reason: "truncated patch segment header".into(),
+                reason: "missing value byte".into(),
             }
             .into());
         }
+        let value = patch_bytes[cursor];
+        cursor += 1;
 
-        let offset = u16::from_le_bytes([patch_bytes[cursor], patch_bytes[cursor + 1]]);
-        let len = u16::from_le_bytes([patch_bytes[cursor + 2], patch_bytes[cursor + 3]]);
-        cursor += 4;
-
-        if len == 0 {
+        let next_pos = pos + 1 + delta as isize;
+        if !(0..PAGE_SIZE as isize).contains(&next_pos) {
             return Err(Error::CorruptedPatch {
-                reason: "zero-length patch segment".into(),
+                reason: "delta would write outside page bounds".into(),
             }
             .into());
         }
-
-        let data_end = cursor + len as usize;
-        if data_end > patch_bytes.len() {
-            return Err(Error::CorruptedPatch {
-                reason: "segment overruns payload".into(),
-            }
-            .into());
-        }
-
-        let start = offset as usize;
-        let end = start + len as usize;
-        if end > PAGE_SIZE {
-            return Err(Error::CorruptedPatch {
-                reason: "segment overruns page boundary".into(),
-            }
-            .into());
-        }
-
-        out[start..end].copy_from_slice(&patch_bytes[cursor..data_end]);
-        cursor = data_end;
+        out[next_pos as usize] = value;
+        pos = next_pos;
     }
 
     Ok(out)
+}
+
+/// Compatibility wrapper for older call sites.
+pub fn apply_patch(base: &[u8; PAGE_SIZE], patch_bytes: &[u8]) -> Result<[u8; PAGE_SIZE]> {
+    apply_patch_v2(base, patch_bytes)
 }
 
 // Layout of the on-disk .patch header. Kept as a spec/for future mmap reads;
@@ -214,7 +221,7 @@ struct PatchFileHeader {
 #[repr(C)]
 struct SlotHeader {
     kind: u8,
-    _flags: u8,
+    flags: u8,
     payload_len: u16,
     _reserved: [u8; 4],
 }
@@ -308,13 +315,13 @@ pub fn create_patch(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read a single slot from `.patch`. Returns (kind, payload).
-pub fn read_patch_slot(file: &File, block_no: u64) -> Result<(SlotKind, Vec<u8>)> {
+/// Read a single slot from `.patch`. Returns (kind, flags, payload).
+pub fn read_patch_slot(file: &File, block_no: u64) -> Result<(SlotKind, u8, Vec<u8>)> {
     let mut hdr = [0u8; std::mem::size_of::<SlotHeader>()];
     let off = patch_offset(block_no);
     let read = file.read_at(&mut hdr, off)?;
     if read == 0 {
-        return Ok((SlotKind::Empty, Vec::new()));
+        return Ok((SlotKind::Empty, 0, Vec::new()));
     }
     if read < hdr.len() {
         return Err(Error::InvalidPatchFile {
@@ -333,6 +340,7 @@ pub fn read_patch_slot(file: &File, block_no: u64) -> Result<(SlotKind, Vec<u8>)
             .into())
         }
     };
+    let flags = hdr[1];
     let payload_len = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
     if payload_len > PATCH_PAYLOAD_MAX {
         return Err(Error::InvalidPatchFile {
@@ -346,6 +354,12 @@ pub fn read_patch_slot(file: &File, block_no: u64) -> Result<(SlotKind, Vec<u8>)
         }
         .into());
     }
+    if kind == SlotKind::Patch && flags & SLOT_FLAG_V2 == 0 {
+        return Err(Error::InvalidPatchFile {
+            reason: "patch slot missing v2 encoding flag".into(),
+        }
+        .into());
+    }
     if matches!(kind, SlotKind::Patch) && payload_len == 0 {
         return Err(Error::InvalidPatchFile {
             reason: "zero-length payload in patch slot".into(),
@@ -353,7 +367,7 @@ pub fn read_patch_slot(file: &File, block_no: u64) -> Result<(SlotKind, Vec<u8>)
         .into());
     }
     if kind == SlotKind::Empty || payload_len == 0 {
-        return Ok((kind, Vec::new()));
+        return Ok((kind, flags, Vec::new()));
     }
     let mut buf = vec![0u8; payload_len];
     let got = file.read_at(&mut buf, off + hdr.len() as u64)?;
@@ -363,7 +377,7 @@ pub fn read_patch_slot(file: &File, block_no: u64) -> Result<(SlotKind, Vec<u8>)
         }
         .into());
     }
-    Ok((kind, buf))
+    Ok((kind, flags, buf))
 }
 
 /// Write a PATCH slot (payload must fit in one slot).
@@ -378,6 +392,7 @@ pub fn write_patch_slot(file: &File, block_no: u64, payload: &[u8]) -> Result<()
     let off = patch_offset(block_no);
     let mut buf = vec![0u8; PATCH_SLOT_SIZE];
     buf[0] = SlotKind::Patch as u8;
+    buf[1] = SLOT_FLAG_V2;
     buf[2..4].copy_from_slice(&(payload.len() as u16).to_le_bytes());
     buf[8..8 + payload.len()].copy_from_slice(payload);
     file.write_all_at(&buf, off)?;
@@ -492,6 +507,20 @@ pub fn write_full_page(file: &File, block_no: u64, page: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Try to shrink `.full` file if the removed block was the tail block.
+///
+/// Safe to call after converting FULL -> PATCH when we know the target block
+/// was stored as FULL. If the file length equals exactly the end of this block,
+/// we truncate back to the header size.
+pub fn shrink_full_tail(file: &File, block_no: u64) -> io::Result<()> {
+    let meta = file.metadata()?;
+    let expected_end = FULL_HEADER_SIZE + (block_no + 1) * PAGE_SIZE as u64;
+    if meta.len() == expected_end {
+        file.set_len(FULL_HEADER_SIZE)?;
+    }
+    Ok(())
+}
+
 /// Punch a hole for a FULL block; ignored if unsupported.
 pub fn punch_full_hole(file: &File, block_no: u64) -> io::Result<()> {
     let _env = env_lock().lock();
@@ -552,6 +581,23 @@ impl BlockBitmap {
 
     pub fn len_bytes(&self) -> usize {
         self.bits.read().len()
+    }
+
+    /// Return the highest block number with any non-empty entry.
+    pub fn max_set_block(&self) -> Option<u64> {
+        let guard = self.bits.read();
+        for (byte_idx, byte) in guard.iter().enumerate().rev() {
+            if *byte == 0 {
+                continue;
+            }
+            for entry in (0..4).rev() {
+                let shift = entry * 2;
+                if ((*byte >> shift) & 0b11) != 0 {
+                    return Some(byte_idx as u64 * 4 + entry as u64);
+                }
+            }
+        }
+        None
     }
 }
 

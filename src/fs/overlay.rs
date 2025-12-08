@@ -23,9 +23,10 @@ use crate::{
     backup::metadata::{BackupMode, CompressionAlgorithm},
     env_lock,
     fs::delta::{
-        apply_patch, compute_delta, hash_path, open_full, open_patch, punch_full_hole,
-        read_full_page, read_patch_slot, write_empty_slot, write_full_page, write_full_ref_slot,
-        write_patch_slot, DeltaDiff, DeltaIndex, SlotKind, PAGE_SIZE,
+        apply_patch_v2, compute_delta, hash_path, open_full, open_patch, punch_full_hole,
+        read_full_page, read_patch_slot, shrink_full_tail, write_empty_slot, write_full_page,
+        write_full_ref_slot, write_patch_slot, DeltaDiff, DeltaIndex, SlotKind, FULL_HEADER_SIZE,
+        PAGE_SIZE,
     },
     Error, Result,
 };
@@ -114,6 +115,7 @@ pub struct OverlayMetrics {
     pub delta_patch_count: u64,
     pub delta_full_count: u64,
     pub delta_patch_bytes: u64,
+    pub delta_patch_max_size: u64,
     pub delta_patch_avg_size: u64,
     pub delta_bitmaps_loaded: u64,
     pub delta_bitmaps_total_bytes: u64,
@@ -131,6 +133,7 @@ struct OverlayMetricsInner {
     delta_patch_count: AtomicU64,
     delta_full_count: AtomicU64,
     delta_patch_bytes: AtomicU64,
+    delta_patch_max_size: AtomicU64,
     delta_bitmaps_loaded: AtomicU64,
     delta_bitmaps_total_bytes: AtomicU64,
     delta_punch_holes: AtomicU64,
@@ -148,6 +151,7 @@ impl OverlayMetricsInner {
             delta_patch_count: self.delta_patch_count.load(Ordering::Relaxed),
             delta_full_count: self.delta_full_count.load(Ordering::Relaxed),
             delta_patch_bytes: self.delta_patch_bytes.load(Ordering::Relaxed),
+            delta_patch_max_size: self.delta_patch_max_size.load(Ordering::Relaxed),
             delta_patch_avg_size: {
                 let count = self.delta_patch_count.load(Ordering::Relaxed);
                 if count == 0 {
@@ -565,6 +569,9 @@ impl Overlay {
                 meta_len,
                 "read_range_meta_eof"
             );
+            if is_datafile {
+                return Ok(Some(vec![0u8; size]));
+            }
             return Ok(Some(Vec::new()));
         }
         let max_len = ((meta_len - offset) as usize).min(size);
@@ -694,36 +701,60 @@ impl Overlay {
     /// Compute logical length for PostgreSQL datafiles (tables and indexes)
     /// using page indexes rather than raw compressed file sizes.
     fn datafile_logical_len(&self, rel: &Path) -> Result<Option<u64>> {
-        // If a diff copy exists and already has data (size > 0) or we have
-        // materialized blocks in the cache, treat its length as authoritative
-        // so PostgreSQL-visible truncations are respected. For a brand-new
-        // diff file (size == 0, no materialized blocks yet), fall back to the
-        // backup layers to avoid reporting a tiny size and triggering
-        // short-read errors during the first copy-up.
-        //
-        // IMPORTANT: Always read current diff file size from disk, not cache.
-        // PostgreSQL can extend files via writes, and cached sizes become stale,
-        // causing "unexpected data beyond EOF" errors when the actual file is
-        // larger than the cached/backup size.
+        // Always derive logical length from all writable surfaces (diff copy,
+        // delta patch/full) plus backup layers. Never rely on cached sizes:
+        // PostgreSQL may extend relations via writes, and stale cached lengths
+        // lead to "unexpected data beyond EOF".
         let diff_path = self.inner.diff.join(rel);
         let diff_len = fs::metadata(&diff_path).map(|m| m.len()).ok();
-        let patch_exists = self.delta_paths(rel).0.exists();
-        if let Some(len) = diff_len {
-            if len > 0 || patch_exists {
-                return Ok(Some(len));
+        let (patch_path, full_path) = self.delta_paths(rel);
+        let patch_exists = patch_path.exists();
+        let full_exists = full_path.exists();
+
+        // Start with any plain diff copy length.
+        let mut best = diff_len.unwrap_or(0u64);
+
+        // Delta patch/full lengths: use bitmap to find highest slot, and full
+        // file payload size as a fallback.
+        if patch_exists {
+            let cached = self.inner.delta_index.is_cached(&patch_path);
+            let bitmap = self.inner.delta_index.get_or_load_bitmap(&patch_path)?;
+            if !cached {
+                self.inner
+                    .metrics
+                    .delta_bitmaps_loaded
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .metrics
+                    .delta_bitmaps_total_bytes
+                    .fetch_add(bitmap.len_bytes() as u64, Ordering::Relaxed);
+            }
+
+            if let Some(max_blk) = bitmap.max_set_block() {
+                best = best.max(self.block_offset(max_blk + 1));
             }
         }
-        let mut best = 0u64;
 
-        if best == 0 {
-            // size == 0; if blocks were already materialized (e.g., after truncate),
-            // respect that as the diff length.
-            if let Ok(cache) = self.inner.cache.lock() {
-                if let Some(entry) = cache.get(rel) {
-                    if let Some(max_blk) = entry.materialized.iter().max() {
-                        let inferred = self.block_offset(max_blk + 1);
-                        best = best.max(inferred);
+        if full_exists {
+            if let Ok(meta) = fs::metadata(&full_path) {
+                if meta.len() >= FULL_HEADER_SIZE {
+                    let payload_bytes = meta.len() - FULL_HEADER_SIZE;
+                    if payload_bytes > 0 {
+                        let blocks = (payload_bytes + self.inner.block_size.get() as u64 - 1)
+                            / self.inner.block_size.get() as u64;
+                        best = best.max(self.block_offset(blocks));
                     }
+                }
+            }
+        }
+
+        // Respect any already materialized blocks tracked in the cache, which
+        // can reflect truncation/extension before a diff copy exists on disk.
+        if let Ok(cache) = self.inner.cache.lock() {
+            if let Some(entry) = cache.get(rel) {
+                if let Some(max_blk) = entry.materialized.iter().max() {
+                    let inferred = self.block_offset(max_blk + 1);
+                    best = best.max(inferred);
                 }
             }
         }
@@ -1593,7 +1624,7 @@ impl Overlay {
                             bitmap.set(block_no, 0);
                         }
                     }
-                    DeltaDiff::Patch { .. } => {
+                    DeltaDiff::PatchV2 { .. } => {
                         let payload = delta.to_patch_bytes().unwrap();
                         write_patch_slot(&patch_file, block_no, &payload)?;
                         self.mark_dirty_path(patch_path.clone());
@@ -1602,7 +1633,8 @@ impl Overlay {
                                 .metrics
                                 .delta_punch_holes
                                 .fetch_add(1, Ordering::Relaxed);
-                            if let Err(err) = punch_full_hole(&full_file, block_no) {
+                            let punch_res = punch_full_hole(&full_file, block_no);
+                            if let Err(err) = &punch_res {
                                 self.inner
                                     .metrics
                                     .delta_punch_hole_failures
@@ -1613,6 +1645,17 @@ impl Overlay {
                                     error = ?err,
                                     "delta_punch_hole_failed"
                                 );
+                            }
+                            // If punch succeeded, try to shrink tail if this was the highest block.
+                            if punch_res.is_ok() {
+                                if let Err(err) = shrink_full_tail(&full_file, block_no) {
+                                    warn!(
+                                        path = %rel.display(),
+                                        block = block_no,
+                                        error = ?err,
+                                        "delta_full_shrink_failed"
+                                    );
+                                }
                             }
                             self.mark_dirty_path(full_path.clone());
                         }
@@ -1625,6 +1668,10 @@ impl Overlay {
                             .metrics
                             .delta_patch_bytes
                             .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        self.inner
+                            .metrics
+                            .delta_patch_max_size
+                            .fetch_max(payload.len() as u64, Ordering::Relaxed);
                     }
                     DeltaDiff::Full(page) => {
                         write_full_page(&full_file, block_no, page.as_ref())?;
@@ -2084,11 +2131,11 @@ impl Overlay {
                 result
             } else {
                 let patch_file = open_patch(&patch_path)?;
-                let (kind, payload) = read_patch_slot(&patch_file, block_idx)?;
+                let (kind, _flags, payload) = read_patch_slot(&patch_file, block_idx)?;
                 match kind {
                     SlotKind::Patch => {
                         let base = self.read_base_block(rel, block_idx)?;
-                        let patched = apply_patch(&base, &payload)?;
+                        let patched = apply_patch_v2(&base, &payload)?;
                         Ok(Some(patched.to_vec()))
                     }
                     SlotKind::FullRef => Err(Error::InvalidPatchFile {
@@ -3053,9 +3100,9 @@ impl Overlay {
         // would otherwise be treated as a relation fork.
         if let Some(top_layer) = self.inner.layers.first() {
             if let Ok(mut cache) = self.inner.file_meta.lock() {
-                let layer_map = cache.entry(top_layer.root.clone()).or_insert_with(|| {
-                    Self::load_backup_content_for_root(&top_layer.root)
-                });
+                let layer_map = cache
+                    .entry(top_layer.root.clone())
+                    .or_insert_with(|| Self::load_backup_content_for_root(&top_layer.root));
                 let key = rel.to_string_lossy().to_string();
                 if let Some(meta) = layer_map.get(&key) {
                     return meta.is_datafile && meta.external_dir_num == 0;
