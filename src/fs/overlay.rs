@@ -178,6 +178,10 @@ struct BlockCacheEntry {
     // Highest byte offset written via FUSE, used to extend logical length for
     // datafiles even when deltas are empty (no bitmap/full growth).
     max_written_end: Option<u64>,
+    // Cached logical length for datafiles, derived from backup layers and
+    // delta artifacts. Kept separate from max_written_end so that writes can
+    // invalidate it without dropping other cache state.
+    logical_len: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -668,7 +672,8 @@ impl Overlay {
 
         // For heap/index files stored in page-mode format, physical file size
         // (with per-page headers/compression) is not the logical size. Derive
-        // length from the highest page number we can observe.
+        // length from the highest page number we can observe and cache the
+        // result per relation, invalidating it on writes/truncates.
         if self.is_pg_datafile(rel) {
             // If the top (target) backup does not list this relation as a
             // datafile in backup_content.control, treat it as absent (e.g.,
@@ -676,7 +681,25 @@ impl Overlay {
             if !self.top_layer_has_datafile(rel) {
                 return Ok(None);
             }
-            return self.datafile_logical_len(rel);
+
+            // Fast path: reuse cached logical length when available. Writes and
+            // truncates clear this field to avoid stale sizes.
+            if let Ok(cache) = self.inner.cache.lock() {
+                if let Some(entry) = cache.get(rel) {
+                    if let Some(len) = entry.logical_len {
+                        return Ok(Some(len));
+                    }
+                }
+            }
+
+            let len = self.datafile_logical_len(rel)?;
+            if let Some(v) = len {
+                if let Ok(mut cache) = self.inner.cache.lock() {
+                    let entry = cache.entry(rel.to_path_buf()).or_default();
+                    entry.logical_len = Some(v);
+                }
+            }
+            return Ok(len);
         }
 
         // Always read current diff file size from disk, not cache.
@@ -805,9 +828,8 @@ impl Overlay {
             // inspect BackupPageHeader stream to find highest block.
             let stream_len = match self.pg_block_index(rel, &path) {
                 Ok(index) if !index.is_empty() => index
-                    .iter()
-                    .map(|e| self.block_offset(e.block as u64 + 1))
-                    .max(),
+                    .last()
+                    .map(|e| self.block_offset(e.block as u64 + 1)),
                 _ => None,
             };
 
@@ -1525,8 +1547,19 @@ impl Overlay {
         // Build or reuse block index to avoid rescanning the whole file.
         let index = self.pg_block_index(rel, src)?;
 
-        let target = index.iter().find(|e| e.block as u64 == block_idx);
-        let target = match target {
+        // Block numbers are stored as u32 in the pg_probackup page stream
+        // header. Reject obviously out-of-range requests early.
+        if block_idx > u32::MAX as u64 {
+            return Ok(None);
+        }
+
+        // Index is kept sorted by block, so use binary search instead of
+        // scanning the whole slice on every page read.
+        let target = match index
+            .binary_search_by_key(&(block_idx as u32), |e| e.block)
+            .ok()
+            .map(|i| &index[i])
+        {
             Some(v) => v,
             None => return Ok(None),
         };
@@ -2027,6 +2060,13 @@ impl Overlay {
         }
 
         self.inner.delta_index.invalidate(&patch_path);
+        // Truncation changes logical length; drop any cached value so it will
+        // be recomputed on next access.
+        if let Ok(mut cache) = self.inner.cache.lock() {
+            if let Some(entry) = cache.get_mut(rel) {
+                entry.logical_len = None;
+            }
+        }
         self.clear_block_locks_for(rel);
         self.cleanup_file_lock(rel, &file_lock);
         Ok(())
@@ -2575,16 +2615,16 @@ impl Overlay {
 
         if let Ok(mut cache) = self.inner.cache.lock() {
             let entry = cache.entry(rel.to_path_buf()).or_default();
-
             if self.is_pg_datafile(rel) {
                 // For datafiles keep block-level materialization to extend logical length,
-                // but drop cached sources/indexes so they will be re-evaluated.
+                // but drop cached sources so they will be re-evaluated. Block indexes
+                // for base backup layers remain valid because those files are immutable.
                 entry.sources.clear();
-                entry.pg_block_index.clear();
                 for blk in start_block..=end_block {
                     entry.materialized.insert(blk);
                 }
                 entry.max_written_end = Some(entry.max_written_end.unwrap_or(0).max(end_offset));
+                entry.logical_len = None;
                 debug!(
                     path = %rel.display(),
                     start_block,
@@ -3076,6 +3116,10 @@ impl Overlay {
             reader.seek(SeekFrom::Current(compressed_size as i64))?;
             offset = data_offset + compressed_size as u64;
         }
+
+        // Sort by block number to enable efficient lookups for individual pages.
+        // Consumers only rely on the set of blocks, not on the original order.
+        index.sort_by_key(|e| e.block);
 
         Ok(index)
     }
