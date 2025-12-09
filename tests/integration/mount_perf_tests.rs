@@ -7,38 +7,6 @@ use std::{fs, io::Write, path::Path, sync::Arc, thread, time::Instant};
 use pbkfs::fs::overlay::Overlay;
 use tempfile::tempdir;
 
-/// RAII env guard for integration tests to toggle feature flags.
-struct EnvGuard {
-    key: &'static str,
-    prev: Option<String>,
-    _lock: parking_lot::ReentrantMutexGuard<'static, ()>,
-}
-
-impl EnvGuard {
-    fn new(key: &'static str, value: Option<&str>) -> Self {
-        let lock = pbkfs::env_lock().lock();
-        let prev = std::env::var(key).ok();
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        Self {
-            key,
-            prev,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
-
 #[test]
 fn overlay_read_write_is_fast_enough() -> pbkfs::Result<()> {
     let base = tempdir()?;

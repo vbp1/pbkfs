@@ -19,40 +19,6 @@ use tempfile::tempdir;
 
 const BLCKSZ: usize = 8192;
 
-/// Simple RAII helper to set and restore env vars inside tests.
-struct EnvGuard {
-    key: &'static str,
-    prev: Option<String>,
-    // Hold exclusive env_lock while the override is in effect to prevent
-    // cross-test races (tests run in parallel).
-    _lock: ReentrantMutexGuard<'static, ()>,
-}
-
-impl EnvGuard {
-    fn new(key: &'static str, value: Option<&str>) -> Self {
-        let lock = pbkfs::env_lock().lock();
-        let prev = std::env::var(key).ok();
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        Self {
-            key,
-            prev,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
-
 #[test]
 fn overlay_reads_base_and_writes_to_diff() -> pbkfs::Result<()> {
     let base = tempdir()?;
