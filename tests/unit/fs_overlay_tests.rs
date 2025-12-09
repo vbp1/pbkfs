@@ -1058,7 +1058,6 @@ fn block_reads_respect_pagemap_and_remain_sparse() -> pbkfs::Result<()> {
 
 #[test]
 fn datafile_reads_do_not_materialize_when_policy_disabled() -> pbkfs::Result<()> {
-
     let base = tempdir()?;
     let diff = tempdir()?;
 
@@ -1396,10 +1395,11 @@ fn pg_datafile_zero_page_write_relies_on_cache() -> pbkfs::Result<()> {
     // Dropping the cache simulates the FUSE invalidation that used to happen
     // before writes; logical length collapses back to metadata-only value.
     overlay.invalidate_cache(rel);
-    let logical_after_invalidate = overlay.logical_len_for(rel)?.expect("logical len after invalidate");
+    let logical_after_invalidate = overlay
+        .logical_len_for(rel)?
+        .expect("logical len after invalidate");
     assert_eq!(
-        logical_after_invalidate,
-        BLCKSZ as u64,
+        logical_after_invalidate, BLCKSZ as u64,
         "cache invalidation must not run for datafiles"
     );
 
@@ -1508,7 +1508,6 @@ fn compress_zlib_block(data: &[u8]) -> pbkfs::Result<Vec<u8>> {
 /// return data from backup, not zeros.
 #[test]
 fn sparse_diff_reads_unmaterialized_blocks_from_backup() -> pbkfs::Result<()> {
-
     let base = tempdir()?;
     let diff = tempdir()?;
 

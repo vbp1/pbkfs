@@ -829,9 +829,9 @@ impl Overlay {
             // For per-page stored files (all pg_probackup main-fork datafiles),
             // inspect BackupPageHeader stream to find highest block.
             let stream_len = match self.pg_block_index(rel, &path) {
-                Ok(index) if !index.is_empty() => index
-                    .last()
-                    .map(|e| self.block_offset(e.block as u64 + 1)),
+                Ok(index) if !index.is_empty() => {
+                    index.last().map(|e| self.block_offset(e.block as u64 + 1))
+                }
                 _ => None,
             };
 
