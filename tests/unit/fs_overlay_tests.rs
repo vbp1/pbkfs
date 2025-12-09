@@ -8,7 +8,6 @@ use std::{
 };
 
 use flate2::{write::ZlibEncoder, Compression};
-use parking_lot::ReentrantMutexGuard;
 use pbkfs::backup::metadata::{BackupMode, CompressionAlgorithm};
 use pbkfs::fs::delta::{
     create_full, create_patch, open_full, open_patch, write_full_page, write_full_ref_slot,
