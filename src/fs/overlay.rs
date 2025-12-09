@@ -175,6 +175,9 @@ struct BlockCacheEntry {
     // Block indexes per physical path (layer or diff file) to avoid mixing
     // incremental/full variants of the same relation.
     pg_block_index: HashMap<PathBuf, Vec<BlockIndexEntry>>,
+    // Highest byte offset written via FUSE, used to extend logical length for
+    // datafiles even when deltas are empty (no bitmap/full growth).
+    max_written_end: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -586,6 +589,7 @@ impl Overlay {
             start_block,
             end_block,
             bytes_returned = buf.len(),
+            logical_len = logical_len.unwrap_or(0),
             elapsed_us = read_start.elapsed().as_micros() as u64,
             "read_range_done"
         );
@@ -713,6 +717,7 @@ impl Overlay {
 
         // Start with any plain diff copy length.
         let mut best = diff_len.unwrap_or(0u64);
+        debug!(path = %rel.display(), diff_len = best, "logical_len_diff");
 
         // Delta patch/full lengths: use bitmap to find highest slot, and full
         // file payload size as a fallback.
@@ -732,6 +737,12 @@ impl Overlay {
 
             if let Some(max_blk) = bitmap.max_set_block() {
                 best = best.max(self.block_offset(max_blk + 1));
+                debug!(
+                    path = %rel.display(),
+                    max_blk,
+                    best,
+                    "logical_len_delta_bitmap"
+                );
             }
         }
 
@@ -743,6 +754,13 @@ impl Overlay {
                         let blocks = (payload_bytes + self.inner.block_size.get() as u64 - 1)
                             / self.inner.block_size.get() as u64;
                         best = best.max(self.block_offset(blocks));
+                        debug!(
+                            path = %rel.display(),
+                            payload_bytes,
+                            blocks,
+                            best,
+                            "logical_len_full_file"
+                        );
                     }
                 }
             }
@@ -755,6 +773,22 @@ impl Overlay {
                 if let Some(max_blk) = entry.materialized.iter().max() {
                     let inferred = self.block_offset(max_blk + 1);
                     best = best.max(inferred);
+                    debug!(
+                        path = %rel.display(),
+                        max_blk,
+                        inferred,
+                        best,
+                        "logical_len_cache_materialized"
+                    );
+                }
+                if let Some(end) = entry.max_written_end {
+                    best = best.max(end);
+                    debug!(
+                        path = %rel.display(),
+                        max_written_end = end,
+                        best,
+                        "logical_len_cache_written_end"
+                    );
                 }
             }
         }
@@ -791,6 +825,16 @@ impl Overlay {
                 (None, None) => fs::metadata(&path).ok().map(|m| m.len()),
             };
 
+            debug!(
+                path = %rel.display(),
+                layer = idx,
+                stream_len = stream_len.unwrap_or(0),
+                meta_len = meta_len.unwrap_or(0),
+                logical = logical.unwrap_or(0),
+                incremental = layer.incremental,
+                "logical_len_layer"
+            );
+
             if let Some(len) = logical {
                 if let (Some(m), Some(s)) = (meta_len, stream_len) {
                     if m > s {
@@ -814,8 +858,10 @@ impl Overlay {
         }
 
         if best == 0 {
+            debug!(path = %rel.display(), best, "logical_len_result_none");
             Ok(None)
         } else {
+            debug!(path = %rel.display(), best, "logical_len_result");
             Ok(Some(best))
         }
     }
@@ -2416,7 +2462,24 @@ impl Overlay {
             cache.get(&root).unwrap()
         };
 
-        let meta = layer_map.get(&rel_key)?;
+        // backup_content.control stores datafiles as "database/<path>" for the
+        // main tablespace or "external_dirN/<path>" for external tablespaces.
+        // Our overlay paths are prefix-less (e.g. "base/16389/16414"), so try
+        // the canonical database prefix first and then fall back to any entry
+        // whose suffix matches and is marked as a datafile. This covers
+        // external tablespaces without hardcoding N.
+        let meta = layer_map
+            .get(&format!("database/{}", rel_key))
+            .copied()
+            .or_else(|| {
+                layer_map.iter().find_map(|(k, v)| {
+                    if v.is_datafile && k.ends_with(&rel_key) {
+                        Some(*v)
+                    } else {
+                        None
+                    }
+                })
+            })?;
         if let Some(n) = meta.n_blocks {
             return Some(n);
         }
@@ -2497,6 +2560,7 @@ impl Overlay {
     pub fn invalidate_cache(&self, rel: &Path) {
         if let Ok(mut cache) = self.inner.cache.lock() {
             cache.remove(rel);
+            debug!(path = %rel.display(), "cache_invalidated");
         }
     }
 
@@ -2504,26 +2568,48 @@ impl Overlay {
     /// subsequent reads will source blocks from the diff rather than
     /// re-copying from base layers.
     pub(crate) fn record_write(&self, rel: &Path, offset: u64, len: usize) {
-        if self.is_pg_datafile(rel) {
-            // Delta-backed datafiles should always re-evaluate block sources
-            // instead of treating diff paths as fully materialized copies.
-            if let Ok(mut cache) = self.inner.cache.lock() {
-                cache.remove(rel);
-            }
-            return;
-        }
-
         let block_sz = self.inner.block_size.get() as u64;
         let start_block = offset / block_sz;
         let end_block = offset.saturating_add(len as u64).saturating_sub(1) / block_sz;
+        let end_offset = offset.saturating_add(len as u64);
 
         if let Ok(mut cache) = self.inner.cache.lock() {
             let entry = cache.entry(rel.to_path_buf()).or_default();
+
+            if self.is_pg_datafile(rel) {
+                // For datafiles keep block-level materialization to extend logical length,
+                // but drop cached sources/indexes so they will be re-evaluated.
+                entry.sources.clear();
+                entry.pg_block_index.clear();
+                for blk in start_block..=end_block {
+                    entry.materialized.insert(blk);
+                }
+                entry.max_written_end = Some(entry.max_written_end.unwrap_or(0).max(end_offset));
+                debug!(
+                    path = %rel.display(),
+                    start_block,
+                    end_block,
+                    end_offset,
+                    max_written_end = entry.max_written_end.unwrap_or(0),
+                    "record_write_pgdata"
+                );
+                return;
+            }
+
             for blk in start_block..=end_block {
                 entry.materialized.insert(blk);
                 // Drop any remembered upstream source: diff now authoritative.
                 entry.sources.remove(&blk);
             }
+            entry.max_written_end = Some(entry.max_written_end.unwrap_or(0).max(end_offset));
+            debug!(
+                path = %rel.display(),
+                start_block,
+                end_block,
+                end_offset,
+                max_written_end = entry.max_written_end.unwrap_or(0),
+                "record_write_regular"
+            );
         }
     }
 

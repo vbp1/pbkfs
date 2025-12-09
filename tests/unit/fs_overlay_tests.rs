@@ -1404,6 +1404,60 @@ fn pg_datafile_delta_extends_logical_len() -> pbkfs::Result<()> {
 }
 
 #[test]
+fn pg_datafile_zero_page_write_relies_on_cache() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    // Base FULL datafile with a single block.
+    let rel = Path::new("base/1/2662");
+    let data_root = base.path().join("FULL").join("database");
+    fs::create_dir_all(data_root.join(rel.parent().unwrap()))?;
+    let mut full_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_root.join(rel))?;
+    write_incremental_entry(&mut full_file, 0, &vec![b'A'; BLCKSZ])?;
+
+    // Mark relation as a datafile with one block in backup metadata.
+    let content_path = base.path().join("FULL").join("backup_content.control");
+    fs::write(
+        &content_path,
+        concat!(
+            r#"{"path":"base/1/2662","size":"-1","mode":"33152","is_datafile":"1","is_cfs":"0","crc":"0","compress_alg":"none","external_dir_num":"0","dbOid":"1","segno":"0","n_blocks":"1"}"#,
+            "\n"
+        ),
+    )?;
+
+    let layers = vec![Layer {
+        root: data_root.clone(),
+        compression: None,
+        incremental: false,
+        backup_mode: BackupMode::Full,
+    }];
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // Writing a zero-filled block far beyond the base length produces
+    // DeltaDiff::Empty, so only cache-tracked max_written_end can extend EOF.
+    let block_idx: u64 = 5;
+    overlay.write_at(rel, block_idx * BLCKSZ as u64, &vec![0u8; BLCKSZ])?;
+
+    let logical_with_cache = overlay.logical_len_for(rel)?.expect("logical len");
+    assert_eq!(logical_with_cache, (block_idx + 1) * BLCKSZ as u64);
+
+    // Dropping the cache simulates the FUSE invalidation that used to happen
+    // before writes; logical length collapses back to metadata-only value.
+    overlay.invalidate_cache(rel);
+    let logical_after_invalidate = overlay.logical_len_for(rel)?.expect("logical len after invalidate");
+    assert_eq!(
+        logical_after_invalidate,
+        BLCKSZ as u64,
+        "cache invalidation must not run for datafiles"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn compressed_incremental_non_data_prefers_newest_layer() -> pbkfs::Result<()> {
     let base = tempdir()?;
     let inc_old = tempdir()?;

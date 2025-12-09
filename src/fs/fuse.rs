@@ -186,7 +186,31 @@ impl FsTask {
                 // to honor logical lengths, sparse holes, and delta storage.
                 if overlay.is_pg_datafile(&rel) {
                     match overlay.read_range(&rel, offset, size) {
-                        Ok(Some(bytes)) => reply.data(&bytes),
+                        Ok(Some(bytes)) => {
+                            debug!(
+                                path = %rel.display(),
+                                offset,
+                                size,
+                                returned = bytes.len(),
+                                "fuse_read_pgdata"
+                            );
+                            // PostgreSQL treats short reads as corruption; if we
+                            // somehow produced an empty buffer while a positive
+                            // size was requested (e.g., length underestimation),
+                            // return zeroed bytes instead of EOF to allow WAL
+                            // replay to extend the relation.
+                            if bytes.is_empty() && size > 0 {
+                                debug!(
+                                    path = %rel.display(),
+                                    offset,
+                                    size,
+                                    "fuse_pgdata_zero_fill_empty",
+                                );
+                                reply.data(&vec![0u8; size]);
+                            } else {
+                                reply.data(&bytes)
+                            }
+                        }
                         Ok(None) => {
                             ok = false;
                             reply.error(ENOENT);
@@ -996,7 +1020,12 @@ impl Filesystem for OverlayFs {
             }
         }
 
-        self.invalidate_path_caches(&rel);
+        // Keep cache for PostgreSQL datafiles: Overlay::record_write tracks
+        // materialized/max_written_end, and a bulk invalidation breaks
+        // logical_len calculation and leads to EOF on new pages.
+        if !self.overlay.is_pg_datafile(&rel) {
+            self.invalidate_path_caches(&rel);
+        }
 
         // Get sequence number BEFORE submitting to worker pool
         let seq = self.pending_ops.increment(ino);
