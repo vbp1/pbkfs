@@ -115,8 +115,6 @@ fn lazy_block_reads_leave_diff_sparse_and_track_cache() -> pbkfs::Result<()> {
 
 #[test]
 fn materialize_policy_keeps_diff_small_for_reads() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
-
     let base = tempdir()?;
     let diff = tempdir()?;
 

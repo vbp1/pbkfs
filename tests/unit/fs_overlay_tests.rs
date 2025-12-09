@@ -193,7 +193,6 @@ fn delta_read_empty_returns_base_page() -> pbkfs::Result<()> {
 
 #[test]
 fn delta_read_applies_patch() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
     let base = tempdir()?;
     let diff = tempdir()?;
     let rel = Path::new("base/1/16402");
@@ -223,7 +222,6 @@ fn delta_read_applies_patch() -> pbkfs::Result<()> {
 
 #[test]
 fn delta_read_full_ref_overrides_base() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
     let base = tempdir()?;
     let diff = tempdir()?;
     let rel = Path::new("base/1/16402");
@@ -346,7 +344,6 @@ fn delta_segments_are_isolated() -> pbkfs::Result<()> {
 
 #[test]
 fn delta_truncate_to_zero_clears_patch_and_full() {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
     let base = tempdir().unwrap();
     let diff = tempdir().unwrap();
     let rel = Path::new("base/1/16402");
@@ -662,7 +659,6 @@ fn page_mode_incremental_without_pagemap_falls_back() -> pbkfs::Result<()> {
         },
     ];
 
-    let _env = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
     let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
 
     let data = overlay.read_range(rel, 0, BLCKSZ * 2)?.expect("file data");
@@ -1062,7 +1058,6 @@ fn block_reads_respect_pagemap_and_remain_sparse() -> pbkfs::Result<()> {
 
 #[test]
 fn datafile_reads_do_not_materialize_when_policy_disabled() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
 
     let base = tempdir()?;
     let diff = tempdir()?;
@@ -1102,50 +1097,6 @@ fn datafile_reads_do_not_materialize_when_policy_disabled() -> pbkfs::Result<()>
 
     let metrics = overlay.metrics();
     assert_eq!(0, metrics.blocks_copied, "read should avoid copy-up");
-
-    Ok(())
-}
-
-#[test]
-fn datafile_reads_materialize_when_policy_enabled() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("1"));
-
-    let base = tempdir()?;
-    let diff = tempdir()?;
-
-    let rel = Path::new("base/1/22222");
-    let base_root = base.path().join("FULL/database");
-    fs::create_dir_all(base_root.join(rel.parent().unwrap()))?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(base_root.join(rel))?;
-    write_incremental_entry(&mut file, 0, &vec![b'Z'; BLCKSZ])?;
-
-    let layers = vec![Layer {
-        root: base_root,
-        compression: None,
-        incremental: false,
-        backup_mode: BackupMode::Full,
-    }];
-
-    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
-
-    let read = overlay.read_range(rel, 0, BLCKSZ)?.expect("datafile");
-    assert_eq!(read.len(), BLCKSZ);
-
-    let diff_path = overlay.diff_root().join(rel);
-    assert!(
-        diff_path.exists(),
-        "materialize-on-read should create diff copy"
-    );
-    assert!(fs::metadata(&diff_path)?.len() >= BLCKSZ as u64);
-
-    let metrics = overlay.metrics();
-    assert!(
-        metrics.blocks_copied >= 1,
-        "materialization should be counted"
-    );
 
     Ok(())
 }
@@ -1292,8 +1243,6 @@ fn non_default_block_size_supported() -> pbkfs::Result<()> {
 
 #[test]
 fn pg_datafile_range_read_does_not_extend_past_logical_len() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("1"));
-
     let base = tempdir()?;
     let diff = tempdir()?;
 
@@ -1336,14 +1285,12 @@ fn pg_datafile_range_read_does_not_extend_past_logical_len() -> pbkfs::Result<()
     }];
     let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
 
-    // First, read the existing 4 * BLCKSZ bytes and ensure diff length matches.
+    // First, read the existing 4 * BLCKSZ bytes and ensure the payload matches.
     let first = overlay
         .read_range(rel, 0, BLCKSZ * 4)?
         .expect("existing range");
     assert_eq!(first.len(), BLCKSZ * 4);
     let diff_path = diff.path().join("data").join(rel);
-    let meta = fs::metadata(&diff_path)?;
-    assert_eq!(meta.len(), (BLCKSZ * 4) as u64);
 
     // Then, read a range starting exactly at logical EOF; we now serve zeros
     // (to avoid EIO during WAL replay) but should not extend the diff file.
@@ -1352,8 +1299,10 @@ fn pg_datafile_range_read_does_not_extend_past_logical_len() -> pbkfs::Result<()
         .expect("beyond logical len");
     assert_eq!(beyond.len(), BLCKSZ);
     assert!(beyond.iter().all(|b| *b == 0));
-    let meta_after = fs::metadata(&diff_path)?;
-    assert_eq!(meta_after.len(), (BLCKSZ * 4) as u64);
+    if diff_path.exists() {
+        let meta_after = fs::metadata(&diff_path)?;
+        assert_eq!(meta_after.len(), (BLCKSZ * 4) as u64);
+    }
 
     Ok(())
 }
@@ -1559,7 +1508,6 @@ fn compress_zlib_block(data: &[u8]) -> pbkfs::Result<Vec<u8>> {
 /// return data from backup, not zeros.
 #[test]
 fn sparse_diff_reads_unmaterialized_blocks_from_backup() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("1"));
 
     let base = tempdir()?;
     let diff = tempdir()?;
@@ -1666,7 +1614,6 @@ fn delta_read_without_deltas_uses_base() -> pbkfs::Result<()> {
 
 #[test]
 fn delta_read_applies_patch_slot() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
     let base = tempdir()?;
     let diff = tempdir()?;
     let rel = Path::new("base/16384/16403");
@@ -1701,7 +1648,6 @@ fn delta_read_applies_patch_slot() -> pbkfs::Result<()> {
 
 #[test]
 fn delta_read_full_ref() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
     let base = tempdir()?;
     let diff = tempdir()?;
     let rel = Path::new("base/16384/16404");
@@ -1735,7 +1681,6 @@ fn delta_read_full_ref() -> pbkfs::Result<()> {
 
 #[test]
 fn full_without_patch_is_error() {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
     let base = tempdir().unwrap();
     let diff = tempdir().unwrap();
     let rel = Path::new("base/16384/16405");
@@ -1767,7 +1712,6 @@ fn full_without_patch_is_error() {
 
 #[test]
 fn truncate_zero_removes_delta_artifacts() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
     let base = tempdir()?;
     let diff = tempdir()?;
     let rel = Path::new("base/16384/16406");

@@ -207,7 +207,6 @@ struct OverlayInner {
     // Per-layer file metadata loaded from pg_probackup's backup_content.control.
     // Keyed by layer root -> relative path -> metadata.
     file_meta: Mutex<HashMap<PathBuf, HashMap<String, FileMeta>>>,
-    materialize_on_read: bool,
     perf_unsafe: bool,
     dirty_paths: Mutex<HashSet<PathBuf>>,
     dirty_marker: PathBuf,
@@ -314,7 +313,6 @@ impl Overlay {
                 cache: Mutex::new(HashMap::new()),
                 metrics: OverlayMetricsInner::default(),
                 file_meta: Mutex::new(HashMap::new()),
-                materialize_on_read: parse_bool_env("PBKFS_MATERIALIZE_ON_READ", false),
                 perf_unsafe: parse_bool_env("PBKFS_PERF_UNSAFE", false),
                 dirty_paths: Mutex::new(HashSet::new()),
                 dirty_marker: diff_root.join(DIRTY_MARKER),
@@ -424,16 +422,20 @@ impl Overlay {
             None => return Ok(None),
         };
 
-        if self.is_pg_datafile(rel) && !self.inner.materialize_on_read {
+        // PostgreSQL datafiles are served via block-wise reads that reconstruct
+        // pages from backup layers and delta artifacts without fully
+        // materializing per-relation copies into the diff directory.
+        if self.is_pg_datafile(rel) {
             let logical = self
                 .logical_len(rel)?
                 .unwrap_or_else(|| fs::metadata(&base_path).map(|m| m.len()).unwrap_or(0));
             return self.read_range(rel, 0, logical as usize);
         }
 
-        // pg_probackup data files (FULL+incremental) and compressed layers
-        // must always be materialized into the diff directory before reads.
-        if incremental || compression.is_some() || self.is_pg_datafile(rel) {
+        // Compressed non-data files (both FULL and incremental) are stored as
+        // whole files. Materialize a single decompressed copy in the diff
+        // directory from the newest matching layer and serve reads from there.
+        if incremental || compression.is_some() {
             self.ensure_copy_up(rel)?;
             return Ok(Some(fs::read(diff_path)?));
         }
@@ -538,13 +540,13 @@ impl Overlay {
 
         let block_size = self.inner.block_size.get() as u64;
 
-        let read_start = Instant::now();
-
         if size == 0 {
             return Ok(Some(Vec::new()));
         }
 
-        let should_materialize = !is_datafile || self.inner.materialize_on_read;
+        let read_start = Instant::now();
+
+        let should_materialize = !is_datafile;
 
         if !should_materialize {
             return self.read_range_nonmaterializing(rel, offset, end_offset, size, &layers);
@@ -1053,6 +1055,13 @@ impl Overlay {
         if diff_path.exists() {
             if self.is_pg_datafile(rel) {
                 if let Ok(meta) = fs::metadata(&diff_path) {
+                    let block_sz = self.inner.block_size.get() as u64;
+                    // Shadowed zero-length relation created via truncate_pg_datafile(size == 0):
+                    // diff file exists with a single zero block and no delta artifacts.
+                    let (patch_path, full_path) = self.delta_paths(rel);
+                    if meta.len() == block_sz && !patch_path.exists() && !full_path.exists() {
+                        return Ok(vec![0u8; self.inner.block_size.get()]);
+                    }
                     if meta.len() == 0 {
                         return Ok(vec![0u8; self.inner.block_size.get()]);
                     }
@@ -1077,10 +1086,6 @@ impl Overlay {
             } else {
                 false
             };
-
-            if self.is_pg_datafile(rel) && is_hole {
-                return Ok(vec![0u8; self.inner.block_size.get()]);
-            }
 
             if !is_hole {
                 let mut buf = vec![0u8; self.inner.block_size.get()];
@@ -2162,10 +2167,6 @@ impl Overlay {
             .lock()
             .map(|c| c.keys().cloned().collect())
             .unwrap_or_default()
-    }
-
-    pub fn materialize_on_read(&self) -> bool {
-        self.inner.materialize_on_read
     }
 
     pub fn compression_algorithm(&self) -> Option<CompressionAlgorithm> {
