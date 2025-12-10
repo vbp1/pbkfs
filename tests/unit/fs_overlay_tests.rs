@@ -9,48 +9,14 @@ use std::{
 
 use flate2::{write::ZlibEncoder, Compression};
 use pbkfs::backup::metadata::{BackupMode, CompressionAlgorithm};
+use pbkfs::fs::delta::{
+    create_full, create_patch, open_full, open_patch, write_full_page, write_full_ref_slot,
+    write_patch_slot,
+};
 use pbkfs::fs::overlay::{Layer, Overlay};
 use tempfile::tempdir;
 
 const BLCKSZ: usize = 8192;
-
-/// Simple RAII helper to set and restore env vars inside tests.
-struct EnvGuard {
-    key: &'static str,
-    prev: Option<String>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl EnvGuard {
-    fn lock() -> &'static std::sync::Mutex<()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn new(key: &'static str, value: Option<&str>) -> Self {
-        let lock = Self::lock().lock().unwrap();
-        let prev = std::env::var(key).ok();
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        Self {
-            key,
-            prev,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
 
 #[test]
 fn overlay_reads_base_and_writes_to_diff() -> pbkfs::Result<()> {
@@ -130,6 +96,371 @@ fn copy_up_decompresses_compressed_file_on_first_read() -> pbkfs::Result<()> {
     let diff_bytes = fs::read(&diff_path)?;
     assert_eq!(original.as_slice(), diff_bytes.as_slice());
 
+    Ok(())
+}
+
+#[test]
+fn is_pg_datafile_recognizes_segments_and_forks() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let overlay = Overlay::new(base.path(), diff.path())?;
+
+    let positive = [
+        "base/16389/16402",
+        "base/16389/16402.1",
+        "base/16389/16402_vm",
+        "base/16389/16402_vm.2",
+        "global/1262",
+        "pg_tblspc/12345/PG_14_202107181/16384/16402_fsm",
+    ];
+    for p in positive {
+        assert!(
+            overlay.is_pg_datafile(Path::new(p)),
+            "{p} should be datafile"
+        );
+    }
+
+    let negative = [
+        "base/16389/016402",
+        "base/16389/abc",
+        "base/16389/16402_ptrack",
+        "pg_tblspc/12345/notpgver/16384/16402",
+        "other/16389/16402",
+    ];
+    for p in negative {
+        assert!(
+            !overlay.is_pg_datafile(Path::new(p)),
+            "{p} should NOT be datafile"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn delta_read_empty_returns_base_page() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/1/16402");
+
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, vec![7u8; BLCKSZ])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+    let page = overlay
+        .read_range(rel, 0, BLCKSZ)?
+        .expect("page should be readable");
+    assert_eq!(page.len(), BLCKSZ);
+    assert!(page.iter().all(|b| *b == 7));
+    Ok(())
+}
+
+#[test]
+fn delta_read_applies_patch() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/1/16402");
+
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, vec![0u8; BLCKSZ])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+    let (patch_path, _) = overlay.delta_paths(rel);
+    fs::create_dir_all(patch_path.parent().unwrap())?;
+    create_patch(&patch_path)?;
+    let patch_file = pbkfs::fs::delta::open_patch(&patch_path)?;
+    // v2 payload: delta=0, value=5
+    write_patch_slot(&patch_file, 0, &[0, 5u8])?;
+    let (kind, flags, payload) = pbkfs::fs::delta::read_patch_slot(&patch_file, 0)?;
+    assert!(matches!(kind, pbkfs::fs::delta::SlotKind::Patch));
+    assert_ne!(flags & pbkfs::fs::delta::SLOT_FLAG_V2, 0);
+    assert_eq!(payload, vec![0, 5u8]);
+
+    let page = overlay
+        .read_range(rel, 0, BLCKSZ)?
+        .expect("page should be readable");
+    assert_eq!(page[0], 5);
+    Ok(())
+}
+
+#[test]
+fn delta_read_full_ref_overrides_base() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/1/16402");
+
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, vec![0u8; BLCKSZ])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+    let (patch_path, full_path) = overlay.delta_paths(rel);
+    fs::create_dir_all(patch_path.parent().unwrap())?;
+    create_patch(&patch_path)?;
+    create_full(&full_path)?;
+
+    let patch_file = pbkfs::fs::delta::open_patch(&patch_path)?;
+    let full_file = pbkfs::fs::delta::open_full(&full_path)?;
+    write_full_ref_slot(&patch_file, 0)?;
+    let page = [9u8; BLCKSZ];
+    write_full_page(&full_file, 0, &page)?;
+    let bm = pbkfs::fs::delta::load_bitmap_from_patch(&patch_path)?;
+    assert_eq!(bm.get(0), 0b01);
+
+    let page = overlay
+        .read_range(rel, 0, BLCKSZ)?
+        .expect("page should be readable");
+    assert_eq!(page[0], 9);
+    Ok(())
+}
+
+#[test]
+fn delta_invalid_patch_magic_errors() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/1/16402");
+
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, vec![0u8; BLCKSZ])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+    let (patch_path, _) = overlay.delta_paths(rel);
+    fs::create_dir_all(patch_path.parent().unwrap())?;
+    fs::write(&patch_path, b"not-a-patch")?;
+
+    let err = overlay
+        .read_range(rel, 0, BLCKSZ)
+        .expect_err("invalid patch should error");
+    let is_patch_err = err
+        .downcast_ref::<pbkfs::Error>()
+        .map(|e| matches!(e, pbkfs::Error::InvalidPatchFile { .. }))
+        .unwrap_or(false);
+    assert!(is_patch_err);
+    Ok(())
+}
+
+#[test]
+fn delta_sparse_slot_defaults_to_base() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/1/16402");
+
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, vec![3u8; BLCKSZ * 6])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+    let (patch_path, _) = overlay.delta_paths(rel);
+    fs::create_dir_all(patch_path.parent().unwrap())?;
+    create_patch(&patch_path)?;
+    // no slot written -> EMPTY
+
+    let page = overlay
+        .read_range(rel, BLCKSZ as u64 * 5, BLCKSZ)?
+        .expect("page should be readable");
+    assert!(page.iter().all(|b| *b == 3));
+    Ok(())
+}
+
+#[test]
+fn delta_segments_are_isolated() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel0 = Path::new("base/1/16402");
+    let rel1 = Path::new("base/1/16402.1");
+
+    // Create base for both segments.
+    fs::create_dir_all(base.path().join("base/1"))?;
+    fs::write(base.path().join(rel0), vec![0u8; BLCKSZ])?;
+    fs::write(base.path().join(rel1), vec![0u8; BLCKSZ])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+
+    // Write patch only to segment .1
+    let (patch_seg, _) = overlay.delta_paths(rel1);
+    fs::create_dir_all(patch_seg.parent().unwrap())?;
+    create_patch(&patch_seg)?;
+    let f = pbkfs::fs::delta::open_patch(&patch_seg)?;
+    // v2 payload: delta=0, value=0xAA
+    write_patch_slot(&f, 0, &[0, 0xAA])?;
+    let bm = pbkfs::fs::delta::load_bitmap_from_patch(&patch_seg)?;
+    assert_eq!(bm.get(0), 0b10);
+    let (k, flags, payload) = pbkfs::fs::delta::read_patch_slot(&f, 0)?;
+    assert!(matches!(k, pbkfs::fs::delta::SlotKind::Patch));
+    assert_ne!(flags & pbkfs::fs::delta::SLOT_FLAG_V2, 0);
+    assert_eq!(payload, vec![0, 0xAA]);
+
+    // Reading base segment should not see changes.
+    let page0 = overlay
+        .read_range(rel0, 0, BLCKSZ)?
+        .expect("page should be readable");
+    assert_eq!(page0[0], 0);
+
+    // Segment .1 still readable.
+    let page1 = overlay
+        .read_range(rel1, 0, BLCKSZ)?
+        .expect("page should be readable");
+    assert_eq!(page1[0], 0xAA);
+    Ok(())
+}
+
+#[test]
+fn delta_truncate_to_zero_clears_patch_and_full() {
+    let base = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+    let rel = Path::new("base/1/16402");
+
+    // Create base and delta artifacts.
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap()).unwrap();
+    fs::write(&base_path, vec![1u8; BLCKSZ]).unwrap();
+
+    let overlay = Overlay::new(base.path(), diff.path()).unwrap();
+    let (patch_path, full_path) = overlay.delta_paths(rel);
+    fs::create_dir_all(patch_path.parent().unwrap()).unwrap();
+    create_patch(&patch_path).unwrap();
+    create_full(&full_path).unwrap();
+    let patch_file = pbkfs::fs::delta::open_patch(&patch_path).unwrap();
+    write_patch_slot(&patch_file, 0, &[0, 0, 1, 0, 9]).unwrap();
+
+    overlay.truncate_pg_datafile(rel, 0).unwrap();
+
+    assert!(!patch_path.exists());
+    assert!(!full_path.exists());
+    assert!(overlay
+        .read_range(rel, 0, BLCKSZ)
+        .unwrap()
+        .expect("page")
+        .iter()
+        .all(|b| *b == 0));
+}
+
+#[test]
+fn delta_extend_without_write_returns_zeroes() {
+    let base = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+    let rel = Path::new("base/1/16402");
+
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap()).unwrap();
+    fs::write(&base_path, vec![0u8; BLCKSZ]).unwrap();
+
+    let overlay = Overlay::new(base.path(), diff.path()).unwrap();
+    overlay
+        .truncate_pg_datafile(rel, (BLCKSZ as u64) * 2)
+        .unwrap();
+
+    // Second block should read as zeros, with no delta files created.
+    let page = overlay
+        .read_range(rel, BLCKSZ as u64, BLCKSZ)
+        .unwrap()
+        .expect("page");
+    assert!(page.iter().all(|b| *b == 0));
+    let (patch_path, full_path) = overlay.delta_paths(rel);
+    assert!(!patch_path.exists());
+    assert!(!full_path.exists());
+}
+
+#[test]
+fn delta_write_stores_patch_for_small_change() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/1/16402");
+
+    // base datafile with zero page
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, vec![0u8; BLCKSZ])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+
+    // Write a tiny change (still block aligned).
+    let mut page = vec![0u8; BLCKSZ];
+    page[10] = 7;
+    overlay.write_at(rel, 0, &page)?;
+
+    // .patch should exist with PATCH kind, .full absent or empty hole.
+    let (patch_path, full_path) = overlay.delta_paths(rel);
+    assert!(patch_path.exists(), "patch file should be created");
+    let patch_meta = fs::metadata(&patch_path)?;
+    assert!(patch_meta.len() >= 512);
+    let full_meta = fs::metadata(&full_path).ok();
+    if let Some(meta) = full_meta {
+        // full may exist but should not have a real page allocated
+        assert!(meta.len() <= 4096 + 8192);
+    }
+
+    // Read returns modified page without needing diff copy.
+    let read = overlay
+        .read_range(rel, 0, BLCKSZ)?
+        .expect("read should succeed");
+    assert_eq!(read.len(), BLCKSZ);
+    assert_eq!(read[10], 7);
+    Ok(())
+}
+
+#[test]
+fn delta_write_stores_full_for_large_change() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/1/16402");
+
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, vec![0u8; BLCKSZ])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+
+    // Write a very different page (all 1s) to trigger FULL.
+    let page = vec![1u8; BLCKSZ];
+    overlay.write_at(rel, 0, &page)?;
+
+    let (patch_path, full_path) = overlay.delta_paths(rel);
+    assert!(patch_path.exists());
+    assert!(full_path.exists());
+
+    // Patch slot should be FULL_REF and full file should have data at block 0.
+    let full_data = fs::read(&full_path)?;
+    assert!(
+        full_data.len() >= 4096 + BLCKSZ,
+        "full file should contain at least one page"
+    );
+
+    let read = overlay
+        .read_range(rel, 0, BLCKSZ)?
+        .expect("read should succeed");
+    assert_eq!(read, page);
+    Ok(())
+}
+
+#[test]
+fn delta_read_prefers_patch_without_materializing_full_page() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/1/16402");
+
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, vec![0u8; BLCKSZ])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+
+    // Write small patch then remove any diff datafile if created (should not be).
+    let mut page = vec![0u8; BLCKSZ];
+    page[20] = 5;
+    overlay.write_at(rel, 0, &page)?;
+
+    let diff_data = diff.path().join("data").join(rel);
+    assert!(!diff_data.exists(), "diff datafile should remain absent");
+
+    let read = overlay
+        .read_range(rel, 0, BLCKSZ)?
+        .expect("read should succeed");
+    assert_eq!(read[20], 5);
+    assert!(!diff_data.exists(), "read should not create diff copy");
     Ok(())
 }
 
@@ -293,7 +624,6 @@ fn page_mode_incremental_without_pagemap_falls_back() -> pbkfs::Result<()> {
         },
     ];
 
-    let _env = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
     let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
 
     let data = overlay.read_range(rel, 0, BLCKSZ * 2)?.expect("file data");
@@ -693,8 +1023,6 @@ fn block_reads_respect_pagemap_and_remain_sparse() -> pbkfs::Result<()> {
 
 #[test]
 fn datafile_reads_do_not_materialize_when_policy_disabled() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("0"));
-
     let base = tempdir()?;
     let diff = tempdir()?;
 
@@ -733,50 +1061,6 @@ fn datafile_reads_do_not_materialize_when_policy_disabled() -> pbkfs::Result<()>
 
     let metrics = overlay.metrics();
     assert_eq!(0, metrics.blocks_copied, "read should avoid copy-up");
-
-    Ok(())
-}
-
-#[test]
-fn datafile_reads_materialize_when_policy_enabled() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("1"));
-
-    let base = tempdir()?;
-    let diff = tempdir()?;
-
-    let rel = Path::new("base/1/22222");
-    let base_root = base.path().join("FULL/database");
-    fs::create_dir_all(base_root.join(rel.parent().unwrap()))?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(base_root.join(rel))?;
-    write_incremental_entry(&mut file, 0, &vec![b'Z'; BLCKSZ])?;
-
-    let layers = vec![Layer {
-        root: base_root,
-        compression: None,
-        incremental: false,
-        backup_mode: BackupMode::Full,
-    }];
-
-    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
-
-    let read = overlay.read_range(rel, 0, BLCKSZ)?.expect("datafile");
-    assert_eq!(read.len(), BLCKSZ);
-
-    let diff_path = overlay.diff_root().join(rel);
-    assert!(
-        diff_path.exists(),
-        "materialize-on-read should create diff copy"
-    );
-    assert!(fs::metadata(&diff_path)?.len() >= BLCKSZ as u64);
-
-    let metrics = overlay.metrics();
-    assert!(
-        metrics.blocks_copied >= 1,
-        "materialization should be counted"
-    );
 
     Ok(())
 }
@@ -923,8 +1207,6 @@ fn non_default_block_size_supported() -> pbkfs::Result<()> {
 
 #[test]
 fn pg_datafile_range_read_does_not_extend_past_logical_len() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("1"));
-
     let base = tempdir()?;
     let diff = tempdir()?;
 
@@ -967,14 +1249,12 @@ fn pg_datafile_range_read_does_not_extend_past_logical_len() -> pbkfs::Result<()
     }];
     let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
 
-    // First, read the existing 4 * BLCKSZ bytes and ensure diff length matches.
+    // First, read the existing 4 * BLCKSZ bytes and ensure the payload matches.
     let first = overlay
         .read_range(rel, 0, BLCKSZ * 4)?
         .expect("existing range");
     assert_eq!(first.len(), BLCKSZ * 4);
     let diff_path = diff.path().join("data").join(rel);
-    let meta = fs::metadata(&diff_path)?;
-    assert_eq!(meta.len(), (BLCKSZ * 4) as u64);
 
     // Then, read a range starting exactly at logical EOF; we now serve zeros
     // (to avoid EIO during WAL replay) but should not extend the diff file.
@@ -983,8 +1263,110 @@ fn pg_datafile_range_read_does_not_extend_past_logical_len() -> pbkfs::Result<()
         .expect("beyond logical len");
     assert_eq!(beyond.len(), BLCKSZ);
     assert!(beyond.iter().all(|b| *b == 0));
-    let meta_after = fs::metadata(&diff_path)?;
-    assert_eq!(meta_after.len(), (BLCKSZ * 4) as u64);
+    if diff_path.exists() {
+        let meta_after = fs::metadata(&diff_path)?;
+        assert_eq!(meta_after.len(), (BLCKSZ * 4) as u64);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn pg_datafile_delta_extends_logical_len() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    // Build a single FULL datafile with one block.
+    let rel = Path::new("base/1/2662");
+    let data_root = base.path().join("FULL").join("database");
+    fs::create_dir_all(data_root.join(rel.parent().unwrap()))?;
+    let mut full_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_root.join(rel))?;
+    write_incremental_entry(&mut full_file, 0, &vec![b'A'; BLCKSZ])?;
+
+    // Minimal backup_content.control entry marking the relation as a datafile
+    // with one block in the restored backup.
+    let content_path = base.path().join("FULL").join("backup_content.control");
+    fs::write(
+        &content_path,
+        concat!(
+            r#"{"path":"base/1/2662","size":"-1","mode":"33152","is_datafile":"1","is_cfs":"0","crc":"0","compress_alg":"none","external_dir_num":"0","dbOid":"1","segno":"0","n_blocks":"1"}"#,
+            "\n"
+        ),
+    )?;
+
+    let layers = vec![Layer {
+        root: data_root.clone(),
+        compression: None,
+        incremental: false,
+        backup_mode: BackupMode::Full,
+    }];
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // Write a new block far beyond the base length via delta storage.
+    let block_idx: u64 = 5;
+    overlay.write_at(rel, block_idx * BLCKSZ as u64, &vec![b'Z'; BLCKSZ])?;
+
+    // Logical length must include the newly written block (6 blocks total).
+    let logical = overlay.logical_len_for(rel)?.expect("logical len");
+    assert_eq!(logical, (block_idx + 1) * BLCKSZ as u64);
+
+    Ok(())
+}
+
+#[test]
+fn pg_datafile_zero_page_write_relies_on_cache() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    // Base FULL datafile with a single block.
+    let rel = Path::new("base/1/2662");
+    let data_root = base.path().join("FULL").join("database");
+    fs::create_dir_all(data_root.join(rel.parent().unwrap()))?;
+    let mut full_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_root.join(rel))?;
+    write_incremental_entry(&mut full_file, 0, &vec![b'A'; BLCKSZ])?;
+
+    // Mark relation as a datafile with one block in backup metadata.
+    let content_path = base.path().join("FULL").join("backup_content.control");
+    fs::write(
+        &content_path,
+        concat!(
+            r#"{"path":"base/1/2662","size":"-1","mode":"33152","is_datafile":"1","is_cfs":"0","crc":"0","compress_alg":"none","external_dir_num":"0","dbOid":"1","segno":"0","n_blocks":"1"}"#,
+            "\n"
+        ),
+    )?;
+
+    let layers = vec![Layer {
+        root: data_root.clone(),
+        compression: None,
+        incremental: false,
+        backup_mode: BackupMode::Full,
+    }];
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // Writing a zero-filled block far beyond the base length produces
+    // DeltaDiff::Empty, so only cache-tracked max_written_end can extend EOF.
+    let block_idx: u64 = 5;
+    overlay.write_at(rel, block_idx * BLCKSZ as u64, &vec![0u8; BLCKSZ])?;
+
+    let logical_with_cache = overlay.logical_len_for(rel)?.expect("logical len");
+    assert_eq!(logical_with_cache, (block_idx + 1) * BLCKSZ as u64);
+
+    // Dropping the cache simulates the FUSE invalidation that used to happen
+    // before writes; logical length collapses back to metadata-only value.
+    overlay.invalidate_cache(rel);
+    let logical_after_invalidate = overlay
+        .logical_len_for(rel)?
+        .expect("logical len after invalidate");
+    assert_eq!(
+        logical_after_invalidate, BLCKSZ as u64,
+        "cache invalidation must not run for datafiles"
+    );
 
     Ok(())
 }
@@ -1091,8 +1473,6 @@ fn compress_zlib_block(data: &[u8]) -> pbkfs::Result<Vec<u8>> {
 /// return data from backup, not zeros.
 #[test]
 fn sparse_diff_reads_unmaterialized_blocks_from_backup() -> pbkfs::Result<()> {
-    let _guard = EnvGuard::new("PBKFS_MATERIALIZE_ON_READ", Some("1"));
-
     let base = tempdir()?;
     let diff = tempdir()?;
 
@@ -1176,4 +1556,179 @@ fn sparse_diff_reads_unmaterialized_blocks_from_backup() -> pbkfs::Result<()> {
     );
 
     Ok(())
+}
+
+#[test]
+fn delta_read_without_deltas_uses_base() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/16384/16402");
+
+    let mut page = vec![1u8; BLCKSZ];
+    page[0] = 7;
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, &page)?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+    let read = overlay.read_range(rel, 0, BLCKSZ)?.expect("page present");
+    assert_eq!(read, page);
+    Ok(())
+}
+
+#[test]
+fn delta_read_applies_patch_slot() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/16384/16403");
+
+    let mut base_page = vec![3u8; BLCKSZ];
+    base_page[100] = 4;
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, &base_page)?;
+
+    // Create .patch with a small delta.
+    let (patch_path, _) = {
+        let overlay = Overlay::new(base.path(), diff.path())?;
+        overlay.delta_paths(rel)
+    };
+    create_patch(&patch_path)?;
+    let mut new_page = [0u8; BLCKSZ];
+    new_page.copy_from_slice(&base_page);
+    new_page[200] = 9;
+    let delta = pbkfs::fs::delta::compute_delta(&base_page.try_into().unwrap(), &new_page);
+    let payload = delta.to_patch_bytes().unwrap();
+    let patch_file = open_patch(&patch_path)?;
+    write_patch_slot(&patch_file, 0, &payload)?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+    let read = overlay.read_range(rel, 0, BLCKSZ)?.expect("patched page");
+    assert_eq!(read[200], 9);
+    assert_eq!(read[100], 4);
+    assert_eq!(read[0], 3);
+    Ok(())
+}
+
+#[test]
+fn delta_read_full_ref() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/16384/16404");
+
+    let base_page = vec![5u8; BLCKSZ];
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, &base_page)?;
+
+    let (_, full_path) = {
+        let overlay = Overlay::new(base.path(), diff.path())?;
+        overlay.delta_paths(rel)
+    };
+    create_full(&full_path)?;
+    let full_file = open_full(&full_path)?;
+    let mut new_page = [0u8; BLCKSZ];
+    new_page.fill(8);
+    write_full_page(&full_file, 0, &new_page)?;
+    let patch_path = full_path.with_extension("patch");
+    create_patch(&patch_path)?;
+    let patch_file = open_patch(&patch_path)?;
+    write_full_ref_slot(&patch_file, 0)?;
+    let bm = pbkfs::fs::delta::load_bitmap_from_patch(&patch_path)?;
+    assert_eq!(bm.get(0), 0b01);
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+    let read = overlay.read_range(rel, 0, BLCKSZ)?.expect("full-ref page");
+    assert_eq!(read, new_page);
+    Ok(())
+}
+
+#[test]
+fn full_without_patch_is_error() {
+    let base = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+    let rel = Path::new("base/16384/16405");
+
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap()).unwrap();
+    fs::write(&base_path, vec![0u8; BLCKSZ]).unwrap();
+
+    let (_, full_path) = {
+        let overlay = Overlay::new(base.path(), diff.path()).unwrap();
+        overlay.delta_paths(rel)
+    };
+    create_full(&full_path).unwrap();
+    assert!(full_path.exists());
+    let err = pbkfs::fs::delta::load_bitmap_from_patch(&full_path.with_extension("patch"))
+        .expect_err("missing patch should error when full exists");
+    let _ = err.downcast::<pbkfs::Error>().expect("invalid patch error");
+
+    let overlay = Overlay::new(base.path(), diff.path()).unwrap();
+    let err = overlay
+        .read_range(rel, 0, BLCKSZ)
+        .expect_err("should fail without patch");
+    let err = err.downcast::<pbkfs::Error>().unwrap();
+    match err {
+        pbkfs::Error::InvalidPatchFile { .. } => {}
+        other => panic!("unexpected error: {:?}", other),
+    }
+}
+
+#[test]
+fn truncate_zero_removes_delta_artifacts() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/16384/16406");
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, vec![1u8; BLCKSZ])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+    // Write a delta to create .patch and .full.
+    overlay.write_at(rel, 0, &[2u8; BLCKSZ])?;
+
+    let (patch_path, full_path) = overlay.delta_paths(rel);
+    assert!(patch_path.exists());
+    assert!(full_path.exists());
+
+    overlay.truncate_pg_datafile(rel, 0)?;
+    assert!(!patch_path.exists());
+    assert!(!full_path.exists());
+
+    // After truncation to zero, relation should read as zeros (empty).
+    let reread = overlay.read_range(rel, 0, BLCKSZ)?.expect("page");
+    assert!(reread.iter().all(|b| *b == 0));
+    Ok(())
+}
+
+#[test]
+fn extend_without_write_returns_zero() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let rel = Path::new("base/16384/16407");
+    let base_path = base.path().join(rel);
+    fs::create_dir_all(base_path.parent().unwrap())?;
+    fs::write(&base_path, vec![0u8; BLCKSZ])?;
+
+    let overlay = Overlay::new(base.path(), diff.path())?;
+    overlay.truncate_pg_datafile(rel, (BLCKSZ * 2) as u64)?;
+
+    let data = overlay
+        .read_range(rel, BLCKSZ as u64, BLCKSZ)?
+        .expect("extended block");
+    assert_eq!(data, vec![0u8; BLCKSZ]);
+    Ok(())
+}
+
+#[test]
+fn is_pg_datafile_patterns() {
+    let base = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+    let overlay = Overlay::new(base.path(), diff.path()).unwrap();
+
+    assert!(overlay.is_pg_datafile(Path::new("base/16389/16402")));
+    assert!(overlay.is_pg_datafile(Path::new("base/16389/16402.1")));
+    assert!(overlay.is_pg_datafile(Path::new("pg_tblspc/12345/PG_14_202107181/16384/16402_fsm")));
+    assert!(!overlay.is_pg_datafile(Path::new("base/16389/16402_ptrack")));
+    assert!(!overlay.is_pg_datafile(Path::new("config/postgresql.conf")));
 }

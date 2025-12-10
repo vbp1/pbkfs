@@ -4,13 +4,42 @@ use pbkfs::{binding::BindingRecord, binding::DiffDir, cli::mount::MountArgs, Err
 use tempfile::tempdir;
 use uuid::Uuid;
 
-static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+use parking_lot::ReentrantMutexGuard;
+/// RAII env guard serialized with the global pbkfs env_lock to avoid
+/// cross-test races when modifying environment variables (e.g. PG_PROBACKUP_BIN).
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+    _lock: ReentrantMutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn new(key: &'static str, value: Option<&str>) -> Self {
+        let lock = pbkfs::env_lock().lock();
+        let prev = std::env::var(key).ok();
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        Self {
+            key,
+            prev,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
 
 fn mount_guarded(args: MountArgs) -> pbkfs::Result<pbkfs::cli::mount::MountContext> {
-    let _guard = ENV_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap();
+    let _guard = pbkfs::env_lock().lock();
     pbkfs::cli::mount::mount(args)
 }
 
@@ -95,6 +124,7 @@ fn mount_errors_for_unknown_store_layout() {
         instance: Some("main".into()),
         backup_id: Some("FULL1".into()),
         force: false,
+        perf_unsafe: false,
     })
     .expect_err("non-pg_probackup layout should fail");
 
@@ -151,13 +181,8 @@ JSON
         perms.set_mode(0o755);
         std::fs::set_permissions(&script_path, perms)?;
     }
-    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
     {
-        let _guard = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
-        std::env::set_var("PG_PROBACKUP_BIN", &script_path);
+        let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some(script_path.to_str().unwrap()));
 
         let ctx = pbkfs::cli::mount::mount(MountArgs {
             pbk_store: Some(store.path().to_path_buf()),
@@ -166,6 +191,7 @@ JSON
             instance: Some("main".into()),
             backup_id: Some("FULL1".into()),
             force: false,
+            perf_unsafe: false,
         })?;
 
         let contents = ctx
@@ -178,12 +204,6 @@ JSON
             handle.unmount();
         }
         let _ = std::fs::remove_file(diff.path().join(pbkfs::binding::LOCK_FILE));
-    }
-
-    if let Some(bin) = old_bin {
-        std::env::set_var("PG_PROBACKUP_BIN", bin);
-    } else {
-        std::env::remove_var("PG_PROBACKUP_BIN");
     }
 
     Ok(())
@@ -235,12 +255,7 @@ JSON
     perms.set_mode(0o755);
     std::fs::set_permissions(&script_path, perms)?;
 
-    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
-    let _guard = ENV_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap();
-    std::env::set_var("PG_PROBACKUP_BIN", &script_path);
+    let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some(script_path.to_str().unwrap()));
 
     let ctx = pbkfs::cli::mount::mount(MountArgs {
         pbk_store: Some(store.path().to_path_buf()),
@@ -249,6 +264,7 @@ JSON
         instance: Some("main".into()),
         backup_id: Some("FULL1".into()),
         force: false,
+        perf_unsafe: false,
     })?;
 
     let mounted_file = target.path().join("data/base.txt");
@@ -270,12 +286,6 @@ JSON
         handle.unmount();
     }
     let _ = std::fs::remove_file(diff.path().join(pbkfs::binding::LOCK_FILE));
-
-    if let Some(bin) = old_bin {
-        std::env::set_var("PG_PROBACKUP_BIN", bin);
-    } else {
-        std::env::remove_var("PG_PROBACKUP_BIN");
-    }
 
     Ok(())
 }
@@ -386,13 +396,8 @@ fn mount_reuses_binding_with_diff_only_arguments() -> pbkfs::Result<()> {
     std::fs::create_dir_all(diff_data.parent().unwrap())?;
     std::fs::write(&diff_data, b"from-diff")?;
 
-    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
     let ctx = {
-        let _guard = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
-        std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
+        let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
 
         pbkfs::cli::mount::mount(MountArgs {
             pbk_store: Some(store.path().to_path_buf()),
@@ -401,14 +406,9 @@ fn mount_reuses_binding_with_diff_only_arguments() -> pbkfs::Result<()> {
             instance: None,
             backup_id: None,
             force: false,
+            perf_unsafe: false,
         })?
     };
-
-    if let Some(bin) = old_bin {
-        std::env::set_var("PG_PROBACKUP_BIN", bin);
-    } else {
-        std::env::remove_var("PG_PROBACKUP_BIN");
-    }
 
     assert_eq!(binding.binding_id, ctx.binding.binding_id);
     assert_eq!("main", ctx.binding.instance_name);
@@ -454,6 +454,7 @@ fn mount_rejects_binding_mismatch_when_instance_differs() {
         instance: Some("other".into()),
         backup_id: Some("FULL1".into()),
         force: false,
+        perf_unsafe: false,
     })
     .expect_err("mismatched instance should fail");
 
@@ -489,6 +490,7 @@ fn mount_rejects_binding_mismatch_when_backup_differs() {
         instance: Some("main".into()),
         backup_id: Some("INC1".into()),
         force: false,
+        perf_unsafe: false,
     })
     .expect_err("mismatched backup should fail");
 
@@ -527,6 +529,7 @@ fn mount_rejects_binding_mismatch_when_store_differs() {
         instance: None,
         backup_id: None,
         force: false,
+        perf_unsafe: false,
     })
     .expect_err("store path mismatch should fail");
 
@@ -665,13 +668,8 @@ fn mount_rejects_corrupt_chain_without_force() {
     std::fs::write(&base_file, b"data").unwrap();
     write_corrupt_metadata(store.path());
 
-    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
     let err = {
-        let _guard = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
-        std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
+        let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
 
         pbkfs::cli::mount::mount(MountArgs {
             pbk_store: Some(store.path().to_path_buf()),
@@ -680,15 +678,10 @@ fn mount_rejects_corrupt_chain_without_force() {
             instance: Some("main".into()),
             backup_id: Some("FULL1".into()),
             force: false,
+            perf_unsafe: false,
         })
         .expect_err("corrupt chain should fail without --force")
     };
-
-    if let Some(bin) = old_bin {
-        std::env::set_var("PG_PROBACKUP_BIN", bin);
-    } else {
-        std::env::remove_var("PG_PROBACKUP_BIN");
-    }
 
     let actual = err
         .downcast_ref::<Error>()
@@ -707,13 +700,8 @@ fn mount_allows_corrupt_chain_with_force() -> pbkfs::Result<()> {
     std::fs::write(&base_file, b"data")?;
     write_corrupt_metadata(store.path());
 
-    let old_bin = std::env::var("PG_PROBACKUP_BIN").ok();
     let ctx = {
-        let _guard = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
-        std::env::set_var("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup");
+        let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
 
         pbkfs::cli::mount::mount(MountArgs {
             pbk_store: Some(store.path().to_path_buf()),
@@ -722,14 +710,9 @@ fn mount_allows_corrupt_chain_with_force() -> pbkfs::Result<()> {
             instance: Some("main".into()),
             backup_id: Some("FULL1".into()),
             force: true,
+            perf_unsafe: false,
         })?
     };
-
-    if let Some(bin) = old_bin {
-        std::env::set_var("PG_PROBACKUP_BIN", bin);
-    } else {
-        std::env::remove_var("PG_PROBACKUP_BIN");
-    }
 
     assert_eq!("FULL1", ctx.chain.target_backup_id);
 

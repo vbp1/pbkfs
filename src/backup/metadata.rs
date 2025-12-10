@@ -114,7 +114,15 @@ pub struct BackupMetadata {
     pub compression: Option<Compression>,
     pub size_bytes: u64,
     pub checksum_state: ChecksumState,
+    /// PostgreSQL major version from the backup (e.g., "16", "17")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
 }
+
+/// Minimum supported PostgreSQL major version.
+pub const POSTGRES_VERSION_MIN: u16 = 14;
+/// Maximum supported PostgreSQL major version.
+pub const POSTGRES_VERSION_MAX: u16 = 18;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupStore {
@@ -122,6 +130,7 @@ pub struct BackupStore {
     pub instance_name: String,
     pub backups: Vec<BackupMetadata>,
     pub version_pg_probackup: String,
+    /// Supported PostgreSQL major version range (min, max).
     pub version_postgres_supported: (u16, u16),
     pub layout: StoreLayout,
 }
@@ -142,16 +151,9 @@ struct ShowBackupJson {
     start_time: String,
     #[serde(rename = "data-bytes")]
     data_bytes: Option<u64>,
-    #[serde(rename = "uncompressed-bytes")]
-    #[allow(dead_code)]
-    uncompressed_bytes: Option<u64>,
-    #[serde(rename = "wal-bytes")]
-    #[allow(dead_code)]
-    wal_bytes: Option<u64>,
     #[serde(rename = "program-version")]
     program_version: Option<String>,
     #[serde(rename = "server-version")]
-    #[allow(dead_code)]
     server_version: Option<String>,
 }
 
@@ -203,7 +205,7 @@ impl BackupStore {
             instance_name,
             backups,
             version_pg_probackup: version_pg_probackup.into(),
-            version_postgres_supported: (14, 17),
+            version_postgres_supported: (POSTGRES_VERSION_MIN, POSTGRES_VERSION_MAX),
             layout,
         })
     }
@@ -223,8 +225,10 @@ impl BackupStore {
                 Error::UnsupportedPgProbackupVersion(self.version_pg_probackup.clone()).into(),
             );
         }
+        let (min_pg, max_pg) = self.version_postgres_supported;
         for backup in &self.backups {
             backup.validate_compression()?;
+            backup.validate_postgres_version(min_pg, max_pg)?;
         }
         Ok(())
     }
@@ -487,6 +491,25 @@ impl BackupMetadata {
         Ok(())
     }
 
+    /// Validate that the PostgreSQL server version is within the supported range.
+    /// If server_version is not present, validation passes (backwards compatibility).
+    pub fn validate_postgres_version(&self, min: u16, max: u16) -> Result<()> {
+        let Some(ref version) = self.server_version else {
+            return Ok(());
+        };
+
+        if !postgres_version_in_range(version, min, max) {
+            return Err(Error::UnsupportedPostgresVersion {
+                version: version.clone(),
+                min,
+                max,
+            }
+            .into());
+        }
+
+        Ok(())
+    }
+
     pub fn ensure_instance(&self, instance: &str) -> Result<()> {
         if self.instance_name != instance {
             return Err(Error::BindingViolation {
@@ -540,6 +563,7 @@ fn backup_from_show(instance: &str, b: ShowBackupJson) -> Result<BackupMetadata>
         compression,
         size_bytes: b.data_bytes.unwrap_or(0),
         checksum_state: ChecksumState::NotVerified,
+        server_version: b.server_version,
     })
 }
 
@@ -549,4 +573,13 @@ fn version_supported(version: &str) -> bool {
         (Some(major), Some(minor)) => (major == 2 && minor >= 5) || major > 2,
         _ => false,
     }
+}
+
+/// Check if PostgreSQL major version is within supported range.
+/// pg_probackup stores major version as plain number for PG≥10 (e.g., "16").
+fn postgres_version_in_range(version: &str, min: u16, max: u16) -> bool {
+    version
+        .parse::<u16>()
+        .map(|major| major >= min && major <= max)
+        .unwrap_or(false)
 }

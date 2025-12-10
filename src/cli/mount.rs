@@ -18,6 +18,7 @@ use crate::{
         BackupType,
     },
     binding::{BindingRecord, DiffDir, LockMarker, LOCK_FILE},
+    env_lock,
     fs::{
         fuse,
         overlay::{Layer as OverlayLayer, Overlay},
@@ -52,6 +53,10 @@ pub struct MountArgs {
     /// Allow mounting corrupt backup chains (dangerous)
     #[arg(long, default_value = "false")]
     pub force: bool,
+
+    /// Skip fsync for datafiles (perf only; unsafe). Leaves .pbkfs-dirty until unmount.
+    #[arg(long, default_value = "false")]
+    pub perf_unsafe: bool,
 }
 
 #[derive(Debug)]
@@ -63,6 +68,16 @@ pub struct MountContext {
     pub overlay: Overlay,
     pub session: MountSession,
     pub fuse_handle: Option<fuse::MountHandle>,
+}
+
+impl MountContext {
+    pub fn perf_unsafe(&self) -> bool {
+        self.overlay.perf_unsafe()
+    }
+
+    pub fn flush_dirty(&self) -> Result<()> {
+        self.overlay.flush_dirty(false)
+    }
 }
 
 pub fn execute(args: MountArgs) -> Result<()> {
@@ -121,6 +136,10 @@ pub fn execute(args: MountArgs) -> Result<()> {
             }
         }
 
+        if let Err(err) = ctx.overlay.flush_dirty(false) {
+            warn!(error = ?err, "failed to flush perf-unsafe dirty set");
+        }
+
         // Clean lock markers best-effort.
         let _ = std::fs::remove_file(ctx.diff_dir.path.join(LOCK_FILE));
     }
@@ -158,6 +177,21 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
         .ok_or_else(|| Error::Cli("diff_dir is required".into()))
         .map(canonicalize_path)?;
 
+    let dirty_marker = diff_dir_path.join(crate::fs::overlay::DIRTY_MARKER);
+    if dirty_marker.exists() {
+        if !args.force {
+            return Err(Error::PerfUnsafeDirtyMarker {
+                path: dirty_marker.display().to_string(),
+            }
+            .into());
+        }
+        warn!(
+            path = %dirty_marker.display(),
+            "forcing mount despite existing perf-unsafe marker"
+        );
+        let _ = fs::remove_file(&dirty_marker);
+    }
+
     let target = MountTarget::new(&mnt_path);
     target.validate_empty()?;
     info!("validated target directory");
@@ -166,6 +200,15 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
     let diff_dir = DiffDir::new(&diff_dir_path)?;
     diff_dir.ensure_writable()?;
     info!(diff = %diff_dir.path.display(), "diff directory prepared");
+
+    {
+        let _guard = env_lock().lock();
+        if args.perf_unsafe {
+            std::env::set_var("PBKFS_PERF_UNSAFE", "1");
+        } else {
+            std::env::set_var("PBKFS_PERF_UNSAFE", "0");
+        }
+    }
 
     let existing_binding = diff_dir.load_binding()?;
     let mut recovered_stale = false;
@@ -277,6 +320,17 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
 
     // Persist lock markers before mounting so writes hit the real FS, not the FUSE layer.
     let mut session = MountSession::new(binding.binding_id, &mnt_path);
+    if overlay.perf_unsafe() {
+        fs::write(
+            &dirty_marker,
+            format!("perf-unsafe mount {}", session.mount_id),
+        )?;
+        warn!(
+            path = %dirty_marker.display(),
+            "perf-unsafe mode enabled: fsyncs are deferred until unmount"
+        );
+    }
+
     let marker = LockMarker {
         mount_id: session.mount_id,
         diff_dir: diff_dir.path.clone(),

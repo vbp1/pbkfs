@@ -150,23 +150,21 @@ enum FsTask {
         offset: i64,
         data: Vec<u8>,
         reply: ReplyWrite,
-        handle: Option<Arc<File>>,
+        _handle: Option<Arc<File>>, // reserved for future direct-diff writes
     },
     Fsync {
         ino: u64,
         seq: u64,
         overlay: Overlay,
         rel: PathBuf,
+        datasync: bool,
         reply: ReplyEmpty,
     },
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct OpenHandle {
-    rel: PathBuf,
     file: Option<Arc<File>>, // diff or base file handle
-    writable: bool,
     from_diff: bool,
 }
 
@@ -184,7 +182,45 @@ impl FsTask {
                 reply,
                 handle,
             } => {
-                if let Some(file) = handle {
+                // For PostgreSQL datafiles, always route through overlay.read_range()
+                // to honor logical lengths, sparse holes, and delta storage.
+                if overlay.is_pg_datafile(&rel) {
+                    match overlay.read_range(&rel, offset, size) {
+                        Ok(Some(bytes)) => {
+                            debug!(
+                                path = %rel.display(),
+                                offset,
+                                size,
+                                returned = bytes.len(),
+                                "fuse_read_pgdata"
+                            );
+                            // PostgreSQL treats short reads as corruption; if we
+                            // somehow produced an empty buffer while a positive
+                            // size was requested (e.g., length underestimation),
+                            // return zeroed bytes instead of EOF to allow WAL
+                            // replay to extend the relation.
+                            if bytes.is_empty() && size > 0 {
+                                debug!(
+                                    path = %rel.display(),
+                                    offset,
+                                    size,
+                                    "fuse_pgdata_zero_fill_empty",
+                                );
+                                reply.data(&vec![0u8; size]);
+                            } else {
+                                reply.data(&bytes)
+                            }
+                        }
+                        Ok(None) => {
+                            ok = false;
+                            reply.error(ENOENT);
+                        }
+                        Err(_) => {
+                            ok = false;
+                            reply.error(EIO);
+                        }
+                    }
+                } else if let Some(file) = handle {
                     let mut buf = vec![0u8; size];
                     match file.read_at(&mut buf, offset) {
                         Ok(read) => {
@@ -218,70 +254,24 @@ impl FsTask {
                 offset,
                 data,
                 reply,
-                handle,
+                _handle: _,
             } => {
                 // Wait for all preceding writes to complete (FIFO order)
                 pending_ops.wait_for_preceding(ino, seq);
 
-                // Ensure diff copy exists so we write into a real file, then
-                // perform an in-place pwrite without truncating existing data.
-                if let Err(err) = overlay.ensure_copy_up(&rel) {
-                    reply.error(crate::fs::fuse::OverlayFs::err_from_anyhow(err));
-                    pending_ops.decrement(ino, seq);
-                    return;
-                }
-
-                let file = match handle {
-                    Some(f) => f,
-                    None => {
-                        let path = overlay.diff_root().join(&rel);
-                        match OpenOptions::new().read(true).write(true).open(&path) {
-                            Ok(f) => Arc::new(f),
-                            Err(err) => {
-                                reply.error(err.raw_os_error().unwrap_or(EIO));
-                                pending_ops.decrement(ino, seq);
-                                return;
-                            }
-                        }
-                    }
-                };
-
                 let start_off = offset.max(0) as u64;
-                if let Err(err) = file.write_at(&data, start_off) {
+                if let Err(err) = overlay.write_at(&rel, start_off, &data) {
                     debug!(
                         error = ?err,
                         path = %rel.display(),
                         offset = start_off,
                         len = data.len(),
-                        "fs_worker_write_at_failed"
+                        "fs_worker_write_overlay_failed"
                     );
-                    reply.error(err.raw_os_error().unwrap_or(EIO));
+                    reply.error(OverlayFs::err_from_anyhow(err));
                     pending_ops.decrement(ino, seq);
                     return;
                 }
-
-                // For PostgreSQL datafiles, extend if needed (never truncate), as they
-                // may grow via WAL replay and require zero-padding at the end.
-                // For regular files, do NOT set_len - the application manages file size
-                // via O_TRUNC at open or explicit ftruncate. Calling set_len here would
-                // cause corruption when multiple writes are reordered in the worker pool.
-                let needed_len = start_off.saturating_add(data.len() as u64);
-                if overlay.is_pg_datafile(&rel) {
-                    if let Ok(meta) = file.metadata() {
-                        let current_len = meta.len();
-                        if current_len < needed_len {
-                            if let Err(err) = file.set_len(needed_len) {
-                                reply.error(err.raw_os_error().unwrap_or(EIO));
-                                pending_ops.decrement(ino, seq);
-                                return;
-                            }
-                        }
-                    }
-                }
-
-                // Mark written blocks as materialized and update cached length
-                // so reads will source data from diff without copy_up.
-                overlay.record_write(&rel, start_off, data.len());
 
                 debug!(path = %rel.display(), ino, seq, "WRITE decrement");
                 reply.written(data.len() as u32);
@@ -292,44 +282,17 @@ impl FsTask {
                 seq,
                 overlay,
                 rel,
+                datasync,
                 reply,
             } => {
                 // Wait for all preceding operations to complete (FIFO order)
                 pending_ops.wait_for_preceding(ino, seq);
 
-                let path = {
-                    let diff = overlay.diff_root().join(&rel);
-                    if diff.exists() {
-                        diff
-                    } else {
-                        match overlay.find_layer_path(&rel) {
-                            Some((p, _, _)) => p,
-                            None => {
-                                ok = false;
-                                reply.error(ENOENT);
-                                pending_ops.decrement(ino, seq);
-                                metrics.record_task(ok, start.elapsed().as_micros() as u64);
-                                return;
-                            }
-                        }
-                    }
-                };
-
-                match File::open(&path) {
-                    Ok(file) => {
-                        if let Err(err) = file.sync_all() {
-                            ok = false;
-                            let code = err.raw_os_error().unwrap_or(EIO);
-                            reply.error(code);
-                        } else {
-                            reply.ok();
-                        }
-                    }
-                    Err(err) => {
-                        ok = false;
-                        let code = err.raw_os_error().unwrap_or(EIO);
-                        reply.error(code);
-                    }
+                if let Err(err) = overlay.fsync_path(&rel, datasync) {
+                    ok = false;
+                    reply.error(OverlayFs::err_from_anyhow(err));
+                } else {
+                    reply.ok();
                 }
                 pending_ops.decrement(ino, seq);
             }
@@ -419,6 +382,8 @@ impl FsWorkerPool {
         }
     }
 
+    // Exposed for Phase 8 (stats dump via SIGUSR1/SIGUSR2) to snapshot worker
+    // queue/load metrics without blocking the worker threads.
     #[allow(dead_code)]
     fn metrics(&self) -> FsWorkerMetrics {
         self.metrics.snapshot()
@@ -528,6 +493,14 @@ impl OverlayFs {
             handle_hits: self.handle_hits.load(Ordering::Relaxed),
             handle_misses: self.handle_misses.load(Ordering::Relaxed),
             handles_open: self.handles.lock().map(|h| h.len()).unwrap_or(0),
+            delta_patch_count: overlay_metrics.delta_patch_count,
+            delta_full_count: overlay_metrics.delta_full_count,
+            delta_patch_avg_size: overlay_metrics.delta_patch_avg_size,
+            delta_patch_max_size: overlay_metrics.delta_patch_max_size,
+            delta_bitmaps_loaded: overlay_metrics.delta_bitmaps_loaded,
+            delta_bitmaps_total_bytes: overlay_metrics.delta_bitmaps_total_bytes,
+            delta_punch_holes: overlay_metrics.delta_punch_holes,
+            delta_punch_hole_failures: overlay_metrics.delta_punch_hole_failures,
         };
         crate::logging::log_overlay_io_metrics(snapshot);
     }
@@ -586,6 +559,10 @@ impl OverlayFs {
     }
 
     fn ensure_diff_copy(&self, rel: &Path) -> io::Result<()> {
+        if self.overlay.is_pg_datafile(rel) {
+            // Datafiles use delta storage; copy-up of whole files defeats dedup.
+            return Ok(());
+        }
         self.overlay
             .ensure_copy_up(rel)
             .map_err(|err| io::Error::from_raw_os_error(Self::err_from_anyhow(err)))
@@ -939,15 +916,7 @@ impl Filesystem for OverlayFs {
         }
 
         let fh = self.alloc_fh();
-        self.insert_handle(
-            fh,
-            OpenHandle {
-                rel: rel.clone(),
-                file,
-                writable: write_intent,
-                from_diff,
-            },
-        );
+        self.insert_handle(fh, OpenHandle { file, from_diff });
 
         reply.opened(fh, 0);
     }
@@ -1024,8 +993,10 @@ impl Filesystem for OverlayFs {
             return;
         }
 
+        // For pg datafiles we skip upfront copy-up: delta slots are written via Overlay::write_at.
+        // For other files we keep the existing fast path with an already opened diff file.
         let mut handle_arc: Option<Arc<File>> = None;
-        {
+        if !self.overlay.is_pg_datafile(&rel) {
             let mut handles = self.handles.lock().unwrap();
             if let Some(entry) = handles.get_mut(&fh) {
                 if entry.file.is_none() || !entry.from_diff {
@@ -1049,7 +1020,12 @@ impl Filesystem for OverlayFs {
             }
         }
 
-        self.invalidate_path_caches(&rel);
+        // Keep cache for PostgreSQL datafiles: Overlay::record_write tracks
+        // materialized/max_written_end, and a bulk invalidation breaks
+        // logical_len calculation and leads to EOF on new pages.
+        if !self.overlay.is_pg_datafile(&rel) {
+            self.invalidate_path_caches(&rel);
+        }
 
         // Get sequence number BEFORE submitting to worker pool
         let seq = self.pending_ops.increment(ino);
@@ -1063,7 +1039,7 @@ impl Filesystem for OverlayFs {
             offset,
             data: data.to_vec(),
             reply,
-            handle: handle_arc,
+            _handle: handle_arc,
         };
         self.worker_pool.submit(task);
     }
@@ -1234,9 +1210,7 @@ impl Filesystem for OverlayFs {
                         self.insert_handle(
                             fh,
                             OpenHandle {
-                                rel: rel.clone(),
                                 file: Some(Arc::new(file)),
-                                writable: true,
                                 from_diff: true,
                             },
                         );
@@ -1360,6 +1334,22 @@ impl Filesystem for OverlayFs {
         }
 
         let diff_path = self.overlay.diff_root().join(&rel);
+        if self.overlay.is_pg_datafile(&rel) {
+            if let Err(err) = self.overlay.unlink_pg_datafile(&rel) {
+                reply.error(Self::err_from_anyhow(err));
+                return;
+            }
+            if self.path_exists_in_base(&rel) {
+                if let Err(err) = self.create_whiteout(&rel) {
+                    reply.error(Self::err_code(err));
+                    return;
+                }
+            }
+            self.invalidate_path_caches(&rel);
+            reply.ok();
+            return;
+        }
+
         if diff_path.exists() {
             match fs::symlink_metadata(&diff_path) {
                 Ok(meta) if meta.is_dir() => {
@@ -1504,6 +1494,24 @@ impl Filesystem for OverlayFs {
             return;
         }
 
+        if self.overlay.is_pg_datafile(&src_rel) {
+            if let Err(err) = self.overlay.rename_pg_datafile(&src_rel, &dst_rel) {
+                reply.error(Self::err_from_anyhow(err));
+                return;
+            }
+            self.move_inode(&src_rel, &dst_rel);
+            if self.path_exists_in_base(&src_rel) {
+                if let Err(err) = self.create_whiteout(&src_rel) {
+                    reply.error(Self::err_code(err));
+                    return;
+                }
+            }
+            self.invalidate_path_caches(&src_rel);
+            self.invalidate_path_caches(&dst_rel);
+            reply.ok();
+            return;
+        }
+
         let src_path = self.overlay.diff_root().join(&src_rel);
         let dst_path = self.overlay.diff_root().join(&dst_rel);
 
@@ -1596,22 +1604,30 @@ impl Filesystem for OverlayFs {
                 target_size,
                 "setattr_truncate"
             );
-            if let Err(err) = self.ensure_diff_copy(&rel) {
-                reply.error(Self::err_code(err));
-                return;
-            }
-            let path = self.overlay.diff_root().join(&rel);
-            match OpenOptions::new().write(true).open(&path) {
-                Ok(file) => {
-                    if let Err(err) = file.set_len(target_size) {
+            if self.overlay.is_pg_datafile(&rel) {
+                if let Err(err) = self.overlay.truncate_pg_datafile(&rel, target_size) {
+                    reply.error(Self::err_from_anyhow(err));
+                    return;
+                }
+                self.invalidate_path_caches(&rel);
+            } else {
+                if let Err(err) = self.ensure_diff_copy(&rel) {
+                    reply.error(Self::err_code(err));
+                    return;
+                }
+                let path = self.overlay.diff_root().join(&rel);
+                match OpenOptions::new().write(true).open(&path) {
+                    Ok(file) => {
+                        if let Err(err) = file.set_len(target_size) {
+                            reply.error(Self::err_code(err));
+                            return;
+                        }
+                        self.invalidate_path_caches(&rel);
+                    }
+                    Err(err) => {
                         reply.error(Self::err_code(err));
                         return;
                     }
-                    self.invalidate_path_caches(&rel);
-                }
-                Err(err) => {
-                    reply.error(Self::err_code(err));
-                    return;
                 }
             }
         }
@@ -1650,14 +1666,7 @@ impl Filesystem for OverlayFs {
         reply.ok();
     }
 
-    fn fsync(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        _datasync: bool,
-        reply: ReplyEmpty,
-    ) {
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, datasync: bool, reply: ReplyEmpty) {
         let rel = match self.rel_for(ino) {
             Some(r) => r,
             None => {
@@ -1678,6 +1687,7 @@ impl Filesystem for OverlayFs {
             seq,
             overlay: self.overlay.clone(),
             rel,
+            datasync,
             reply,
         };
         self.worker_pool.submit(task);

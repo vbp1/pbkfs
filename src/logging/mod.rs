@@ -32,6 +32,14 @@ pub struct OverlayIoSnapshot {
     pub handle_hits: u64,
     pub handle_misses: u64,
     pub handles_open: usize,
+    pub delta_patch_count: u64,
+    pub delta_full_count: u64,
+    pub delta_patch_avg_size: u64,
+    pub delta_patch_max_size: u64,
+    pub delta_bitmaps_loaded: u64,
+    pub delta_bitmaps_total_bytes: u64,
+    pub delta_punch_holes: u64,
+    pub delta_punch_hole_failures: u64,
 }
 
 /// Initialize global tracing subscriber. Safe to call multiple times; subsequent
@@ -95,6 +103,14 @@ pub fn log_overlay_io_metrics(snapshot: OverlayIoSnapshot) {
         handle_hits = snapshot.handle_hits,
         handle_misses = snapshot.handle_misses,
         handles_open = snapshot.handles_open,
+        delta_patch_count = snapshot.delta_patch_count,
+        delta_full_count = snapshot.delta_full_count,
+        delta_patch_avg_size = snapshot.delta_patch_avg_size,
+        delta_patch_max_size = snapshot.delta_patch_max_size,
+        delta_bitmaps_loaded = snapshot.delta_bitmaps_loaded,
+        delta_bitmaps_total_bytes = snapshot.delta_bitmaps_total_bytes,
+        delta_punch_holes = snapshot.delta_punch_holes,
+        delta_punch_hole_failures = snapshot.delta_punch_hole_failures,
         "overlay_io_metrics"
     );
 }
