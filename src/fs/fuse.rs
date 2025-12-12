@@ -141,6 +141,7 @@ enum FsTask {
         size: usize,
         reply: ReplyData,
         handle: Option<Arc<File>>,
+        wal_state: Option<WalFileState>, // Some(state) for WAL under --no-wal
     },
     Write {
         ino: u64,
@@ -151,6 +152,17 @@ enum FsTask {
         data: Vec<u8>,
         reply: ReplyWrite,
         _handle: Option<Arc<File>>, // reserved for future direct-diff writes
+    },
+    WalWrite {
+        ino: u64,
+        seq: u64,
+        rel: PathBuf,
+        offset: u64,
+        len: usize,
+        reply: ReplyWrite,
+        wal_state: Arc<Mutex<HashMap<PathBuf, WalFileState>>>,
+        base_len: u64,
+        mode: u32,
     },
     Fsync {
         ino: u64,
@@ -168,6 +180,13 @@ struct OpenHandle {
     from_diff: bool,
 }
 
+#[derive(Debug, Clone)]
+struct WalFileState {
+    logical_size: u64,
+    mode: u32,
+    present: bool,
+}
+
 impl FsTask {
     fn run(self, metrics: &FsWorkerMetricsInner, pending_ops: &PendingOps) {
         let start = Instant::now();
@@ -181,16 +200,43 @@ impl FsTask {
                 size,
                 reply,
                 handle,
+                wal_state,
             } => {
+                let is_wal = overlay.no_wal() && OverlayFs::is_pg_wal_child(&rel);
                 // For PostgreSQL datafiles, always route through overlay.read_range()
                 // to honor logical lengths, sparse holes, and delta storage.
-                if overlay.is_pg_datafile(&rel) {
+                if overlay.is_pg_datafile(&rel) || is_wal {
+                    if is_wal {
+                        if let Some(state) = wal_state {
+                            if !state.present {
+                                ok = false;
+                                reply.error(ENOENT);
+                                // handled
+                                metrics.record_task(ok, start.elapsed().as_micros() as u64);
+                                return;
+                            }
+                            let logical = state.logical_size;
+                            if offset >= logical {
+                                reply.data(&[]);
+                                metrics.record_task(ok, start.elapsed().as_micros() as u64);
+                                return;
+                            }
+                            let end = (offset + size as u64).min(logical);
+                            let buf_len = (end - offset) as usize;
+                            let buf = vec![0u8; buf_len];
+                            reply.data(&buf);
+                            metrics.record_task(ok, start.elapsed().as_micros() as u64);
+                            return;
+                        }
+                    }
+
                     match overlay.read_range(&rel, offset, size) {
                         Ok(Some(bytes)) => {
                             debug!(
                                 path = %rel.display(),
                                 offset,
                                 size,
+                                is_wal,
                                 returned = bytes.len(),
                                 "fuse_read_pgdata"
                             );
@@ -275,6 +321,35 @@ impl FsTask {
 
                 debug!(path = %rel.display(), ino, seq, "WRITE decrement");
                 reply.written(data.len() as u32);
+                pending_ops.decrement(ino, seq);
+            }
+            FsTask::WalWrite {
+                ino,
+                seq,
+                rel,
+                offset,
+                len,
+                reply,
+                wal_state,
+                base_len,
+                mode,
+            } => {
+                pending_ops.wait_for_preceding(ino, seq);
+
+                {
+                    let mut guard = wal_state.lock().unwrap();
+                    let entry = guard.entry(rel.clone()).or_insert(WalFileState {
+                        logical_size: base_len,
+                        mode,
+                        present: true,
+                    });
+                    entry.present = true;
+                    entry.mode = if entry.mode == 0 { mode } else { entry.mode };
+                    let end = offset.saturating_add(len as u64);
+                    entry.logical_size = entry.logical_size.max(base_len).max(end);
+                }
+
+                reply.written(len as u32);
                 pending_ops.decrement(ino, seq);
             }
             FsTask::Fsync {
@@ -392,6 +467,7 @@ impl FsWorkerPool {
 
 pub struct OverlayFs {
     overlay: Overlay,
+    no_wal: bool,
     paths: Mutex<HashMap<u64, PathBuf>>,  // ino -> rel path
     inodes: Mutex<HashMap<PathBuf, u64>>, // rel path -> ino
     next_ino: Mutex<u64>,
@@ -401,6 +477,7 @@ pub struct OverlayFs {
     handle_misses: AtomicU64,
     pending_ops: Arc<PendingOps>,
     worker_pool: FsWorkerPool,
+    wal_state: Arc<Mutex<HashMap<PathBuf, WalFileState>>>,
 }
 
 impl OverlayFs {
@@ -411,8 +488,10 @@ impl OverlayFs {
         inodes.insert(PathBuf::from(""), 1);
         let pending_ops = Arc::new(PendingOps::new());
         let worker_pool = FsWorkerPool::new(&overlay, pending_ops.clone());
+        let no_wal = overlay.no_wal();
         Self {
             overlay,
+            no_wal,
             paths: Mutex::new(paths),
             inodes: Mutex::new(inodes),
             next_ino: Mutex::new(2),
@@ -422,6 +501,7 @@ impl OverlayFs {
             handle_misses: AtomicU64::new(0),
             pending_ops,
             worker_pool,
+            wal_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -580,6 +660,132 @@ impl OverlayFs {
         rel.parent() == Some(Path::new("pg_wal"))
     }
 
+    fn wal_state_get(&self, rel: &Path) -> Option<WalFileState> {
+        self.wal_state.lock().unwrap().get(rel).cloned()
+    }
+
+    fn wal_state_upsert<F>(&self, rel: &Path, f: F)
+    where
+        F: FnOnce(Option<WalFileState>) -> WalFileState,
+    {
+        let mut guard = self.wal_state.lock().unwrap();
+        let current = guard.get(rel).cloned();
+        guard.insert(rel.to_path_buf(), f(current));
+    }
+
+    fn wal_state_mark_deleted(&self, rel: &Path) {
+        self.wal_state_upsert(rel, |existing| WalFileState {
+            present: false,
+            logical_size: existing
+                .as_ref()
+                .map(|s| s.logical_size)
+                .unwrap_or_else(|| self.wal_backing_len(rel)),
+            mode: existing.as_ref().map(|s| s.mode).unwrap_or(0o600),
+        });
+    }
+
+    fn wal_backing_len(&self, rel: &Path) -> u64 {
+        self.overlay
+            .logical_len_for(rel)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                self.overlay
+                    .find_layer_path(rel)
+                    .and_then(|(path, _, _)| fs::symlink_metadata(path).ok().map(|m| m.len()))
+            })
+            .unwrap_or(0)
+    }
+
+    fn wal_state_set_present(&self, rel: &Path, target_len: u64, mode: u32) {
+        let mode = mode & 0o777;
+        self.wal_state_upsert(rel, |existing| {
+            let prev_len = existing
+                .as_ref()
+                .map(|s| s.logical_size)
+                .unwrap_or_else(|| self.wal_backing_len(rel));
+            let prev_mode = existing.as_ref().map(|s| s.mode).unwrap_or(mode);
+            WalFileState {
+                present: true,
+                logical_size: prev_len.max(target_len),
+                mode: prev_mode,
+            }
+        });
+    }
+
+    fn wal_default_mode(&self, rel: &Path) -> u32 {
+        // Try base metadata; fallback to 0o600.
+        let layer_roots = self.overlay.layer_roots();
+        if let Some((root, _)) = layer_roots.first() {
+            let path = root.join(rel);
+            if let Ok(meta) = fs::symlink_metadata(&path) {
+                return meta.mode() & 0o777;
+            }
+        }
+        0o600
+    }
+
+    fn wal_attr_from_state(&self, rel: &Path, state: &WalFileState) -> FileAttr {
+        let meta =
+            self.overlay
+                .find_layer_path(rel)
+                .and_then(|(p, _, _)| fs::symlink_metadata(p).ok())
+                .or_else(|| fs::symlink_metadata(self.overlay.diff_root().join(rel)).ok())
+                .or_else(|| {
+                    rel.parent().and_then(|parent| {
+                        fs::symlink_metadata(self.overlay.diff_root().join(parent))
+                            .ok()
+                            .or_else(|| {
+                                self.overlay.layer_roots().first().and_then(|(root, _)| {
+                                    fs::symlink_metadata(root.join(parent)).ok()
+                                })
+                            })
+                    })
+                });
+
+        let (perm, uid, gid, atime, mtime, ctime, blksize, blocks) = if let Some(m) = meta {
+            (
+                state.mode as u16,
+                m.uid(),
+                m.gid(),
+                m.accessed().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                m.created().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                m.blksize() as u32,
+                m.blocks(),
+            )
+        } else {
+            (
+                state.mode as u16,
+                0,
+                0,
+                std::time::SystemTime::UNIX_EPOCH,
+                std::time::SystemTime::UNIX_EPOCH,
+                std::time::SystemTime::UNIX_EPOCH,
+                4096,
+                0,
+            )
+        };
+
+        FileAttr {
+            ino: self.get_or_insert_ino(rel),
+            size: state.logical_size,
+            blocks,
+            atime,
+            mtime,
+            ctime,
+            crtime: ctime,
+            kind: FileType::RegularFile,
+            perm,
+            nlink: 1,
+            uid,
+            gid,
+            rdev: 0,
+            blksize,
+            flags: 0,
+        }
+    }
+
     /// Heuristic to detect PostgreSQL main-fork relation filenames based on
     /// pg_probackup's `is_datafile` rules: `<oid>` or `<oid>.<segno>` where
     /// both components are decimal without leading zeros and within reasonable
@@ -712,6 +918,22 @@ impl OverlayFs {
             }
         }
 
+        if self.no_wal && Self::is_pg_wal_dir(rel) {
+            if let Ok(state) = self.wal_state.lock() {
+                for (path, wal) in state.iter() {
+                    if path.parent() == Some(rel) {
+                        if wal.present {
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                names.insert(name.to_string());
+                            }
+                        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            names.remove(name);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut sorted: Vec<String> = names.into_iter().collect();
         sorted.sort();
         Ok(sorted)
@@ -735,6 +957,16 @@ impl OverlayFs {
         // (restore.c skips it), so present it as absent in the mounted view.
         if Self::is_database_map(rel) {
             return None;
+        }
+
+        if self.no_wal && Self::is_pg_wal_child(rel) {
+            if let Some(state) = self.wal_state_get(rel) {
+                if !state.present {
+                    return None;
+                }
+                let attr = self.wal_attr_from_state(rel, &state);
+                return Some((attr, false));
+            }
         }
 
         // Prefer diff over base; if neither has the path but this looks like a
@@ -869,11 +1101,14 @@ impl Filesystem for OverlayFs {
 
         let mut file = None;
         let mut from_diff = false;
+        let is_wal = self.no_wal && Self::is_pg_wal_child(&rel);
         let write_intent = (flags & libc::O_ACCMODE) != libc::O_RDONLY
             || (flags & libc::O_TRUNC) != 0
             || (flags & libc::O_CREAT) != 0;
 
-        if write_intent {
+        if is_wal {
+            // Virtual WAL: never copy up or open backing handles.
+        } else if write_intent {
             if let Err(err) = self.ensure_diff_copy(&rel) {
                 reply.error(Self::err_code(err));
                 return;
@@ -948,7 +1183,12 @@ impl Filesystem for OverlayFs {
         self.pending_ops.wait_barrier(ino);
 
         let off = if offset < 0 { 0 } else { offset as u64 };
-        let handle = self.take_handle_file(fh).and_then(|h| h.file.clone());
+        let is_wal = self.no_wal && Self::is_pg_wal_child(&rel);
+        let handle = if is_wal {
+            None // force overlay path for WAL when no_wal is on
+        } else {
+            self.take_handle_file(fh).and_then(|h| h.file.clone())
+        };
         let total = if handle.is_some() {
             self.handle_hits.fetch_add(1, Ordering::Relaxed) + 1
         } else {
@@ -958,13 +1198,21 @@ impl Filesystem for OverlayFs {
             self.log_handle_snapshot();
         }
 
+        let rel_for_task = rel.clone();
+        let wal_state = if is_wal {
+            self.wal_state_get(&rel_for_task)
+        } else {
+            None
+        };
+
         let task = FsTask::Read {
             overlay: self.overlay.clone(),
-            rel,
+            rel: rel_for_task,
             offset: off,
             size: size as usize,
             reply,
             handle,
+            wal_state,
         };
         self.worker_pool.submit(task);
     }
@@ -993,10 +1241,12 @@ impl Filesystem for OverlayFs {
             return;
         }
 
+        let is_wal = self.no_wal && Self::is_pg_wal_child(&rel);
+
         // For pg datafiles we skip upfront copy-up: delta slots are written via Overlay::write_at.
         // For other files we keep the existing fast path with an already opened diff file.
         let mut handle_arc: Option<Arc<File>> = None;
-        if !self.overlay.is_pg_datafile(&rel) {
+        if !self.overlay.is_pg_datafile(&rel) && !is_wal {
             let mut handles = self.handles.lock().unwrap();
             if let Some(entry) = handles.get_mut(&fh) {
                 if entry.file.is_none() || !entry.from_diff {
@@ -1025,6 +1275,25 @@ impl Filesystem for OverlayFs {
         // logical_len calculation and leads to EOF on new pages.
         if !self.overlay.is_pg_datafile(&rel) {
             self.invalidate_path_caches(&rel);
+        }
+
+        if is_wal {
+            let seq = self.pending_ops.increment(ino);
+            let base_len = self.wal_backing_len(&rel);
+            let mode = self.wal_default_mode(&rel);
+            let task = FsTask::WalWrite {
+                ino,
+                seq,
+                rel,
+                offset: offset.max(0) as u64,
+                len: data.len(),
+                reply,
+                wal_state: self.wal_state.clone(),
+                base_len,
+                mode,
+            };
+            self.worker_pool.submit(task);
+            return;
         }
 
         // Get sequence number BEFORE submitting to worker pool
@@ -1191,35 +1460,52 @@ impl Filesystem for OverlayFs {
             reply.error(Self::err_code(err));
             return;
         }
-        if let Err(err) = self.ensure_parent_dirs(&rel) {
-            reply.error(Self::err_code(err));
-            return;
-        }
-
-        let path = self.overlay.diff_root().join(&rel);
-        let mut opts = OpenOptions::new();
-        opts.create(true).write(true).read(true).truncate(true);
-        match opts.open(&path) {
-            Ok(file) => {
-                let _ = file.set_permissions(PermissionsExt::from_mode(mode & 0o777));
-                let _ino = self.get_or_insert_ino(&rel);
-                match self.stat_path(&rel) {
-                    Some((attr, _)) => {
-                        // Allocate file handle and register it (like open() does)
-                        let fh = self.alloc_fh();
-                        self.insert_handle(
-                            fh,
-                            OpenHandle {
-                                file: Some(Arc::new(file)),
-                                from_diff: true,
-                            },
-                        );
-                        reply.created(&TTL, &attr, GENERATION, fh, 0);
-                    }
-                    None => reply.error(ENOENT),
-                }
+        if self.no_wal && Self::is_pg_wal_child(&rel) {
+            self.wal_state_set_present(&rel, 0, mode);
+            let _ino = self.get_or_insert_ino(&rel);
+            let fh = self.alloc_fh();
+            self.insert_handle(
+                fh,
+                OpenHandle {
+                    file: None,
+                    from_diff: false,
+                },
+            );
+            match self.stat_path(&rel) {
+                Some((attr, _)) => reply.created(&TTL, &attr, GENERATION, fh, 0),
+                None => reply.error(ENOENT),
             }
-            Err(err) => reply.error(Self::err_code(err)),
+        } else {
+            if let Err(err) = self.ensure_parent_dirs(&rel) {
+                reply.error(Self::err_code(err));
+                return;
+            }
+
+            let path = self.overlay.diff_root().join(&rel);
+            let mut opts = OpenOptions::new();
+            opts.create(true).write(true).read(true).truncate(true);
+            match opts.open(&path) {
+                Ok(file) => {
+                    let _ = file.set_permissions(PermissionsExt::from_mode(mode & 0o777));
+                    let _ino = self.get_or_insert_ino(&rel);
+                    match self.stat_path(&rel) {
+                        Some((attr, _)) => {
+                            // Allocate file handle and register it (like open() does)
+                            let fh = self.alloc_fh();
+                            self.insert_handle(
+                                fh,
+                                OpenHandle {
+                                    file: Some(Arc::new(file)),
+                                    from_diff: true,
+                                },
+                            );
+                            reply.created(&TTL, &attr, GENERATION, fh, 0);
+                        }
+                        None => reply.error(ENOENT),
+                    }
+                }
+                Err(err) => reply.error(Self::err_code(err)),
+            }
         }
     }
 
@@ -1252,6 +1538,15 @@ impl Filesystem for OverlayFs {
             reply.error(Self::err_code(err));
             return;
         }
+        if self.no_wal && Self::is_pg_wal_child(&rel) {
+            self.wal_state_set_present(&rel, 0, mode);
+            match self.stat_path(&rel) {
+                Some((attr, _)) => reply.entry(&TTL, &attr, GENERATION),
+                None => reply.error(ENOENT),
+            }
+            return;
+        }
+
         if let Err(err) = self.ensure_parent_dirs(&rel) {
             reply.error(Self::err_code(err));
             return;
@@ -1331,6 +1626,12 @@ impl Filesystem for OverlayFs {
         // Wait for pending writes on this file before deleting
         if let Some(ino) = self.inodes.lock().unwrap().get(&rel).copied() {
             self.pending_ops.wait_barrier(ino);
+        }
+
+        if self.no_wal && Self::is_pg_wal_child(&rel) {
+            self.wal_state_mark_deleted(&rel);
+            reply.ok();
+            return;
         }
 
         let diff_path = self.overlay.diff_root().join(&rel);
@@ -1460,6 +1761,9 @@ impl Filesystem for OverlayFs {
             return;
         }
 
+        let is_src_wal = self.no_wal && Self::is_pg_wal_child(&src_rel);
+        let is_dst_wal = self.no_wal && Self::is_pg_wal_child(&dst_rel);
+
         // Wait for pending writes on source and target before renaming
         {
             let inodes = self.inodes.lock().unwrap();
@@ -1478,6 +1782,32 @@ impl Filesystem for OverlayFs {
 
         if self.stat_path(&src_rel).is_none() {
             reply.error(ENOENT);
+            return;
+        }
+
+        if is_src_wal || is_dst_wal {
+            let src_state = if is_src_wal {
+                self.wal_state_get(&src_rel)
+            } else {
+                None
+            };
+            let base_len = src_state
+                .as_ref()
+                .map(|s| s.logical_size)
+                .unwrap_or_else(|| self.wal_backing_len(&src_rel));
+
+            if is_src_wal {
+                self.wal_state_mark_deleted(&src_rel);
+            }
+            if is_dst_wal {
+                let mode = src_state
+                    .as_ref()
+                    .map(|s| s.mode)
+                    .unwrap_or_else(|| self.wal_default_mode(&dst_rel));
+                self.wal_state_set_present(&dst_rel, base_len, mode);
+            }
+            self.move_inode(&src_rel, &dst_rel);
+            reply.ok();
             return;
         }
 
@@ -1590,11 +1920,36 @@ impl Filesystem for OverlayFs {
             return;
         }
 
+        let is_wal = self.no_wal && Self::is_pg_wal_child(&rel);
+
         // Wait for pending writes before modifying attributes
         self.pending_ops.wait_barrier(ino);
 
         if (size.is_some() || mode.is_some()) && self.stat_path(&rel).is_none() {
             reply.error(ENOENT);
+            return;
+        }
+
+        if is_wal {
+            self.wal_state_upsert(&rel, |existing| {
+                let mut state = existing.unwrap_or(WalFileState {
+                    logical_size: self.wal_backing_len(&rel),
+                    mode: self.wal_default_mode(&rel),
+                    present: true,
+                });
+                state.present = true;
+                if let Some(target_size) = size {
+                    state.logical_size = target_size;
+                }
+                if let Some(bits) = mode {
+                    state.mode = bits & 0o777;
+                }
+                state
+            });
+            match self.stat_path(&rel) {
+                Some((attr, _)) => reply.attr(&TTL, &attr),
+                None => reply.error(ENOENT),
+            }
             return;
         }
 
@@ -1679,6 +2034,14 @@ impl Filesystem for OverlayFs {
             return;
         }
 
+        if self.no_wal && Self::is_pg_wal_child(&rel) {
+            let seq = self.pending_ops.increment(ino);
+            self.pending_ops.wait_for_preceding(ino, seq);
+            reply.ok();
+            self.pending_ops.decrement(ino, seq);
+            return;
+        }
+
         // Get sequence number BEFORE submitting to worker pool
         let seq = self.pending_ops.increment(ino);
 
@@ -1712,6 +2075,11 @@ impl Filesystem for OverlayFs {
         };
         if self.is_whiteouted(&rel) {
             reply.error(ENOENT);
+            return;
+        }
+
+        if self.no_wal && Self::is_pg_wal_child(&rel) {
+            reply.ok();
             return;
         }
 

@@ -122,6 +122,7 @@ fn mounts_backup_and_preserves_store_immutability() -> pbkfs::Result<()> {
         backup_id: Some("FULL1".into()),
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     })?;
 
     // Reads come from base
@@ -186,6 +187,7 @@ fn mount_decompresses_compressed_backup_files() -> pbkfs::Result<()> {
         backup_id: Some("FULL1".into()),
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     })?;
 
     let contents = ctx
@@ -231,6 +233,7 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
         backup_id: Some("FULL1".into()),
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -270,6 +273,7 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
         backup_id: None,
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -353,6 +357,7 @@ fn remount_rejects_binding_mismatch() {
         backup_id: Some("FULL1".into()),
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     })
     .unwrap();
 
@@ -375,6 +380,7 @@ fn remount_rejects_binding_mismatch() {
         backup_id: Some("FULL1".into()),
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     })
     .expect_err("binding mismatch should fail");
 
@@ -405,6 +411,7 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
         backup_id: Some("FULL1".into()),
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -450,6 +457,7 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
         backup_id: None,
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -509,6 +517,7 @@ fn perf_unsafe_creates_and_clears_dirty_marker() -> pbkfs::Result<()> {
         backup_id: Some("FULL1".into()),
         force: false,
         perf_unsafe: true,
+        no_wal: false,
     })?;
 
     let marker = diff.path().join(pbkfs::fs::overlay::DIRTY_MARKER);
@@ -559,6 +568,7 @@ fn perf_unsafe_marker_requires_force_after_crash() -> pbkfs::Result<()> {
         backup_id: Some("FULL1".into()),
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     })
     .expect_err("mount should reject existing dirty marker");
 
@@ -575,6 +585,7 @@ fn perf_unsafe_marker_requires_force_after_crash() -> pbkfs::Result<()> {
         backup_id: Some("FULL1".into()),
         force: true,
         perf_unsafe: true,
+        no_wal: false,
     })?;
 
     ctx.flush_dirty()?;
@@ -582,6 +593,127 @@ fn perf_unsafe_marker_requires_force_after_crash() -> pbkfs::Result<()> {
         mnt_path: Some(target.path().to_path_buf()),
         diff_dir: Some(diff.path().to_path_buf()),
     })?;
+
+    Ok(())
+}
+
+#[test]
+fn mount_no_wal_virtualizes_wal_writes() -> pbkfs::Result<()> {
+    let store = tempdir()?;
+    let target = tempdir()?;
+    let diff = tempdir()?;
+
+    let wal_rel = Path::new("pg_wal/000000010000000000000001");
+    let wal_base = native_path(store.path(), "FULL1", wal_rel);
+    fs::create_dir_all(wal_base.parent().unwrap())?;
+    fs::write(&wal_base, b"base-wal")?;
+    write_metadata(store.path(), false, None);
+
+    let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
+    let ctx = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+        perf_unsafe: false,
+        no_wal: true,
+    })?;
+
+    // If FUSE is unavailable in the environment, skip to avoid spurious failures.
+    if ctx.fuse_handle.is_none() {
+        eprintln!("skipping no_wal_virtualization test: /dev/fuse unavailable");
+        return Ok(());
+    }
+
+    let wal_path = target.path().join(wal_rel);
+    std::fs::write(&wal_path, b"new-wal-bytes")?;
+
+    let read_back = std::fs::read(&wal_path)?;
+    assert!(
+        read_back.iter().all(|b| *b == 0),
+        "changed WAL must read back as zeros under --no-wal"
+    );
+    // Logical size should reflect the larger of base size and written length.
+    assert_eq!(
+        read_back.len(),
+        b"new-wal-bytes".len().max(b"base-wal".len())
+    );
+    let meta = fs::metadata(&wal_path)?;
+    assert_eq!(meta.len() as usize, read_back.len());
+
+    let diff_wal = diff.path().join("data").join(wal_rel);
+    assert!(
+        !diff_wal.exists(),
+        "WAL writes under --no-wal must not create diff files"
+    );
+
+    if let Some(handle) = ctx.fuse_handle {
+        handle.unmount();
+    }
+    try_unmount(
+        unmount::UnmountArgs {
+            mnt_path: Some(target.path().to_path_buf()),
+            diff_dir: Some(diff.path().to_path_buf()),
+        },
+        diff.path(),
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mount_no_wal_reads_unchanged_wal_from_backup_chain() -> pbkfs::Result<()> {
+    let store = tempdir()?;
+    let target = tempdir()?;
+    let diff = tempdir()?;
+
+    let wal_rel = Path::new("pg_wal/000000010000000000000002");
+    let wal_base = native_path(store.path(), "FULL1", wal_rel);
+    fs::create_dir_all(wal_base.parent().unwrap())?;
+    let payload = b"wal-from-backup";
+    fs::write(&wal_base, payload)?;
+    write_metadata(store.path(), false, None);
+
+    let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
+    let ctx = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+        perf_unsafe: false,
+        no_wal: true,
+    })?;
+
+    // If FUSE is unavailable in the environment, skip to avoid spurious failures.
+    if ctx.fuse_handle.is_none() {
+        eprintln!("skipping unchanged WAL read test: /dev/fuse unavailable");
+        return Ok(());
+    }
+
+    let wal_path = target.path().join(wal_rel);
+    let read_back = std::fs::read(&wal_path)?;
+    assert_eq!(payload.as_slice(), read_back.as_slice());
+
+    let diff_wal = diff.path().join("data").join(wal_rel);
+    assert!(
+        !diff_wal.exists(),
+        "unchanged WAL read under --no-wal must not materialize diff copy"
+    );
+
+    if let Some(handle) = ctx.fuse_handle {
+        handle.unmount();
+    }
+    try_unmount(
+        unmount::UnmountArgs {
+            mnt_path: Some(target.path().to_path_buf()),
+            diff_dir: Some(diff.path().to_path_buf()),
+        },
+        diff.path(),
+    );
 
     Ok(())
 }
@@ -609,6 +741,7 @@ fn mounts_native_pg_probackup_catalog_when_available() -> pbkfs::Result<()> {
         backup_id: Some(backup_id),
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     })?;
 
     if let Some(handle) = ctx.fuse_handle {

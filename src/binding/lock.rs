@@ -32,6 +32,10 @@ pub struct BindingRecord {
     pub owner_host: String,
     pub pbkfs_version: String,
     pub state: BindingState,
+    /// Marker that this diff directory has ever been mounted with `--no-wal`.
+    /// Defaults to false for backward compatibility with older binding files.
+    #[serde(default)]
+    pub no_wal_used: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,6 +191,7 @@ impl BindingRecord {
             owner_host: owner_host.into(),
             pbkfs_version: pbkfs_version.into(),
             state: BindingState::Active,
+            no_wal_used: false,
         }
     }
 

@@ -21,7 +21,7 @@ mkdir -p /home/vbponomarev/pbkfs/postgres/pbk_diff
 RUST_LOG=debug target/debug/pbkfs mount --pbk-store /home/vbponomarev/pbkfs/postgres/pbk_store/ \
   --mnt-path /home/vbponomarev/pbkfs/postgres/pbk_target/ \
   --diff-dir /home/vbponomarev/pbkfs/postgres/pbk_diff/ \
-  --instance main --backup-id T68JRR > /tmp/pbkfs_debug.log 2>&1 &
+  --no-wal --instance main-checksums --backup-id T6ZTYL > /tmp/pbkfs_debug.log 2>&1 &
 mount_pid=$!
 trap 'kill "$mount_pid" 2>/dev/null || true' EXIT
 
