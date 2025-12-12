@@ -125,11 +125,64 @@ fn mount_errors_for_unknown_store_layout() {
         backup_id: Some("FULL1".into()),
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     })
     .expect_err("non-pg_probackup layout should fail");
 
     let actual = err.downcast_ref::<Error>().expect("should be pbkfs::Error");
     assert!(matches!(actual, Error::InvalidStoreLayout(_)));
+}
+
+#[test]
+fn mount_sets_and_enforces_no_wal_binding_flag() {
+    let store = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+
+    // Minimal backup contents.
+    let base_file = native_path(store.path(), "FULL1", std::path::Path::new("data/base.txt"));
+    std::fs::create_dir_all(base_file.parent().unwrap()).unwrap();
+    std::fs::write(&base_file, b"base").unwrap();
+    write_metadata(store.path());
+
+    let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
+    let first = mount_guarded(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+        perf_unsafe: false,
+        no_wal: true,
+    })
+    .expect("first mount with --no-wal should succeed");
+
+    let binding =
+        BindingRecord::load_from_diff(&DiffDir::new(diff.path()).unwrap()).expect("binding exists");
+    assert!(
+        binding.no_wal_used,
+        "binding must record prior --no-wal usage"
+    );
+
+    if let Some(handle) = first.fuse_handle {
+        handle.unmount();
+    }
+
+    let err = mount_guarded(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+        perf_unsafe: false,
+        no_wal: false,
+    })
+    .expect_err("reusing diff after --no-wal must fail");
+
+    let actual = err.downcast_ref::<Error>().expect("should be pbkfs::Error");
+    assert!(matches!(actual, Error::Cli(msg) if msg.contains("previously mounted with --no-wal")));
 }
 
 #[test]
@@ -192,6 +245,7 @@ JSON
             backup_id: Some("FULL1".into()),
             force: false,
             perf_unsafe: false,
+            no_wal: false,
         })?;
 
         let contents = ctx
@@ -265,6 +319,7 @@ JSON
         backup_id: Some("FULL1".into()),
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     })?;
 
     let mounted_file = target.path().join("data/base.txt");
@@ -407,6 +462,7 @@ fn mount_reuses_binding_with_diff_only_arguments() -> pbkfs::Result<()> {
             backup_id: None,
             force: false,
             perf_unsafe: false,
+            no_wal: false,
         })?
     };
 
@@ -455,6 +511,7 @@ fn mount_rejects_binding_mismatch_when_instance_differs() {
         backup_id: Some("FULL1".into()),
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     })
     .expect_err("mismatched instance should fail");
 
@@ -491,6 +548,7 @@ fn mount_rejects_binding_mismatch_when_backup_differs() {
         backup_id: Some("INC1".into()),
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     })
     .expect_err("mismatched backup should fail");
 
@@ -530,6 +588,7 @@ fn mount_rejects_binding_mismatch_when_store_differs() {
         backup_id: None,
         force: false,
         perf_unsafe: false,
+        no_wal: false,
     })
     .expect_err("store path mismatch should fail");
 
@@ -679,6 +738,7 @@ fn mount_rejects_corrupt_chain_without_force() {
             backup_id: Some("FULL1".into()),
             force: false,
             perf_unsafe: false,
+            no_wal: false,
         })
         .expect_err("corrupt chain should fail without --force")
     };
@@ -711,6 +771,7 @@ fn mount_allows_corrupt_chain_with_force() -> pbkfs::Result<()> {
             backup_id: Some("FULL1".into()),
             force: true,
             perf_unsafe: false,
+            no_wal: false,
         })?
     };
 

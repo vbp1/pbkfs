@@ -27,6 +27,10 @@ fn writes_and_reads_binding_record() -> pbkfs::Result<()> {
     assert_eq!(record.binding_id, loaded.binding_id);
     assert_eq!(BindingState::Stale, loaded.state);
     assert_eq!("FULL1", loaded.backup_id);
+    assert!(
+        !loaded.no_wal_used,
+        "no_wal_used should default to false for new bindings"
+    );
 
     Ok(())
 }
@@ -39,4 +43,29 @@ fn detects_non_writable_diff_dir() {
 
     let diff = DiffDir::new(&file_path).unwrap();
     assert!(diff.ensure_writable().is_err());
+}
+
+#[test]
+fn binding_persists_no_wal_flag() -> pbkfs::Result<()> {
+    let diff_root = tempdir()?;
+    let diff = DiffDir::new(diff_root.path())?;
+    diff.ensure_writable()?;
+
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
+    let mut record = BindingRecord::new(
+        "main",
+        "FULL1",
+        "/pbk_store",
+        "/pbk_target",
+        std::process::id() as i32,
+        host,
+        "0.1.0",
+    );
+    record.no_wal_used = true;
+    record.write_to_diff(&diff)?;
+
+    let loaded = BindingRecord::load_from_diff(&diff)?;
+    assert!(loaded.no_wal_used, "no_wal_used should round-trip via disk");
+
+    Ok(())
 }

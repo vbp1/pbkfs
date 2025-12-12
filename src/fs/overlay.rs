@@ -213,6 +213,7 @@ struct OverlayInner {
     delta_index: DeltaIndex,
     delta_file_locks: RwLock<DeltaFileLockMap>,
     delta_block_locks: RwLock<DeltaBlockLockMap>,
+    no_wal: bool,
 }
 
 impl Overlay {
@@ -319,6 +320,7 @@ impl Overlay {
                 delta_index: DeltaIndex::new(),
                 delta_file_locks: RwLock::new(HashMap::new()),
                 delta_block_locks: RwLock::new(HashMap::new()),
+                no_wal: parse_bool_env("PBKFS_NO_WAL", false),
             }),
         };
 
@@ -454,6 +456,7 @@ impl Overlay {
         size: usize,
     ) -> Result<Option<Vec<u8>>> {
         let rel = relative.as_ref();
+        let is_wal = self.is_pg_wal_child(rel);
         let diff_path = self.inner.diff.join(rel);
 
         // If already in diff and the path is NOT present in any base layer
@@ -546,7 +549,7 @@ impl Overlay {
 
         let read_start = Instant::now();
 
-        let should_materialize = !is_datafile;
+        let should_materialize = !(is_datafile || (is_wal && self.inner.no_wal));
 
         if !should_materialize {
             return self.read_range_nonmaterializing(rel, offset, end_offset, size, &layers);
@@ -1427,15 +1430,35 @@ impl Overlay {
         compression: Option<CompressionAlgorithm>,
         block_idx: u64,
     ) -> Result<Option<Vec<u8>>> {
-        // For WAL files we bypass block-walk and materialize via legacy copy-up.
-        if rel.to_string_lossy().contains("pg_wal") && compression.is_some() {
-            self.inner
-                .metrics
-                .fallback_used
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(path = %rel.display(), block = block_idx, algo = ?compression, "wal_fallback_full_copy");
-            self.ensure_copy_up(rel)?;
-            return Ok(None);
+        // For WAL files under --no-wal, avoid copy-up and read directly from compressed source.
+        if self.is_pg_wal_child(rel) {
+            if let Some(algo) = compression {
+                if self.inner.no_wal {
+                    let decompressed = self.decompress_full_to_vec(base_path, algo)?;
+                    let block_size = self.inner.block_size.get();
+                    let start = self.block_offset(block_idx) as usize;
+                    if start >= decompressed.len() {
+                        return Ok(None);
+                    }
+                    let end = (start + block_size).min(decompressed.len());
+                    let mut buf = vec![0u8; block_size];
+                    buf[..end - start].copy_from_slice(&decompressed[start..end]);
+                    return Ok(Some(buf));
+                } else {
+                    self.inner
+                        .metrics
+                        .fallback_used
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        path = %rel.display(),
+                        block = block_idx,
+                        algo = ?compression,
+                        "wal_fallback_full_copy"
+                    );
+                    self.ensure_copy_up(rel)?;
+                    return Ok(None);
+                }
+            }
         }
 
         if self.is_pg_datafile(rel) {
@@ -1819,6 +1842,14 @@ impl Overlay {
 
     pub fn perf_unsafe(&self) -> bool {
         self.inner.perf_unsafe
+    }
+
+    pub fn no_wal(&self) -> bool {
+        self.inner.no_wal
+    }
+
+    fn is_pg_wal_child(&self, rel: &Path) -> bool {
+        rel.parent() == Some(Path::new("pg_wal"))
     }
 
     pub fn dirty_marker_path(&self) -> PathBuf {
@@ -2816,6 +2847,32 @@ impl Overlay {
                 let mut out = fs::File::create(diff_path)?;
                 io::copy(&mut decoder, &mut out)?;
                 Ok(())
+            }
+        }
+    }
+
+    fn decompress_full_to_vec(
+        &self,
+        base_path: &Path,
+        algo: CompressionAlgorithm,
+    ) -> Result<Vec<u8>> {
+        match algo {
+            CompressionAlgorithm::Zlib => {
+                let reader = fs::File::open(base_path)?;
+                let mut decoder = flate2::read::ZlibDecoder::new(reader);
+                let mut out = Vec::new();
+                decoder.read_to_end(&mut out)?;
+                Ok(out)
+            }
+            CompressionAlgorithm::Lz4 => {
+                let bytes = fs::read(base_path)?;
+                lz4_flex::block::decompress_size_prepended(&bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e).into())
+            }
+            CompressionAlgorithm::Zstd => {
+                let reader = fs::File::open(base_path)?;
+                let decoded = zstd::stream::decode_all(reader)?;
+                Ok(decoded)
             }
         }
     }

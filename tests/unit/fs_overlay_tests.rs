@@ -9,6 +9,7 @@ use std::{
 
 use flate2::{write::ZlibEncoder, Compression};
 use pbkfs::backup::metadata::{BackupMode, CompressionAlgorithm};
+use pbkfs::env_lock;
 use pbkfs::fs::delta::{
     create_full, create_patch, open_full, open_patch, write_full_page, write_full_ref_slot,
     write_patch_slot,
@@ -262,6 +263,56 @@ fn delta_sparse_slot_defaults_to_base() -> pbkfs::Result<()> {
         .read_range(rel, BLCKSZ as u64 * 5, BLCKSZ)?
         .expect("page should be readable");
     assert!(page.iter().all(|b| *b == 3));
+    Ok(())
+}
+
+#[test]
+fn no_wal_read_does_not_materialize_diff() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+    let wal_rel = Path::new("pg_wal/000000010000000000000001");
+    let wal_bytes = b"wal-base-bytes";
+
+    fs::create_dir_all(base.path().join("pg_wal"))?;
+    fs::write(base.path().join(wal_rel), wal_bytes)?;
+
+    {
+        let _guard = env_lock().lock();
+        std::env::set_var("PBKFS_NO_WAL", "1");
+    }
+    let overlay = Overlay::new(base.path(), diff.path())?;
+
+    let read_back = overlay
+        .read_range(wal_rel, 0, wal_bytes.len())?
+        .expect("wal should be readable");
+    assert_eq!(wal_bytes.as_slice(), read_back.as_slice());
+
+    let diff_wal = diff.path().join("data").join(wal_rel);
+    assert!(
+        !diff_wal.exists(),
+        "non-materializing WAL read must not create diff copy"
+    );
+
+    {
+        let _guard = env_lock().lock();
+        std::env::remove_var("PBKFS_NO_WAL");
+    }
+    Ok(())
+}
+
+#[test]
+fn overlay_no_wal_flag_reads_env() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    {
+        let _guard = env_lock().lock();
+        std::env::set_var("PBKFS_NO_WAL", "1");
+        let overlay = Overlay::new(base.path(), diff.path())?;
+        assert!(overlay.no_wal(), "no_wal flag should reflect env var");
+        std::env::remove_var("PBKFS_NO_WAL");
+    }
+
     Ok(())
 }
 

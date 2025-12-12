@@ -57,6 +57,10 @@ pub struct MountArgs {
     /// Skip fsync for datafiles (perf only; unsafe). Leaves .pbkfs-dirty until unmount.
     #[arg(long, default_value = "false")]
     pub perf_unsafe: bool,
+
+    /// Do not persist WAL contents; pg_wal writes become virtual and diff dir is non-resumable.
+    #[arg(long, default_value = "false")]
+    pub no_wal: bool,
 }
 
 #[derive(Debug)]
@@ -208,11 +212,23 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
         } else {
             std::env::set_var("PBKFS_PERF_UNSAFE", "0");
         }
+        if args.no_wal {
+            std::env::set_var("PBKFS_NO_WAL", "1");
+        } else {
+            std::env::set_var("PBKFS_NO_WAL", "0");
+        }
     }
 
     let existing_binding = diff_dir.load_binding()?;
     let mut recovered_stale = false;
     let binding = if let Some(mut binding) = existing_binding {
+        if binding.no_wal_used {
+            return Err(Error::Cli(
+                "diff directory was previously mounted with --no-wal and cannot be reused; choose a fresh pbk_diff"
+                    .into(),
+            )
+            .into());
+        }
         info!(binding_id=%binding.binding_id, "reusing existing binding from diff");
         binding.validate_store_path(&pbk_store)?;
         binding.validate_binding_args(args.instance.as_deref(), args.backup_id.as_deref())?;
@@ -244,6 +260,9 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
             std::process::id() as i32,
             std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
         );
+        // If the user opts into --no-wal on reuse, mark the binding as non-resumable
+        // so subsequent mounts are rejected.
+        binding.no_wal_used |= args.no_wal;
         binding
     } else {
         let instance = args
@@ -253,7 +272,14 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
             .backup_id
             .ok_or_else(|| Error::Cli("backup_id is required".into()))?;
 
-        BindingRecord::new(
+        if args.no_wal {
+            warn!(
+                diff_dir = %diff_dir.path.display(),
+                "mounting with --no-wal: WAL changes will not persist; this diff directory cannot be reused later"
+            );
+        }
+
+        let mut binding = BindingRecord::new(
             instance,
             backup_id,
             &pbk_store,
@@ -261,7 +287,9 @@ pub fn mount(args: MountArgs) -> Result<MountContext> {
             std::process::id() as i32,
             std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
             env!("CARGO_PKG_VERSION"),
-        )
+        );
+        binding.no_wal_used = args.no_wal;
+        binding
     };
 
     let instance = binding.instance_name.clone();
