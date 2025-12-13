@@ -3,9 +3,9 @@
 use std::{
     fs,
     io::Read,
+    os::unix::io::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
     process,
-    os::unix::io::{AsRawFd, FromRawFd},
     sync::atomic::{AtomicBool, AtomicI32, Ordering},
     sync::mpsc,
     time::Duration,
@@ -228,11 +228,9 @@ fn resolve_under_mount(
         None => PathBuf::from(default_rel),
         Some(path) if path.is_absolute() => {
             if !path.starts_with(mnt_path) {
-                return Err(Error::Cli(format!(
-                    "path must be under mnt_path: {}",
-                    path.display()
-                ))
-                .into());
+                return Err(
+                    Error::Cli(format!("path must be under mnt_path: {}", path.display())).into(),
+                );
             }
             path.strip_prefix(mnt_path)
                 .unwrap_or(Path::new(""))
@@ -560,9 +558,7 @@ fn run_launcher(args: MountArgs) -> Result<()> {
             return Ok(());
         }
         Err(err) => {
-            return Err(
-                Error::Cli(format!("failed waiting for worker start: {err}")).into(),
-            );
+            return Err(Error::Cli(format!("failed waiting for worker start: {err}")).into());
         }
     };
     if cancelled.load(Ordering::Relaxed) {
@@ -592,52 +588,55 @@ fn run_launcher(args: MountArgs) -> Result<()> {
                     return Ok(());
                 }
                 Err(err) => {
-                    return Err(Error::Cli(format!(
-                        "failed waiting for mount completion: {err}"
-                    ))
-                    .into());
+                    return Err(
+                        Error::Cli(format!("failed waiting for mount completion: {err}")).into(),
+                    );
                 }
             };
             if cancelled.load(Ordering::Relaxed) {
-                eprintln!("pbkfs: cancelled waiting for mount completion; worker may still be running");
+                eprintln!(
+                    "pbkfs: cancelled waiting for mount completion; worker may still be running"
+                );
                 return Ok(());
             }
             match code2 {
                 crate::cli::daemon::STATUS_OK => Ok(()),
-                crate::cli::daemon::STATUS_ERR => Err(Error::Cli(format!(
-                    "mount failed: {}",
-                    msg2.trim()
-                ))
-                .into()),
-                0xFE => Err(Error::Cli(
-                    "worker exited before reporting mount completion".into(),
-                )
-                .into()),
-                other => Err(Error::Cli(format!("unexpected handshake status: 0x{other:02X}")).into()),
+                crate::cli::daemon::STATUS_ERR => {
+                    Err(Error::Cli(format!("mount failed: {}", msg2.trim())).into())
+                }
+                0xFE => {
+                    Err(Error::Cli("worker exited before reporting mount completion".into()).into())
+                }
+                other => {
+                    Err(Error::Cli(format!("unexpected handshake status: 0x{other:02X}")).into())
+                }
             }
         }
-        WaitMode::Timeout(t) => match read_handshake(&mut reader, Some(t), &cancelled) {
-            Ok((crate::cli::daemon::STATUS_OK, _)) => Ok(()),
-            Ok((crate::cli::daemon::STATUS_ERR, msg2)) => Err(Error::Cli(format!(
-                "mount failed: {}",
-                msg2.trim()
-            ))
-            .into()),
-            Ok((0xFE, _)) => Err(Error::Cli(
-                "worker exited before reporting mount completion".into(),
-            )
-            .into()),
-            Ok((other, _)) => Err(Error::Cli(format!("unexpected handshake status: 0x{other:02X}")).into()),
-            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
-                eprintln!("pbkfs: mount still in progress (timeout reached); worker may still be running");
-                Ok(())
+        WaitMode::Timeout(t) => {
+            match read_handshake(&mut reader, Some(t), &cancelled) {
+                Ok((crate::cli::daemon::STATUS_OK, _)) => Ok(()),
+                Ok((crate::cli::daemon::STATUS_ERR, msg2)) => {
+                    Err(Error::Cli(format!("mount failed: {}", msg2.trim())).into())
+                }
+                Ok((0xFE, _)) => {
+                    Err(Error::Cli("worker exited before reporting mount completion".into()).into())
+                }
+                Ok((other, _)) => {
+                    Err(Error::Cli(format!("unexpected handshake status: 0x{other:02X}")).into())
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                    eprintln!("pbkfs: mount still in progress (timeout reached); worker may still be running");
+                    Ok(())
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    eprintln!("pbkfs: cancelled waiting for mount completion; worker may still be running");
+                    Ok(())
+                }
+                Err(err) => {
+                    Err(Error::Cli(format!("failed waiting for mount completion: {err}")).into())
+                }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                eprintln!("pbkfs: cancelled waiting for mount completion; worker may still be running");
-                Ok(())
-            }
-            Err(err) => Err(Error::Cli(format!("failed waiting for mount completion: {err}")).into()),
-        },
+        }
         WaitMode::Foreground => Ok(()),
     }
 }
@@ -694,7 +693,10 @@ fn read_handshake(
     let start = std::time::Instant::now();
     loop {
         if cancelled.load(Ordering::Relaxed) {
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled",
+            ));
         }
         if let Some(t) = timeout {
             if start.elapsed() >= t {
@@ -729,13 +731,7 @@ fn read_handshake(
         }
 
         let mut code = [0u8; 1];
-        let n = unsafe {
-            libc::read(
-                file.as_raw_fd(),
-                code.as_mut_ptr() as *mut libc::c_void,
-                1,
-            )
-        };
+        let n = unsafe { libc::read(file.as_raw_fd(), code.as_mut_ptr() as *mut libc::c_void, 1) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -802,7 +798,10 @@ fn run_mount_worker(
         // Background: file-by-default logging (unless journald is selected).
         let sink = match args.log_sink.unwrap_or_default() {
             LogSink::File => {
-                let path = args.log_file.clone().unwrap_or_else(|| defaults.log_diff.clone());
+                let path = args
+                    .log_file
+                    .clone()
+                    .unwrap_or_else(|| defaults.log_diff.clone());
                 crate::logging::LogSink::File(path)
             }
             LogSink::Journald => crate::logging::LogSink::Journald,
@@ -907,7 +906,8 @@ fn hold_mount(
         ))
         .into());
     }
-    install_signal_handlers(fds[1]).map_err(|e| Error::Cli(format!("failed to install signals: {e}")))?;
+    install_signal_handlers(fds[1])
+        .map_err(|e| Error::Cli(format!("failed to install signals: {e}")))?;
     std::thread::spawn({
         let tx = tx.clone();
         move || {

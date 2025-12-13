@@ -79,18 +79,7 @@ fn mount_daemon_flags_parse_and_defaults() -> pbkfs::Result<()> {
     use pbkfs::cli::{mount::LogSink, mount::MountMode, mount::WaitMode, Command};
 
     let args = pbkfs::cli::parse_args([
-        "pbkfs",
-        "mount",
-        "-B",
-        "/store",
-        "-D",
-        "/mnt",
-        "-d",
-        "/diff",
-        "-I",
-        "main",
-        "-i",
-        "FULL1",
+        "pbkfs", "mount", "-B", "/store", "-D", "/mnt", "-d", "/diff", "-I", "main", "-i", "FULL1",
     ])?;
 
     let Command::Mount(mount) = args.command else {
@@ -103,8 +92,14 @@ fn mount_daemon_flags_parse_and_defaults() -> pbkfs::Result<()> {
     assert!(!mount.debug);
 
     let defaults = mount.daemon_defaults()?;
-    assert_eq!(defaults.pid_visible, std::path::PathBuf::from("/mnt/.pbkfs/worker.pid"));
-    assert_eq!(defaults.stat_visible, std::path::PathBuf::from("/mnt/.pbkfs/stat"));
+    assert_eq!(
+        defaults.pid_visible,
+        std::path::PathBuf::from("/mnt/.pbkfs/worker.pid")
+    );
+    assert_eq!(
+        defaults.stat_visible,
+        std::path::PathBuf::from("/mnt/.pbkfs/stat")
+    );
     assert_eq!(
         defaults.log_visible,
         std::path::PathBuf::from("/mnt/.pbkfs/pbkfs.log")
@@ -191,7 +186,10 @@ fn mount_wait_timeout_priority_rules() -> pbkfs::Result<()> {
         panic!("expected mount command");
     };
 
-    assert_eq!(mount.wait_mode(), WaitMode::Timeout(std::time::Duration::from_secs(5)));
+    assert_eq!(
+        mount.wait_mode(),
+        WaitMode::Timeout(std::time::Duration::from_secs(5))
+    );
     Ok(())
 }
 
@@ -479,24 +477,24 @@ JSON
     {
         let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some(script_path.to_str().unwrap()));
 
-	        let ctx = pbkfs::cli::mount::mount(MountArgs {
-	            pbk_store: Some(store.path().to_path_buf()),
-	            mnt_path: Some(target.path().to_path_buf()),
-	            diff_dir: Some(diff.path().to_path_buf()),
-	            instance: Some("main".into()),
-	            backup_id: Some("FULL1".into()),
-	            force: false,
-	            perf_unsafe: false,
-	            no_wal: false,
-	            console: false,
-	            wait: false,
-	            timeout: None,
-	            log_file: None,
-	            log_format: pbkfs::cli::mount::LogFormatArg::Text,
-	            log_sink: None,
-	            pid_file: None,
-	            debug: false,
-	        })?;
+        let ctx = pbkfs::cli::mount::mount(MountArgs {
+            pbk_store: Some(store.path().to_path_buf()),
+            mnt_path: Some(target.path().to_path_buf()),
+            diff_dir: Some(diff.path().to_path_buf()),
+            instance: Some("main".into()),
+            backup_id: Some("FULL1".into()),
+            force: false,
+            perf_unsafe: false,
+            no_wal: false,
+            console: false,
+            wait: false,
+            timeout: None,
+            log_file: None,
+            log_format: pbkfs::cli::mount::LogFormatArg::Text,
+            log_sink: None,
+            pid_file: None,
+            debug: false,
+        })?;
 
         let contents = ctx
             .overlay
@@ -561,24 +559,24 @@ JSON
 
     let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some(script_path.to_str().unwrap()));
 
-	    let ctx = pbkfs::cli::mount::mount(MountArgs {
-	        pbk_store: Some(store.path().to_path_buf()),
-	        mnt_path: Some(target.path().to_path_buf()),
-	        diff_dir: Some(diff.path().to_path_buf()),
-	        instance: Some("main".into()),
-	        backup_id: Some("FULL1".into()),
-	        force: false,
-	        perf_unsafe: false,
-	        no_wal: false,
-	        console: false,
-	        wait: false,
-	        timeout: None,
-	        log_file: None,
-	        log_format: pbkfs::cli::mount::LogFormatArg::Text,
-	        log_sink: None,
-	        pid_file: None,
-	        debug: false,
-	    })?;
+    let ctx = pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(target.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+        perf_unsafe: false,
+        no_wal: false,
+        console: false,
+        wait: false,
+        timeout: None,
+        log_file: None,
+        log_format: pbkfs::cli::mount::LogFormatArg::Text,
+        log_sink: None,
+        pid_file: None,
+        debug: false,
+    })?;
 
     let mounted_file = target.path().join("data/base.txt");
     let meta_before = std::fs::metadata(&mounted_file)?;

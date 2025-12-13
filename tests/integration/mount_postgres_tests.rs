@@ -5,12 +5,7 @@
 //! - writes binding metadata to the diff directory, and
 //! - keeps the base backup immutable while writes land in the diff.
 
-use std::{
-    fs,
-    path::Path,
-    thread,
-    time::Duration,
-};
+use std::{fs, path::Path, thread, time::Duration};
 
 #[cfg(unix)]
 use std::process::{Command, Stdio};
@@ -1181,7 +1176,8 @@ fn unmount_force_detaches_busy_mount_when_fuse_available() -> pbkfs::Result<()> 
                     return Ok(());
                 }
             }
-            if err.to_string().contains("Permission denied") || err.to_string().contains("/dev/fuse")
+            if err.to_string().contains("Permission denied")
+                || err.to_string().contains("/dev/fuse")
             {
                 eprintln!("skipping force-unmount test: {err}");
                 return Ok(());

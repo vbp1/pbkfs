@@ -1,6 +1,9 @@
 //! PID record handling for Phase 8 daemonization (`<MNT_PATH>/.pbkfs/worker.pid`).
 
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 

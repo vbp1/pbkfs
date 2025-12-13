@@ -1,9 +1,6 @@
 //! Helpers for daemonization and launcher↔worker handshakes (Phase 8).
 
-use std::{
-    io,
-    os::unix::io::RawFd,
-};
+use std::{io, os::unix::io::RawFd};
 
 pub const STATUS_STARTED: u8 = 0x01;
 pub const STATUS_OK: u8 = 0x00;
@@ -69,7 +66,8 @@ impl HandshakeWriter {
 
     fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
         while !buf.is_empty() {
-            let rc = unsafe { libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+            let rc =
+                unsafe { libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
             if rc < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
