@@ -1,7 +1,9 @@
 //! Logging initialization using `tracing` and `tracing-subscriber`.
 
+use std::path::{Path, PathBuf};
+
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{fmt, fmt::writer::BoxMakeWriter, util::SubscriberInitExt, EnvFilter};
 
 use crate::Result;
 
@@ -10,6 +12,24 @@ pub enum LogFormat {
     #[default]
     Human,
     Json,
+}
+
+#[derive(Debug, Clone)]
+pub enum LogSink {
+    /// Log to the console (stdout/stderr). In practice, we use stderr to avoid
+    /// interleaving user output and logs.
+    Console,
+    /// Append-only log file.
+    File(PathBuf),
+    /// Log to journald via `systemd-cat`.
+    Journald,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoggingConfig {
+    pub format: LogFormat,
+    pub sink: LogSink,
+    pub debug: bool,
 }
 
 /// Snapshot of filesystem worker-pool health, emitted periodically from the
@@ -44,17 +64,50 @@ pub struct OverlayIoSnapshot {
 
 /// Initialize global tracing subscriber. Safe to call multiple times; subsequent
 /// calls will no-op.
-pub fn init_logging(format: LogFormat) -> Result<()> {
+pub fn init_logging(config: LoggingConfig) -> Result<()> {
     if tracing::dispatcher::has_been_set() {
         return Ok(());
     }
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = if config.debug {
+        EnvFilter::new("trace")
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    };
+
+    let (writer, ansi) = match &config.sink {
+        LogSink::Console => (BoxMakeWriter::new(std::io::stderr), true),
+        LogSink::File(path) => {
+            ensure_parent(path)?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            (BoxMakeWriter::new(std::sync::Mutex::new(file)), false)
+        }
+        LogSink::Journald => {
+            let mut cmd = std::process::Command::new("systemd-cat");
+            cmd.arg("--identifier=pbkfs")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let mut child = cmd.spawn()?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "missing stdin"))?;
+            drop(child);
+            (BoxMakeWriter::new(std::sync::Mutex::new(stdin)), false)
+        }
+    };
+
     let builder = fmt::Subscriber::builder()
         .with_env_filter(filter)
-        .with_target(false);
+        .with_target(false)
+        .with_writer(writer)
+        .with_ansi(ansi);
 
-    match format {
+    match config.format {
         LogFormat::Human => {
             let _ = builder.finish().try_init();
         }
@@ -63,6 +116,13 @@ pub fn init_logging(format: LogFormat) -> Result<()> {
         }
     };
 
+    Ok(())
+}
+
+fn ensure_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     Ok(())
 }
 

@@ -5,7 +5,15 @@
 //! - writes binding metadata to the diff directory, and
 //! - keeps the base backup immutable while writes land in the diff.
 
-use std::{fs, path::Path, thread, time::Duration};
+use std::{
+    fs,
+    path::Path,
+    thread,
+    time::Duration,
+};
+
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 
 use parking_lot::ReentrantMutexGuard;
 
@@ -123,6 +131,7 @@ fn mounts_backup_and_preserves_store_immutability() -> pbkfs::Result<()> {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        ..Default::default()
     })?;
 
     // Reads come from base
@@ -153,6 +162,7 @@ fn mounts_backup_and_preserves_store_immutability() -> pbkfs::Result<()> {
     unmount::execute(unmount::UnmountArgs {
         mnt_path: Some(target.path().to_path_buf()),
         diff_dir: Some(diff.path().to_path_buf()),
+        ..Default::default()
     })?;
 
     assert!(!diff.path().join(pbkfs::binding::LOCK_FILE).exists());
@@ -188,6 +198,7 @@ fn mount_decompresses_compressed_backup_files() -> pbkfs::Result<()> {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        ..Default::default()
     })?;
 
     let contents = ctx
@@ -234,6 +245,7 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        ..Default::default()
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -258,6 +270,7 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
         unmount::UnmountArgs {
             mnt_path: Some(target.path().to_path_buf()),
             diff_dir: Some(diff.path().to_path_buf()),
+            ..Default::default()
         },
         diff.path(),
     );
@@ -274,6 +287,7 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        ..Default::default()
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -329,6 +343,7 @@ fn remount_reuses_existing_diff_and_binding() -> pbkfs::Result<()> {
         unmount::UnmountArgs {
             mnt_path: Some(target.path().to_path_buf()),
             diff_dir: Some(diff.path().to_path_buf()),
+            ..Default::default()
         },
         diff.path(),
     );
@@ -358,6 +373,7 @@ fn remount_rejects_binding_mismatch() {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        ..Default::default()
     })
     .unwrap();
 
@@ -368,6 +384,7 @@ fn remount_rejects_binding_mismatch() {
         unmount::UnmountArgs {
             mnt_path: Some(target.path().to_path_buf()),
             diff_dir: Some(diff.path().to_path_buf()),
+            ..Default::default()
         },
         diff.path(),
     );
@@ -381,6 +398,7 @@ fn remount_rejects_binding_mismatch() {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        ..Default::default()
     })
     .expect_err("binding mismatch should fail");
 
@@ -412,6 +430,7 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        ..Default::default()
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -430,6 +449,7 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
         unmount::UnmountArgs {
             mnt_path: Some(target.path().to_path_buf()),
             diff_dir: Some(diff.path().to_path_buf()),
+            ..Default::default()
         },
         diff.path(),
     );
@@ -458,6 +478,7 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        ..Default::default()
     }) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -490,6 +511,7 @@ fn remount_recovers_stale_lock() -> pbkfs::Result<()> {
         unmount::UnmountArgs {
             mnt_path: Some(target.path().to_path_buf()),
             diff_dir: Some(diff.path().to_path_buf()),
+            ..Default::default()
         },
         diff.path(),
     );
@@ -518,6 +540,7 @@ fn perf_unsafe_creates_and_clears_dirty_marker() -> pbkfs::Result<()> {
         force: false,
         perf_unsafe: true,
         no_wal: false,
+        ..Default::default()
     })?;
 
     let marker = diff.path().join(pbkfs::fs::overlay::DIRTY_MARKER);
@@ -534,6 +557,7 @@ fn perf_unsafe_creates_and_clears_dirty_marker() -> pbkfs::Result<()> {
     unmount::execute(unmount::UnmountArgs {
         mnt_path: Some(target.path().to_path_buf()),
         diff_dir: Some(diff.path().to_path_buf()),
+        ..Default::default()
     })?;
 
     assert!(
@@ -569,6 +593,7 @@ fn perf_unsafe_marker_requires_force_after_crash() -> pbkfs::Result<()> {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        ..Default::default()
     })
     .expect_err("mount should reject existing dirty marker");
 
@@ -586,12 +611,14 @@ fn perf_unsafe_marker_requires_force_after_crash() -> pbkfs::Result<()> {
         force: true,
         perf_unsafe: true,
         no_wal: false,
+        ..Default::default()
     })?;
 
     ctx.flush_dirty()?;
     unmount::execute(unmount::UnmountArgs {
         mnt_path: Some(target.path().to_path_buf()),
         diff_dir: Some(diff.path().to_path_buf()),
+        ..Default::default()
     })?;
 
     Ok(())
@@ -619,6 +646,7 @@ fn mount_no_wal_virtualizes_wal_writes() -> pbkfs::Result<()> {
         force: false,
         perf_unsafe: false,
         no_wal: true,
+        ..Default::default()
     })?;
 
     // If FUSE is unavailable in the environment, skip to avoid spurious failures.
@@ -656,6 +684,7 @@ fn mount_no_wal_virtualizes_wal_writes() -> pbkfs::Result<()> {
         unmount::UnmountArgs {
             mnt_path: Some(target.path().to_path_buf()),
             diff_dir: Some(diff.path().to_path_buf()),
+            ..Default::default()
         },
         diff.path(),
     );
@@ -686,6 +715,7 @@ fn mount_no_wal_reads_unchanged_wal_from_backup_chain() -> pbkfs::Result<()> {
         force: false,
         perf_unsafe: false,
         no_wal: true,
+        ..Default::default()
     })?;
 
     // If FUSE is unavailable in the environment, skip to avoid spurious failures.
@@ -711,6 +741,7 @@ fn mount_no_wal_reads_unchanged_wal_from_backup_chain() -> pbkfs::Result<()> {
         unmount::UnmountArgs {
             mnt_path: Some(target.path().to_path_buf()),
             diff_dir: Some(diff.path().to_path_buf()),
+            ..Default::default()
         },
         diff.path(),
     );
@@ -718,9 +749,8 @@ fn mount_no_wal_reads_unchanged_wal_from_backup_chain() -> pbkfs::Result<()> {
     Ok(())
 }
 
-/// Ignored by default: requires a real pg_probackup catalog and FUSE.
+/// Requires a real pg_probackup catalog and FUSE; skips when env is not provided.
 #[test]
-#[ignore]
 fn mounts_native_pg_probackup_catalog_when_available() -> pbkfs::Result<()> {
     let Some(store_var) = std::env::var_os("PBKFS_NATIVE_STORE") else {
         // Environment not provided; skip quietly.
@@ -742,12 +772,546 @@ fn mounts_native_pg_probackup_catalog_when_available() -> pbkfs::Result<()> {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        ..Default::default()
     })?;
 
     if let Some(handle) = ctx.fuse_handle {
         handle.unmount();
     }
     let _ = std::fs::remove_file(diff.path().join(pbkfs::binding::LOCK_FILE));
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn pbkfs_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_pbkfs")
+}
+
+#[cfg(unix)]
+fn diff_pid_path(diff: &Path) -> std::path::PathBuf {
+    diff.join("data")
+        .join(pbkfs::cli::pid::DEFAULT_PID_FILE_REL)
+}
+
+#[cfg(unix)]
+fn wait_for_path(path: &Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    path.exists()
+}
+
+#[cfg(unix)]
+fn kill_pid(pid: i32, sig: i32) {
+    unsafe {
+        libc::kill(pid, sig);
+    }
+}
+
+#[cfg(unix)]
+fn mount_cmd(store: &Path, mnt: &Path, diff: &Path) -> Command {
+    let mut cmd = Command::new(pbkfs_bin());
+    cmd.arg("mount")
+        .arg("-B")
+        .arg(store)
+        .arg("-D")
+        .arg(mnt)
+        .arg("-d")
+        .arg(diff)
+        .arg("-I")
+        .arg("main")
+        .arg("-i")
+        .arg("FULL1")
+        // Avoid invoking a real pg_probackup binary even if present.
+        .env("PG_PROBACKUP_BIN", "/nonexistent/pg_probackup")
+        // Keep child quiet and deterministic unless the test needs output.
+        .stdin(Stdio::null());
+    cmd
+}
+
+/// Phase 8: background-by-default launcher returns after phase-1 "started"
+/// and leaves a detached worker running.
+#[cfg(unix)]
+#[test]
+fn daemon_background_returns_after_started_and_leaves_worker_running() {
+    let store = tempdir().unwrap();
+    let mnt = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+
+    let pid_path = diff_pid_path(diff.path());
+
+    let out = mount_cmd(store.path(), mnt.path(), diff.path())
+        // Keep worker alive so we can observe it.
+        .env("PBKFS_TEST_DAEMON_DELAY_MS", "10000")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("launcher should run");
+
+    assert!(
+        out.status.success(),
+        "launcher must exit successfully; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        wait_for_path(&pid_path, Duration::from_secs(2)),
+        "worker pid file should appear in diff layer"
+    );
+    let record = pbkfs::cli::pid::read_pid_record(&pid_path).expect("pid record should be valid");
+    assert!(
+        pbkfs::cli::pid::pid_alive(record.pid),
+        "worker pid should be alive"
+    );
+
+    // Cleanup: stop the detached worker and remove pid record.
+    kill_pid(record.pid, libc::SIGKILL);
+    thread::sleep(Duration::from_millis(50));
+    let _ = fs::remove_file(&pid_path);
+}
+
+/// Phase 8: Ctrl+C during `--wait` cancels waiting only and does not kill worker.
+#[cfg(unix)]
+#[test]
+fn daemon_wait_ctrlc_cancels_without_killing_worker() {
+    let store = tempdir().unwrap();
+    let mnt = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+
+    let pid_path = diff_pid_path(diff.path());
+
+    let mut child = mount_cmd(store.path(), mnt.path(), diff.path())
+        .arg("--wait")
+        .env("PBKFS_TEST_DAEMON_DELAY_MS", "10000")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launcher should spawn");
+
+    assert!(
+        wait_for_path(&pid_path, Duration::from_secs(2)),
+        "worker pid file should appear"
+    );
+
+    // Give the launcher a moment to transition into phase-2 waiting.
+    thread::sleep(Duration::from_millis(100));
+    kill_pid(child.id() as i32, libc::SIGINT);
+
+    let status = child.wait().expect("launcher should exit after SIGINT");
+    assert!(
+        status.success(),
+        "launcher should treat cancellation as success"
+    );
+
+    let record = pbkfs::cli::pid::read_pid_record(&pid_path).expect("pid record should be valid");
+    assert!(
+        pbkfs::cli::pid::pid_alive(record.pid),
+        "worker must still be running after launcher Ctrl+C"
+    );
+
+    kill_pid(record.pid, libc::SIGKILL);
+    thread::sleep(Duration::from_millis(50));
+    let _ = fs::remove_file(&pid_path);
+}
+
+/// Phase 8: `--timeout` exits but leaves worker running.
+#[cfg(unix)]
+#[test]
+fn daemon_timeout_leaves_worker_running() {
+    let store = tempdir().unwrap();
+    let mnt = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+
+    let pid_path = diff_pid_path(diff.path());
+
+    let out = mount_cmd(store.path(), mnt.path(), diff.path())
+        .arg("--timeout")
+        .arg("1")
+        .env("PBKFS_TEST_DAEMON_DELAY_MS", "10000")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("launcher should run");
+
+    assert!(
+        out.status.success(),
+        "timeout should not be fatal; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        wait_for_path(&pid_path, Duration::from_secs(2)),
+        "worker pid file should appear"
+    );
+    let record = pbkfs::cli::pid::read_pid_record(&pid_path).expect("pid record should be valid");
+    assert!(pbkfs::cli::pid::pid_alive(record.pid));
+
+    kill_pid(record.pid, libc::SIGKILL);
+    thread::sleep(Duration::from_millis(50));
+    let _ = fs::remove_file(&pid_path);
+}
+
+/// Phase 8: if worker dies after phase-1 "started" but before phase-2, launcher reports error.
+#[cfg(unix)]
+#[test]
+fn daemon_wait_reports_worker_death_between_phases() {
+    let store = tempdir().unwrap();
+    let mnt = tempdir().unwrap();
+    let diff = tempdir().unwrap();
+
+    let pid_path = diff_pid_path(diff.path());
+
+    let out = mount_cmd(store.path(), mnt.path(), diff.path())
+        .arg("--wait")
+        .env("PBKFS_TEST_DAEMON_CRASH_AFTER_STARTED", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("launcher should run");
+
+    assert!(
+        !out.status.success(),
+        "launcher must fail when worker dies mid-handshake"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("worker exited before reporting mount completion")
+            || stderr.contains("mount failed")
+            || stderr.contains("pbkfs error"),
+        "stderr should mention handshake failure; stderr={stderr}"
+    );
+
+    // Cleanup pid record left behind by the intentional crash.
+    let _ = fs::remove_file(&pid_path);
+}
+
+/// Phase 8: end-to-end `--wait` success path (requires working FUSE).
+#[cfg(unix)]
+#[test]
+fn daemon_wait_succeeds_when_fuse_available() -> pbkfs::Result<()> {
+    let store = tempdir()?;
+    let mnt = tempdir()?;
+    let diff = tempdir()?;
+
+    let base_file = native_path(store.path(), "FULL1", Path::new("data/base.txt"));
+    fs::create_dir_all(base_file.parent().unwrap())?;
+    fs::write(&base_file, b"from-store")?;
+    write_metadata(store.path(), false, None);
+
+    let out = mount_cmd(store.path(), mnt.path(), diff.path())
+        .arg("--wait")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("launcher should run");
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("Permission denied") || stderr.contains("/dev/fuse") {
+            eprintln!("skipping daemon wait success test: {stderr}");
+            return Ok(());
+        }
+        anyhow::bail!("unexpected mount failure: {stderr}");
+    }
+
+    // PID/stat/log files should be visible via FUSE.
+    assert!(mnt.path().join(".pbkfs/worker.pid").exists());
+    assert!(mnt.path().join(".pbkfs/pbkfs.log").exists());
+
+    // Cleanup via CLI unmount (signal-based).
+    let out = Command::new(pbkfs_bin())
+        .arg("unmount")
+        .arg("--mnt-path")
+        .arg(mnt.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("unmount should run");
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("Permission denied") || stderr.contains("/dev/fuse") {
+            eprintln!("skipping daemon unmount in success test: {stderr}");
+            return Ok(());
+        }
+        anyhow::bail!("unexpected unmount failure: {stderr}");
+    }
+
+    Ok(())
+}
+
+/// Phase 8: `pbkfs stat` integration (requires working FUSE).
+#[cfg(unix)]
+#[test]
+fn stat_command_dumps_and_resets_counters_when_fuse_available() -> pbkfs::Result<()> {
+    let store = tempdir()?;
+    let mnt = tempdir()?;
+    let diff = tempdir()?;
+
+    let base_file = native_path(store.path(), "FULL1", Path::new("data/base.txt"));
+    fs::create_dir_all(base_file.parent().unwrap())?;
+    fs::write(&base_file, b"from-store")?;
+    write_metadata(store.path(), false, None);
+
+    // Use the daemonized worker so PID/stat files exist under `<mnt>/.pbkfs/`.
+    let out = mount_cmd(store.path(), mnt.path(), diff.path())
+        .arg("--wait")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("launcher should run");
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("Permission denied") || stderr.contains("/dev/fuse") {
+            eprintln!("skipping stat integration test: {stderr}");
+            return Ok(());
+        }
+        anyhow::bail!("unexpected mount failure: {stderr}");
+    }
+
+    // Generate some traffic to bump counters.
+    let base_path = mnt.path().join("data/base.txt");
+    let _ = fs::read(&base_path)?;
+    fs::write(&base_path, b"from-diff")?;
+    assert_eq!(b"from-diff".as_slice(), fs::read(&base_path)?.as_slice());
+
+    let out = Command::new(pbkfs_bin())
+        .arg("stat")
+        .arg("--mnt-path")
+        .arg(mnt.path())
+        .arg("--format")
+        .arg("json")
+        .arg("--counters-reset")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("stat should run");
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("Permission denied") || stderr.contains("/dev/fuse") {
+            eprintln!("skipping stat integration test: {stderr}");
+            return Ok(());
+        }
+        anyhow::bail!("unexpected stat failure: {stderr}");
+    }
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    assert!(v.get("overlay").is_some());
+    assert!(v.get("fuse").is_some());
+
+    // After reset, immediate second stat should show zeroed "copy-up" counters.
+    let out2 = Command::new(pbkfs_bin())
+        .arg("stat")
+        .arg("--mnt-path")
+        .arg(mnt.path())
+        .arg("--format")
+        .arg("json")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("stat should run");
+    if !out2.status.success() {
+        anyhow::bail!(
+            "unexpected stat failure after reset: {}",
+            String::from_utf8_lossy(&out2.stderr)
+        );
+    }
+
+    let v2: serde_json::Value = serde_json::from_slice(&out2.stdout)?;
+    let bytes_copied = v2["overlay"]["bytes_copied"].as_u64().unwrap_or(0);
+    let blocks_copied = v2["overlay"]["blocks_copied"].as_u64().unwrap_or(0);
+    assert_eq!(0, bytes_copied);
+    assert_eq!(0, blocks_copied);
+
+    // Cleanup via CLI unmount.
+    let out = Command::new(pbkfs_bin())
+        .arg("unmount")
+        .arg("--mnt-path")
+        .arg(mnt.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("unmount should run");
+    if !out.status.success() {
+        anyhow::bail!(
+            "unexpected unmount failure in stat test: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+/// Phase 8: force-unmount a busy mount (requires working FUSE).
+#[cfg(unix)]
+#[test]
+fn unmount_force_detaches_busy_mount_when_fuse_available() -> pbkfs::Result<()> {
+    let store = tempdir()?;
+    let mnt = tempdir()?;
+    let diff = tempdir()?;
+
+    let base_file = native_path(store.path(), "FULL1", Path::new("data/base.txt"));
+    fs::create_dir_all(base_file.parent().unwrap())?;
+    fs::write(&base_file, b"from-store")?;
+    write_metadata(store.path(), false, None);
+
+    // Ensure tests don't depend on a real pg_probackup binary even if one is available in PATH.
+    let _env = EnvGuard::new("PG_PROBACKUP_BIN", Some("/nonexistent/pg_probackup"));
+
+    let mut ctx = match pbkfs::cli::mount::mount(MountArgs {
+        pbk_store: Some(store.path().to_path_buf()),
+        mnt_path: Some(mnt.path().to_path_buf()),
+        diff_dir: Some(diff.path().to_path_buf()),
+        instance: Some("main".into()),
+        backup_id: Some("FULL1".into()),
+        force: false,
+        perf_unsafe: false,
+        no_wal: false,
+        ..Default::default()
+    }) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+                if io_err.kind() == std::io::ErrorKind::PermissionDenied {
+                    eprintln!("skipping force-unmount test: {io_err}");
+                    return Ok(());
+                }
+            }
+            if err.to_string().contains("Permission denied") || err.to_string().contains("/dev/fuse")
+            {
+                eprintln!("skipping force-unmount test: {err}");
+                return Ok(());
+            }
+            return Err(err);
+        }
+    };
+
+    // Make the mount definitely "busy" for a regular unmount by keeping a
+    // separate process working directory inside the mountpoint.
+    let mut busy_proc = Command::new("sleep")
+        .arg("60")
+        .current_dir(mnt.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let out = Command::new(pbkfs_bin())
+        .arg("unmount")
+        .arg("--mnt-path")
+        .arg(mnt.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("unmount should run");
+    assert!(
+        !out.status.success(),
+        "regular unmount should fail while mount is busy"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        stderr.contains("busy"),
+        "expected busy error, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(pbkfs_bin())
+        .arg("unmount")
+        .arg("--mnt-path")
+        .arg(mnt.path())
+        .arg("--force")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("force unmount should run");
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("Permission denied") || stderr.contains("/dev/fuse") {
+            eprintln!("skipping force-unmount test: {stderr}");
+            return Ok(());
+        }
+        anyhow::bail!("unexpected force-unmount failure: {stderr}");
+    }
+
+    // Terminate the helper process holding CWD inside the mountpoint before
+    // joining the background FUSE session.
+    let _ = busy_proc.kill();
+    let _ = busy_proc.wait();
+
+    // Join the background session thread now that the mount is gone.
+    if let Some(handle) = ctx.fuse_handle.take() {
+        handle.unmount();
+    }
+
+    Ok(())
+}
+
+/// Phase 8: stale PID + broken endpoint fallback (requires working FUSE).
+#[cfg(unix)]
+#[test]
+fn unmount_falls_back_when_pid_is_stale_when_fuse_available() -> pbkfs::Result<()> {
+    let store = tempdir()?;
+    let mnt = tempdir()?;
+    let diff = tempdir()?;
+
+    let base_file = native_path(store.path(), "FULL1", Path::new("data/base.txt"));
+    fs::create_dir_all(base_file.parent().unwrap())?;
+    fs::write(&base_file, b"from-store")?;
+    write_metadata(store.path(), false, None);
+
+    let out = mount_cmd(store.path(), mnt.path(), diff.path())
+        .arg("--wait")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("launcher should run");
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("Permission denied") || stderr.contains("/dev/fuse") {
+            eprintln!("skipping stale-pid unmount test: {stderr}");
+            return Ok(());
+        }
+        anyhow::bail!("unexpected mount failure: {stderr}");
+    }
+
+    let pid_path = mnt.path().join(".pbkfs/worker.pid");
+    let record = pbkfs::cli::pid::read_pid_record(&pid_path)?;
+
+    // Kill the worker abruptly; pid file becomes stale.
+    kill_pid(record.pid, libc::SIGKILL);
+    thread::sleep(Duration::from_millis(100));
+    assert!(!pbkfs::cli::pid::pid_alive(record.pid));
+
+    let out = Command::new(pbkfs_bin())
+        .arg("unmount")
+        .arg("--mnt-path")
+        .arg(mnt.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("unmount should run");
+    if !out.status.success() {
+        // Busy/broken endpoints may require --force; validate it works.
+        let out2 = Command::new(pbkfs_bin())
+            .arg("unmount")
+            .arg("--mnt-path")
+            .arg(mnt.path())
+            .arg("--force")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("force unmount should run");
+        if !out2.status.success() {
+            anyhow::bail!(
+                "unmount failed even with --force: {}",
+                String::from_utf8_lossy(&out2.stderr)
+            );
+        }
+    }
 
     Ok(())
 }
