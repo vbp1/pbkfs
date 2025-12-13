@@ -152,6 +152,7 @@ struct MountStatsInner {
     worker_metrics: Arc<FsWorkerMetricsInner>,
     handle_hits: AtomicU64,
     handle_misses: AtomicU64,
+    handle_bypassed_by_design: AtomicU64,
     handles_open: AtomicUsize,
 }
 
@@ -159,6 +160,7 @@ struct MountStatsInner {
 pub struct MountStatsSnapshot {
     pub handle_hits: u64,
     pub handle_misses: u64,
+    pub bypassed_by_design: u64,
     pub handles_open: usize,
     pub queue_depth: usize,
     pub max_queue_depth: usize,
@@ -175,6 +177,7 @@ impl MountStats {
                 worker_metrics,
                 handle_hits: AtomicU64::new(0),
                 handle_misses: AtomicU64::new(0),
+                handle_bypassed_by_design: AtomicU64::new(0),
                 handles_open: AtomicUsize::new(0),
             }),
         }
@@ -185,6 +188,7 @@ impl MountStats {
         MountStatsSnapshot {
             handle_hits: self.inner.handle_hits.load(Ordering::Relaxed),
             handle_misses: self.inner.handle_misses.load(Ordering::Relaxed),
+            bypassed_by_design: self.inner.handle_bypassed_by_design.load(Ordering::Relaxed),
             handles_open: self.inner.handles_open.load(Ordering::Relaxed),
             queue_depth: worker.queue_depth,
             max_queue_depth: worker.max_queue_depth,
@@ -198,6 +202,9 @@ impl MountStats {
     pub fn reset_counters(&self) {
         self.inner.handle_hits.store(0, Ordering::Relaxed);
         self.inner.handle_misses.store(0, Ordering::Relaxed);
+        self.inner
+            .handle_bypassed_by_design
+            .store(0, Ordering::Relaxed);
         self.inner.worker_metrics.reset();
     }
 
@@ -207,6 +214,12 @@ impl MountStats {
 
     fn incr_handle_miss(&self) {
         self.inner.handle_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_handle_bypassed_by_design(&self) {
+        self.inner
+            .handle_bypassed_by_design
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn incr_handles_open(&self) {
@@ -653,6 +666,7 @@ impl OverlayFs {
             cache_misses: overlay_metrics.cache_misses,
             handle_hits: stats.handle_hits,
             handle_misses: stats.handle_misses,
+            bypassed_by_design: stats.bypassed_by_design,
             handles_open: stats.handles_open,
             delta_patch_count: overlay_metrics.delta_patch_count,
             delta_full_count: overlay_metrics.delta_full_count,
@@ -1265,12 +1279,20 @@ impl Filesystem for OverlayFs {
 
         let off = if offset < 0 { 0 } else { offset as u64 };
         let is_wal = self.no_wal && Self::is_pg_wal_child(&rel);
-        let handle = if is_wal {
-            None // force overlay path for WAL when no_wal is on
+        let is_datafile = self.overlay.is_pg_datafile(&rel);
+        let bypassed_by_design = is_datafile || is_wal;
+        let handle = if bypassed_by_design {
+            None
         } else {
             self.take_handle_file(fh).and_then(|h| h.file.clone())
         };
-        let total = if handle.is_some() {
+        let total = if bypassed_by_design {
+            self.stats.incr_handle_bypassed_by_design();
+            self.stats
+                .inner
+                .handle_bypassed_by_design
+                .load(Ordering::Relaxed)
+        } else if handle.is_some() {
             self.stats.incr_handle_hit();
             self.stats.inner.handle_hits.load(Ordering::Relaxed)
         } else {
