@@ -964,11 +964,38 @@ fn hold_mount(
                 }
                 libc::SIGINT | libc::SIGTERM => {
                     info!(
-                        "signal received; unmounting {}",
+                        "signal received; requesting unmount of {}",
                         ctx.session.pbk_target_path.display()
                     );
-                    handle.unmount();
-                    break;
+
+                    // IMPORTANT: do not force-detach from the worker on SIGTERM.
+                    // If the mount is busy (e.g. PostgreSQL still running), we
+                    // must leave the mount in place and keep the worker alive.
+                    match crate::cli::unmount::system_unmount(&ctx.session.pbk_target_path) {
+                        Ok(()) => {
+                            handle.unmount();
+                            break;
+                        }
+                        Err(err)
+                            if matches!(
+                                err.downcast_ref::<Error>(),
+                                Some(Error::Cli(msg)) if msg.to_lowercase().contains("busy")
+                            ) =>
+                        {
+                            warn!(
+                                path = %ctx.session.pbk_target_path.display(),
+                                error = %err,
+                                "unmount requested but mount is busy; keeping worker running"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                path = %ctx.session.pbk_target_path.display(),
+                                error = %err,
+                                "unmount requested but failed; keeping worker running"
+                            );
+                        }
+                    }
                 }
                 _ => {}
             },
