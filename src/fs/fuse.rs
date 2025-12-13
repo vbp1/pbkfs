@@ -24,6 +24,7 @@ use fuser::{
     Request,
 };
 use libc::{EACCES, EEXIST, EIO, EISDIR, ENOENT, ENOTEMPTY};
+use serde::Serialize;
 use tracing::{debug, error};
 
 use crate::fs::overlay::Overlay;
@@ -130,6 +131,103 @@ impl FsWorkerMetricsInner {
             },
             true,
         );
+    }
+
+    fn reset(&self) {
+        self.max_queue_depth.store(0, Ordering::Relaxed);
+        self.tasks_total.store(0, Ordering::Relaxed);
+        self.tasks_failed.store(0, Ordering::Relaxed);
+        self.rejected.store(0, Ordering::Relaxed);
+        self.last_task_latency_us.store(0, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MountStats {
+    inner: Arc<MountStatsInner>,
+}
+
+#[derive(Debug)]
+struct MountStatsInner {
+    worker_metrics: Arc<FsWorkerMetricsInner>,
+    handle_hits: AtomicU64,
+    handle_misses: AtomicU64,
+    handle_bypassed_by_design: AtomicU64,
+    handles_open: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct MountStatsSnapshot {
+    pub handle_hits: u64,
+    pub handle_misses: u64,
+    pub bypassed_by_design: u64,
+    pub handles_open: usize,
+    pub queue_depth: usize,
+    pub max_queue_depth: usize,
+    pub tasks_total: u64,
+    pub tasks_failed: u64,
+    pub rejected: u64,
+    pub last_task_latency_us: u64,
+}
+
+impl MountStats {
+    fn new(worker_metrics: Arc<FsWorkerMetricsInner>) -> Self {
+        Self {
+            inner: Arc::new(MountStatsInner {
+                worker_metrics,
+                handle_hits: AtomicU64::new(0),
+                handle_misses: AtomicU64::new(0),
+                handle_bypassed_by_design: AtomicU64::new(0),
+                handles_open: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    pub fn snapshot(&self) -> MountStatsSnapshot {
+        let worker = self.inner.worker_metrics.snapshot();
+        MountStatsSnapshot {
+            handle_hits: self.inner.handle_hits.load(Ordering::Relaxed),
+            handle_misses: self.inner.handle_misses.load(Ordering::Relaxed),
+            bypassed_by_design: self.inner.handle_bypassed_by_design.load(Ordering::Relaxed),
+            handles_open: self.inner.handles_open.load(Ordering::Relaxed),
+            queue_depth: worker.queue_depth,
+            max_queue_depth: worker.max_queue_depth,
+            tasks_total: worker.tasks_total,
+            tasks_failed: worker.tasks_failed,
+            rejected: worker.rejected,
+            last_task_latency_us: worker.last_task_latency_us,
+        }
+    }
+
+    pub fn reset_counters(&self) {
+        self.inner.handle_hits.store(0, Ordering::Relaxed);
+        self.inner.handle_misses.store(0, Ordering::Relaxed);
+        self.inner
+            .handle_bypassed_by_design
+            .store(0, Ordering::Relaxed);
+        self.inner.worker_metrics.reset();
+    }
+
+    fn incr_handle_hit(&self) {
+        self.inner.handle_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_handle_miss(&self) {
+        self.inner.handle_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_handle_bypassed_by_design(&self) {
+        self.inner
+            .handle_bypassed_by_design
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn incr_handles_open(&self) {
+        self.inner.handles_open.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decr_handles_open(&self) {
+        self.inner.handles_open.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -456,13 +554,6 @@ impl FsWorkerPool {
             }
         }
     }
-
-    // Exposed for Phase 8 (stats dump via SIGUSR1/SIGUSR2) to snapshot worker
-    // queue/load metrics without blocking the worker threads.
-    #[allow(dead_code)]
-    fn metrics(&self) -> FsWorkerMetrics {
-        self.metrics.snapshot()
-    }
 }
 
 pub struct OverlayFs {
@@ -473,23 +564,23 @@ pub struct OverlayFs {
     next_ino: Mutex<u64>,
     handles: Mutex<HashMap<u64, OpenHandle>>, // fh -> handle
     next_fh: AtomicU64,
-    handle_hits: AtomicU64,
-    handle_misses: AtomicU64,
+    stats: MountStats,
     pending_ops: Arc<PendingOps>,
     worker_pool: FsWorkerPool,
     wal_state: Arc<Mutex<HashMap<PathBuf, WalFileState>>>,
 }
 
 impl OverlayFs {
-    pub fn new(overlay: Overlay) -> Self {
+    pub fn new(overlay: Overlay) -> (Self, MountStats) {
         let mut paths = HashMap::new();
         let mut inodes = HashMap::new();
         paths.insert(1, PathBuf::from(""));
         inodes.insert(PathBuf::from(""), 1);
         let pending_ops = Arc::new(PendingOps::new());
         let worker_pool = FsWorkerPool::new(&overlay, pending_ops.clone());
+        let stats = MountStats::new(worker_pool.metrics.clone());
         let no_wal = overlay.no_wal();
-        Self {
+        let fs = Self {
             overlay,
             no_wal,
             paths: Mutex::new(paths),
@@ -497,12 +588,12 @@ impl OverlayFs {
             next_ino: Mutex::new(2),
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(2),
-            handle_hits: AtomicU64::new(0),
-            handle_misses: AtomicU64::new(0),
+            stats: stats.clone(),
             pending_ops,
             worker_pool,
             wal_state: Arc::new(Mutex::new(HashMap::new())),
-        }
+        };
+        (fs, stats)
     }
 
     fn err_code(err: io::Error) -> i32 {
@@ -531,10 +622,12 @@ impl OverlayFs {
 
     fn insert_handle(&self, fh: u64, handle: OpenHandle) {
         self.handles.lock().unwrap().insert(fh, handle);
+        self.stats.incr_handles_open();
     }
 
     fn remove_handle(&self, fh: u64) {
         let _ = self.handles.lock().unwrap().remove(&fh);
+        self.stats.decr_handles_open();
     }
 
     fn take_handle_file(&self, fh: u64) -> Option<OpenHandle> {
@@ -567,12 +660,14 @@ impl OverlayFs {
 
     fn log_handle_snapshot(&self) {
         let overlay_metrics = self.overlay.metrics();
+        let stats = self.stats.snapshot();
         let snapshot = crate::logging::OverlayIoSnapshot {
             cache_hits: overlay_metrics.cache_hits,
             cache_misses: overlay_metrics.cache_misses,
-            handle_hits: self.handle_hits.load(Ordering::Relaxed),
-            handle_misses: self.handle_misses.load(Ordering::Relaxed),
-            handles_open: self.handles.lock().map(|h| h.len()).unwrap_or(0),
+            handle_hits: stats.handle_hits,
+            handle_misses: stats.handle_misses,
+            bypassed_by_design: stats.bypassed_by_design,
+            handles_open: stats.handles_open,
             delta_patch_count: overlay_metrics.delta_patch_count,
             delta_full_count: overlay_metrics.delta_full_count,
             delta_patch_avg_size: overlay_metrics.delta_patch_avg_size,
@@ -1184,15 +1279,25 @@ impl Filesystem for OverlayFs {
 
         let off = if offset < 0 { 0 } else { offset as u64 };
         let is_wal = self.no_wal && Self::is_pg_wal_child(&rel);
-        let handle = if is_wal {
-            None // force overlay path for WAL when no_wal is on
+        let is_datafile = self.overlay.is_pg_datafile(&rel);
+        let bypassed_by_design = is_datafile || is_wal;
+        let handle = if bypassed_by_design {
+            None
         } else {
             self.take_handle_file(fh).and_then(|h| h.file.clone())
         };
-        let total = if handle.is_some() {
-            self.handle_hits.fetch_add(1, Ordering::Relaxed) + 1
+        let total = if bypassed_by_design {
+            self.stats.incr_handle_bypassed_by_design();
+            self.stats
+                .inner
+                .handle_bypassed_by_design
+                .load(Ordering::Relaxed)
+        } else if handle.is_some() {
+            self.stats.incr_handle_hit();
+            self.stats.inner.handle_hits.load(Ordering::Relaxed)
         } else {
-            self.handle_misses.fetch_add(1, Ordering::Relaxed) + 1
+            self.stats.incr_handle_miss();
+            self.stats.inner.handle_misses.load(Ordering::Relaxed)
         };
         if total % 256 == 0 {
             self.log_handle_snapshot();
@@ -2096,6 +2201,7 @@ impl Filesystem for OverlayFs {
 pub struct MountHandle {
     mountpoint: String,
     session: BackgroundSession,
+    stats: MountStats,
 }
 
 impl std::fmt::Debug for MountHandle {
@@ -2107,6 +2213,14 @@ impl std::fmt::Debug for MountHandle {
 }
 
 impl MountHandle {
+    pub fn stats_snapshot(&self) -> MountStatsSnapshot {
+        self.stats.snapshot()
+    }
+
+    pub fn reset_counters(&self) {
+        self.stats.reset_counters();
+    }
+
     pub fn unmount(self) {
         self.session.join();
     }
@@ -2117,20 +2231,24 @@ impl MountHandle {
 /// as non-fatal for now.
 pub fn spawn_overlay<P: AsRef<Path>>(overlay: Overlay, mountpoint: P) -> Result<MountHandle> {
     let mountpoint = mountpoint.as_ref().to_string_lossy().to_string();
-    let fs = OverlayFs::new(overlay.clone());
     let options = vec![MountOption::FSName("pbkfs".into())];
-    let session = fuser::spawn_mount2(fs, &mountpoint, &options).or_else(|e| {
-        if e.raw_os_error() == Some(libc::ENOSYS) {
-            let fs_fallback = OverlayFs::new(overlay);
+    let (fs, stats) = OverlayFs::new(overlay.clone());
+    match fuser::spawn_mount2(fs, &mountpoint, &options) {
+        Ok(session) => Ok(MountHandle {
+            mountpoint,
+            session,
+            stats,
+        }),
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+            let (fs_fallback, stats_fallback) = OverlayFs::new(overlay);
             #[allow(deprecated)]
-            fuser::spawn_mount(fs_fallback, &mountpoint, &[])
-        } else {
-            Err(e)
+            let session = fuser::spawn_mount(fs_fallback, &mountpoint, &[])?;
+            Ok(MountHandle {
+                mountpoint,
+                session,
+                stats: stats_fallback,
+            })
         }
-    })?;
-
-    Ok(MountHandle {
-        mountpoint,
-        session,
-    })
+        Err(e) => Err(e.into()),
+    }
 }

@@ -9,7 +9,7 @@ use crate::{binding::lock::cleanup_diff_dir, binding::DiffDir, Error, Result};
 #[derive(Debug, Clone, Args, Default)]
 pub struct CleanupArgs {
     /// Path to a diff directory to clean up
-    #[arg(long = "diff-dir")]
+    #[arg(short = 'd', long = "diff-dir")]
     pub diff_dir: Option<PathBuf>,
 
     /// Force removal even if populated
@@ -18,6 +18,12 @@ pub struct CleanupArgs {
 }
 
 pub fn execute(args: CleanupArgs) -> Result<()> {
+    crate::logging::init_logging(crate::logging::LoggingConfig {
+        format: crate::logging::LogFormat::Human,
+        sink: crate::logging::LogSink::Console,
+        debug: false,
+    })?;
+
     let diff_dir = args
         .diff_dir
         .ok_or_else(|| Error::Cli("diff_dir is required".into()))?;

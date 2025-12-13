@@ -31,7 +31,7 @@ use crate::{
     Error, Result,
 };
 use parking_lot::RwLock;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use walkdir::WalkDir;
 
@@ -105,7 +105,7 @@ enum BlockSource {
     Zero,
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct OverlayMetrics {
     pub cache_hits: u64,
     pub cache_misses: u64,
@@ -165,6 +165,22 @@ impl OverlayMetricsInner {
             delta_punch_holes: self.delta_punch_holes.load(Ordering::Relaxed),
             delta_punch_hole_failures: self.delta_punch_hole_failures.load(Ordering::Relaxed),
         }
+    }
+
+    fn reset(&self) {
+        self.cache_hits.store(0, Ordering::Relaxed);
+        self.cache_misses.store(0, Ordering::Relaxed);
+        self.fallback_used.store(0, Ordering::Relaxed);
+        self.blocks_copied.store(0, Ordering::Relaxed);
+        self.bytes_copied.store(0, Ordering::Relaxed);
+        self.delta_patch_count.store(0, Ordering::Relaxed);
+        self.delta_full_count.store(0, Ordering::Relaxed);
+        self.delta_patch_bytes.store(0, Ordering::Relaxed);
+        self.delta_patch_max_size.store(0, Ordering::Relaxed);
+        self.delta_bitmaps_loaded.store(0, Ordering::Relaxed);
+        self.delta_bitmaps_total_bytes.store(0, Ordering::Relaxed);
+        self.delta_punch_holes.store(0, Ordering::Relaxed);
+        self.delta_punch_hole_failures.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1838,6 +1854,10 @@ impl Overlay {
 
     pub fn metrics(&self) -> OverlayMetrics {
         self.inner.metrics.snapshot()
+    }
+
+    pub fn reset_metrics(&self) {
+        self.inner.metrics.reset();
     }
 
     pub fn perf_unsafe(&self) -> bool {

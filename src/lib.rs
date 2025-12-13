@@ -102,9 +102,6 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    // Initialize logging before doing anything else. Defaults to human format for the CLI.
-    logging::init_logging(logging::LogFormat::Human)?;
-
     let cli_args = cli::parse_args(args.into_iter().map(Into::into))?;
     cli::dispatch(cli_args)
 }

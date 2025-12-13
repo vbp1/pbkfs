@@ -75,6 +75,222 @@ fn expect_error(args: &[&str], expected: Error) {
 }
 
 #[test]
+fn mount_daemon_flags_parse_and_defaults() -> pbkfs::Result<()> {
+    use pbkfs::cli::{mount::LogSink, mount::MountMode, mount::WaitMode, Command};
+
+    let args = pbkfs::cli::parse_args([
+        "pbkfs", "mount", "-B", "/store", "-D", "/mnt", "-d", "/diff", "-I", "main", "-i", "FULL1",
+    ])?;
+
+    let Command::Mount(mount) = args.command else {
+        panic!("expected mount command");
+    };
+
+    assert_eq!(mount.mode(), MountMode::Background);
+    assert_eq!(mount.wait_mode(), WaitMode::StartOnly);
+    assert_eq!(mount.log_sink.unwrap_or_default(), LogSink::File);
+    assert!(!mount.debug);
+
+    let defaults = mount.daemon_defaults()?;
+    assert_eq!(
+        defaults.pid_visible,
+        std::path::PathBuf::from("/mnt/.pbkfs/worker.pid")
+    );
+    assert_eq!(
+        defaults.stat_visible,
+        std::path::PathBuf::from("/mnt/.pbkfs/stat")
+    );
+    assert_eq!(
+        defaults.log_visible,
+        std::path::PathBuf::from("/mnt/.pbkfs/pbkfs.log")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mount_parses_logging_and_pid_overrides() -> pbkfs::Result<()> {
+    use pbkfs::cli::{mount::LogFormatArg, mount::LogSink, Command};
+
+    let args = pbkfs::cli::parse_args([
+        "pbkfs",
+        "mount",
+        "-B",
+        "/store",
+        "--mnt-path",
+        "/mnt",
+        "--diff-dir",
+        "/diff",
+        "--instance",
+        "main",
+        "--backup-id",
+        "FULL1",
+        "--log-format",
+        "json",
+        "--log-sink",
+        "journald",
+        "--log-file",
+        "/var/log/pbkfs.log",
+        "--pid-file",
+        ".pbkfs/custom.pid",
+        "--debug",
+    ])?;
+
+    let Command::Mount(mount) = args.command else {
+        panic!("expected mount command");
+    };
+
+    assert_eq!(mount.log_format, LogFormatArg::Json);
+    assert_eq!(mount.log_sink, Some(LogSink::Journald));
+    assert_eq!(
+        mount.log_file,
+        Some(std::path::PathBuf::from("/var/log/pbkfs.log"))
+    );
+    assert_eq!(
+        mount.pid_file,
+        Some(std::path::PathBuf::from(".pbkfs/custom.pid"))
+    );
+    assert!(mount.debug);
+
+    let defaults = mount.daemon_defaults()?;
+    assert_eq!(
+        defaults.pid_visible,
+        std::path::PathBuf::from("/mnt/.pbkfs/custom.pid")
+    );
+    Ok(())
+}
+
+#[test]
+fn mount_wait_timeout_priority_rules() -> pbkfs::Result<()> {
+    use pbkfs::cli::{mount::WaitMode, Command};
+
+    let args = pbkfs::cli::parse_args([
+        "pbkfs",
+        "mount",
+        "-B",
+        "/store",
+        "--mnt-path",
+        "/mnt",
+        "--diff-dir",
+        "/diff",
+        "--instance",
+        "main",
+        "--backup-id",
+        "FULL1",
+        "--wait",
+        "--timeout",
+        "5",
+    ])?;
+
+    let Command::Mount(mount) = args.command else {
+        panic!("expected mount command");
+    };
+
+    assert_eq!(
+        mount.wait_mode(),
+        WaitMode::Timeout(std::time::Duration::from_secs(5))
+    );
+    Ok(())
+}
+
+#[test]
+fn mount_console_ignores_wait_semantics() -> pbkfs::Result<()> {
+    use pbkfs::cli::{mount::MountMode, mount::WaitMode, Command};
+
+    let args = pbkfs::cli::parse_args([
+        "pbkfs",
+        "mount",
+        "-B",
+        "/store",
+        "--mnt-path",
+        "/mnt",
+        "--diff-dir",
+        "/diff",
+        "--instance",
+        "main",
+        "--backup-id",
+        "FULL1",
+        "--console",
+        "--wait",
+        "--timeout",
+        "1",
+    ])?;
+
+    let Command::Mount(mount) = args.command else {
+        panic!("expected mount command");
+    };
+
+    assert_eq!(mount.mode(), MountMode::Console);
+    assert_eq!(mount.wait_mode(), WaitMode::Foreground);
+    Ok(())
+}
+
+#[test]
+fn unmount_force_flag_and_busy_classification() -> pbkfs::Result<()> {
+    use pbkfs::cli::{unmount::UnmountFailureKind, Command};
+
+    let args = pbkfs::cli::parse_args(["pbkfs", "unmount", "--mnt-path", "/mnt", "--force"])?;
+    let Command::Unmount(unmount) = args.command else {
+        panic!("expected unmount command");
+    };
+    assert!(unmount.force);
+
+    assert_eq!(
+        pbkfs::cli::unmount::classify_unmount_stderr("umount: /mnt: target is busy\n"),
+        UnmountFailureKind::Busy
+    );
+    assert_eq!(
+        pbkfs::cli::unmount::classify_unmount_stderr("umount: /mnt: not mounted.\n"),
+        UnmountFailureKind::NotMounted
+    );
+    assert_eq!(
+        pbkfs::cli::unmount::classify_unmount_stderr("some other error\n"),
+        UnmountFailureKind::Other
+    );
+    Ok(())
+}
+
+#[test]
+fn unmount_help_mentions_force_flag() -> pbkfs::Result<()> {
+    let mut cmd = pbkfs::cli::clap_command();
+    let unmount = cmd
+        .find_subcommand_mut("unmount")
+        .expect("unmount subcommand exists");
+    let help = unmount.render_long_help().to_string();
+    assert!(help.contains("--force"));
+    Ok(())
+}
+
+#[test]
+fn stat_command_parses_and_flags_work() -> pbkfs::Result<()> {
+    use pbkfs::cli::{stat::StatFormat, Command};
+
+    let args = pbkfs::cli::parse_args(["pbkfs", "stat", "--mnt-path", "/mnt"])?;
+    let Command::Stat(stat) = args.command else {
+        panic!("expected stat command");
+    };
+    assert_eq!(stat.format, StatFormat::Text);
+    assert!(!stat.counters_reset);
+
+    let args = pbkfs::cli::parse_args([
+        "pbkfs",
+        "stat",
+        "--mnt-path",
+        "/mnt",
+        "--format",
+        "json",
+        "--counters-reset",
+    ])?;
+    let Command::Stat(stat) = args.command else {
+        panic!("expected stat command");
+    };
+    assert_eq!(stat.format, StatFormat::Json);
+    assert!(stat.counters_reset);
+
+    Ok(())
+}
+
+#[test]
 fn mount_requires_target_and_store_paths() {
     // Missing all required paths
     expect_error(
@@ -126,6 +342,14 @@ fn mount_errors_for_unknown_store_layout() {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        console: false,
+        wait: false,
+        timeout: None,
+        log_file: None,
+        log_format: pbkfs::cli::mount::LogFormatArg::Text,
+        log_sink: None,
+        pid_file: None,
+        debug: false,
     })
     .expect_err("non-pg_probackup layout should fail");
 
@@ -155,6 +379,14 @@ fn mount_sets_and_enforces_no_wal_binding_flag() {
         force: false,
         perf_unsafe: false,
         no_wal: true,
+        console: false,
+        wait: false,
+        timeout: None,
+        log_file: None,
+        log_format: pbkfs::cli::mount::LogFormatArg::Text,
+        log_sink: None,
+        pid_file: None,
+        debug: false,
     })
     .expect("first mount with --no-wal should succeed");
 
@@ -178,6 +410,14 @@ fn mount_sets_and_enforces_no_wal_binding_flag() {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        console: false,
+        wait: false,
+        timeout: None,
+        log_file: None,
+        log_format: pbkfs::cli::mount::LogFormatArg::Text,
+        log_sink: None,
+        pid_file: None,
+        debug: false,
     })
     .expect_err("reusing diff after --no-wal must fail");
 
@@ -246,6 +486,14 @@ JSON
             force: false,
             perf_unsafe: false,
             no_wal: false,
+            console: false,
+            wait: false,
+            timeout: None,
+            log_file: None,
+            log_format: pbkfs::cli::mount::LogFormatArg::Text,
+            log_sink: None,
+            pid_file: None,
+            debug: false,
         })?;
 
         let contents = ctx
@@ -320,6 +568,14 @@ JSON
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        console: false,
+        wait: false,
+        timeout: None,
+        log_file: None,
+        log_format: pbkfs::cli::mount::LogFormatArg::Text,
+        log_sink: None,
+        pid_file: None,
+        debug: false,
     })?;
 
     let mounted_file = target.path().join("data/base.txt");
@@ -463,6 +719,14 @@ fn mount_reuses_binding_with_diff_only_arguments() -> pbkfs::Result<()> {
             force: false,
             perf_unsafe: false,
             no_wal: false,
+            console: false,
+            wait: false,
+            timeout: None,
+            log_file: None,
+            log_format: pbkfs::cli::mount::LogFormatArg::Text,
+            log_sink: None,
+            pid_file: None,
+            debug: false,
         })?
     };
 
@@ -512,6 +776,14 @@ fn mount_rejects_binding_mismatch_when_instance_differs() {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        console: false,
+        wait: false,
+        timeout: None,
+        log_file: None,
+        log_format: pbkfs::cli::mount::LogFormatArg::Text,
+        log_sink: None,
+        pid_file: None,
+        debug: false,
     })
     .expect_err("mismatched instance should fail");
 
@@ -549,6 +821,14 @@ fn mount_rejects_binding_mismatch_when_backup_differs() {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        console: false,
+        wait: false,
+        timeout: None,
+        log_file: None,
+        log_format: pbkfs::cli::mount::LogFormatArg::Text,
+        log_sink: None,
+        pid_file: None,
+        debug: false,
     })
     .expect_err("mismatched backup should fail");
 
@@ -589,6 +869,14 @@ fn mount_rejects_binding_mismatch_when_store_differs() {
         force: false,
         perf_unsafe: false,
         no_wal: false,
+        console: false,
+        wait: false,
+        timeout: None,
+        log_file: None,
+        log_format: pbkfs::cli::mount::LogFormatArg::Text,
+        log_sink: None,
+        pid_file: None,
+        debug: false,
     })
     .expect_err("store path mismatch should fail");
 
@@ -739,6 +1027,14 @@ fn mount_rejects_corrupt_chain_without_force() {
             force: false,
             perf_unsafe: false,
             no_wal: false,
+            console: false,
+            wait: false,
+            timeout: None,
+            log_file: None,
+            log_format: pbkfs::cli::mount::LogFormatArg::Text,
+            log_sink: None,
+            pid_file: None,
+            debug: false,
         })
         .expect_err("corrupt chain should fail without --force")
     };
@@ -772,6 +1068,14 @@ fn mount_allows_corrupt_chain_with_force() -> pbkfs::Result<()> {
             force: true,
             perf_unsafe: false,
             no_wal: false,
+            console: false,
+            wait: false,
+            timeout: None,
+            log_file: None,
+            log_format: pbkfs::cli::mount::LogFormatArg::Text,
+            log_sink: None,
+            pid_file: None,
+            debug: false,
         })?
     };
 
