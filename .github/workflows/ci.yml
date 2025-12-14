@@ -2,6 +2,9 @@ name: CI
 
 on:
   pull_request:
+  push:
+    branches:
+      - main
 
 jobs:
   build:
@@ -18,14 +21,21 @@ jobs:
       - name: Ensure rustfmt and clippy components are installed
         run: rustup component add rustfmt clippy
 
-      - name: Cache cargo build
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-1.80.1-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.80.1-cargo-registry-
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-1.80.1-cargo-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cargo fmt
         run: cargo fmt --all -- --check
@@ -36,12 +46,16 @@ jobs:
       - name: Cargo test
         run: cargo test
 
-      - name: Cache cargo-audit binary
+      - name: Cache cargo-audit (binary + advisory DB)
         id: cache-cargo-audit
         uses: actions/cache@v4
         with:
-          path: ~/.cargo/bin/cargo-audit
-          key: ${{ runner.os }}-cargo-audit-0.21.1
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/advisory-db
+          key: ${{ runner.os }}-rust-1.80.1-cargo-audit-0.21.1
+          restore-keys: |
+            ${{ runner.os }}-rust-1.80.1-cargo-audit-
 
       - name: Install cargo-audit (0.21.1 for Rust 1.80)
         if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
