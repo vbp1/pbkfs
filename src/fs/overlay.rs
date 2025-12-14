@@ -3126,8 +3126,10 @@ impl Overlay {
                 decoder.read_to_end(&mut out)?;
                 Ok(out)
             }
-            CompressionAlgorithm::Lz4 => lz4_flex::block::decompress(data, self.inner.block_size.get())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e).into()),
+            CompressionAlgorithm::Lz4 => {
+                lz4_flex::block::decompress(data, self.inner.block_size.get())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e).into())
+            }
             CompressionAlgorithm::Zstd => zstd::stream::decode_all(data)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e).into()),
         }
