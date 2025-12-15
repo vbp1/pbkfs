@@ -75,3 +75,25 @@ large `.full` file or many FULLREF slots.
   The script does **not** modify any files; it only reads them and prints
   summary statistics and potential invariant violations.
 
+## `pgtest.sh`
+
+Runs a quick pgbench smoke test against a `pbkfs mount` created from an
+existing `pg_probackup` store under this repo (by default
+`postgres/pbk_store`). Useful for local debugging of mount correctness
+and performance regressions.
+
+- **Usage**
+
+  ```bash
+  PBK_INSTANCE=main-checksums PBK_BACKUP_ID=T6ZTYL \
+    POSTGRES_BIN_DIR=$HOME/postgres_bin/bin \
+    ./utils/pgtest.sh
+  ```
+
+- **Environment**
+  - Required: `PBK_INSTANCE`, `PBK_BACKUP_ID`
+  - Optional:
+    - `POSTGRES_BIN_DIR` (added to `PATH`, must contain `pg_ctl`, `psql`, `pgbench`)
+    - `PBK_STORE_REL`, `PBK_TARGET_REL`, `PBK_DIFF_REL` (defaults: `postgres/pbk_store`, `postgres/pbk_target`, `postgres/pbk_diff`)
+    - `PBKFS_LOG` (default: `/tmp/pbkfs_debug.log`)
+    - `PBK_MOUNT_TIMEOUT_SECS` (default: `30`)
