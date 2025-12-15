@@ -1277,6 +1277,53 @@ fn pg_probackup_lz4_page_stream_raw_block_decodes() -> pbkfs::Result<()> {
 }
 
 #[test]
+fn pg_probackup_zstd_page_stream_decodes() -> pbkfs::Result<()> {
+    let base = tempdir()?;
+    let diff = tempdir()?;
+
+    // Simulate a pg_probackup-style FULL datafile stored as a page stream:
+    // [BackupPageHeader][payload] where payload is a zstd frame (no size prefix).
+    let rel = Path::new("base/1/2662");
+    let data_root = base.path().join("FULL").join("database");
+    let full_path = data_root.join(rel);
+    fs::create_dir_all(full_path.parent().unwrap())?;
+
+    // Use highly compressible input so compressed_size < BLCKSZ and the decode path is exercised.
+    let page = vec![0u8; BLCKSZ];
+    let compressed = zstd::stream::encode_all(&page[..], 1)?;
+    assert!(
+        compressed.len() < BLCKSZ,
+        "test requires compressed payload smaller than a page"
+    );
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&full_path)?;
+    write_incremental_entry(&mut file, 0, &compressed)?;
+
+    let layers = vec![Layer {
+        root: data_root.clone(),
+        compression: Some(CompressionAlgorithm::Zstd),
+        incremental: false,
+        backup_mode: BackupMode::Full,
+    }];
+    let overlay = Overlay::new_with_layers(base.path(), diff.path(), layers)?;
+
+    // 1) Random page read via page stream indexing + per-page decompression.
+    let decoded = overlay.read_range(rel, 0, BLCKSZ)?.expect("decoded page");
+    assert_eq!(page, decoded);
+
+    // 2) Full materialization into diff should produce a plain PostgreSQL file.
+    overlay.ensure_copy_up(rel)?;
+    let materialized = fs::read(diff.path().join("data").join(rel))?;
+    assert_eq!(BLCKSZ, materialized.len());
+    assert_eq!(page, materialized);
+
+    Ok(())
+}
+
+#[test]
 fn non_default_block_size_supported() -> pbkfs::Result<()> {
     let base = tempdir()?;
     let diff = tempdir()?;
