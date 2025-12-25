@@ -7,8 +7,6 @@ pbkfs is a Rust FUSE filesystem that mounts pg_probackup backups as a PostgreSQL
 - Supports FULL and incremental backup chains (including mixed compression) with binding metadata stored in `pbk_diff` to enforce single-use semantics.
 - Target platform: Linux with libfuse3-compatible tooling.
 
-Specs and plans live in `specs/001-pbkfs-backup-mount/` (symlinked as `specs/004-phase-6/`).
-
 ## Prerequisites
 - Rust 1.80 (pinned via `rust-toolchain.toml`).
 - libfuse3 / FUSE userspace tools installed.
