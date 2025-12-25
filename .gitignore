@@ -17,6 +17,7 @@ target
 release/
 *.rlib
 *.prof*
+.cargo-tools/
 
 # IDEs / editors
 .idea/

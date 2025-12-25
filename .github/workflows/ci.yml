@@ -46,22 +46,9 @@ jobs:
       - name: Cargo test
         run: cargo test
 
-      - name: Cache cargo-audit (binary + advisory DB)
-        id: cache-cargo-audit
-        uses: actions/cache@v4
+      - name: Cargo deny (advisories)
+        uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          path: |
-            ~/.cargo/bin/cargo-audit
-            ~/.cargo/advisory-db
-          key: ${{ runner.os }}-rust-1.80.1-cargo-audit-0.21.1
-          restore-keys: |
-            ${{ runner.os }}-rust-1.80.1-cargo-audit-
-
-      - name: Install cargo-audit (0.21.1 for Rust 1.80)
-        if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
-        run: cargo install --locked cargo-audit@0.21.1
-
-      - name: Cargo audit (allow known fuser advisory)
-        env:
-          RUSTSEC_ALLOW: RUSTSEC-2021-0154
-        run: cargo audit --ignore RUSTSEC-2021-0154
+          rust-version: 1.80.1
+          command: check
+          command-arguments: advisories

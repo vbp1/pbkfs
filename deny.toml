@@ -1,0 +1,5 @@
+[advisories]
+unmaintained = "workspace"
+ignore = [
+  { id = "RUSTSEC-2021-0154", reason = "Known fuser advisory; allowed in CI." },
+]
